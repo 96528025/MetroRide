@@ -1,0 +1,185 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rider-service
+  namespace: metroride
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rider-service
+  template:
+    metadata:
+      labels:
+        app: rider-service
+    spec:
+      containers:
+        - name: rider-service
+          image: metroride/rider-service:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: metroride-config
+          env:
+            - name: RIDER_SERVICE_ADDR
+              value: ":8080"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatch-service
+  namespace: metroride
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dispatch-service
+  template:
+    metadata:
+      labels:
+        app: dispatch-service
+    spec:
+      containers:
+        - name: dispatch-service
+          image: metroride/dispatch-service:latest
+          ports:
+            - containerPort: 8082
+          envFrom:
+            - configMapRef:
+                name: metroride-config
+          env:
+            - name: DISPATCH_SERVICE_ADDR
+              value: ":8082"
+            - name: CONSUMER_GROUP
+              value: dispatch-service
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: routing-service
+  namespace: metroride
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: routing-service
+  template:
+    metadata:
+      labels:
+        app: routing-service
+    spec:
+      containers:
+        - name: routing-service
+          image: metroride/routing-service:latest
+          ports:
+            - containerPort: 8083
+          envFrom:
+            - configMapRef:
+                name: metroride-config
+          env:
+            - name: ROUTING_SERVICE_ADDR
+              value: ":8083"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: driver-service
+  namespace: metroride
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: driver-service
+  template:
+    metadata:
+      labels:
+        app: driver-service
+    spec:
+      containers:
+        - name: driver-service
+          image: metroride/driver-service:latest
+          ports:
+            - containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: metroride-config
+          env:
+            - name: DRIVER_SERVICE_ADDR
+              value: ":8081"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-service
+  namespace: metroride
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-service
+  template:
+    metadata:
+      labels:
+        app: traffic-service
+    spec:
+      containers:
+        - name: traffic-service
+          image: metroride/traffic-service:latest
+          ports:
+            - containerPort: 8084
+          envFrom:
+            - configMapRef:
+                name: metroride-config
+          env:
+            - name: TRAFFIC_SERVICE_ADDR
+              value: ":8084"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: metroride
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+    spec:
+      containers:
+        - name: notification-service
+          image: metroride/notification-service:latest
+          ports:
+            - containerPort: 8085
+          envFrom:
+            - configMapRef:
+                name: metroride-config
+          env:
+            - name: NOTIFICATION_SERVICE_ADDR
+              value: ":8085"
+            - name: CONSUMER_GROUP
+              value: notification-service
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
