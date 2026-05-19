@@ -118,6 +118,14 @@ Redis Streams are used as the initial event log because they provide persistent 
 
 PostgreSQL remains the authoritative store for ride status. Redis carries workflow events; it does not own long-term ride truth. This separation mirrors production systems where event logs coordinate distributed work while relational storage protects transactional state and queryability.
 
+## System Design Narrative
+
+MetroRide is a production-style local distributed systems project designed to demonstrate backend infrastructure concepts: service decomposition, asynchronous workflow coordination, durable state, reliability controls, and observability. It is not presented as a real production deployment at scale; it is structured so the architecture can be explained and extended like a production backend system.
+
+- [System design](docs/system-design.md)
+- [Interview talk track](docs/interview-talk-track.md)
+- [Architecture decisions](docs/architecture-decisions.md)
+
 ## Observability
 
 Every service exposes:
@@ -155,9 +163,12 @@ See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behav
 ├── docs/
 │   ├── api.md
 │   ├── architecture.md
+│   ├── architecture-decisions.md
+│   ├── interview-talk-track.md
 │   ├── observability.md
 │   ├── reliability.md
-│   └── resume-bullets.md
+│   ├── resume-bullets.md
+│   └── system-design.md
 ├── infrastructure/
 │   ├── docker/
 │   ├── grafana/
@@ -250,6 +261,9 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [System design](docs/system-design.md)
+- [Interview talk track](docs/interview-talk-track.md)
+- [Architecture decisions](docs/architecture-decisions.md)
 - [API](docs/api.md)
 - [Observability](docs/observability.md)
 - [Reliability](docs/reliability.md)
