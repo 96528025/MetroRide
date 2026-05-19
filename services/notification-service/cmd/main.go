@@ -14,6 +14,8 @@ import (
 	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/metroride/metroride/shared/pkg/httpx"
 	"github.com/metroride/metroride/shared/pkg/logging"
+	"github.com/metroride/metroride/shared/pkg/metrics"
+	"github.com/metroride/metroride/shared/pkg/reliability"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,9 +26,15 @@ type notificationService struct {
 }
 
 func main() {
+	metrics.RegisterCommon()
 	cfg := config.Load("notification-service", ":8085")
 	log := logging.New(cfg.ServiceName)
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.RedisAddr,
+		DialTimeout:  reliability.RedisTimeout,
+		ReadTimeout:  reliability.RedisTimeout,
+		WriteTimeout: reliability.RedisTimeout,
+	})
 	defer func() { _ = rdb.Close() }()
 
 	svc := &notificationService{cfg: cfg, rdb: rdb}
@@ -34,7 +42,10 @@ func main() {
 	defer cancel()
 	go svc.consume(ctx, log)
 
-	mux := httpx.CommonMux(log)
+	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
+		"redis":               svc.checkRedis,
+		"notification_stream": svc.checkNotificationStream,
+	})
 	mux.HandleFunc("GET /v1/notifications/stats", func(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondJSON(w, http.StatusOK, map[string]any{"processed": svc.processed.Load()})
 	})
@@ -62,22 +73,28 @@ func (s *notificationService) consume(ctx context.Context, log interface {
 }) {
 	group := s.cfg.ConsumerGroup
 	consumer := s.cfg.ConsumerName
-	err := s.rdb.XGroupCreateMkStream(ctx, events.StreamRideNotifications, group, "0").Err()
+	initCtx, initCancel := reliability.WithRedisTimeout(ctx)
+	err := ensureGroup(initCtx, s.rdb, events.StreamRideNotifications, group)
+	initCancel()
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 		log.Error("notification consumer group failed", "error", err)
 	}
 	for {
-		result, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		readCtx, readCancel := reliability.WithRedisTimeout(ctx)
+		result, err := s.rdb.XReadGroup(readCtx, &redis.XReadGroupArgs{
 			Group:    group,
 			Consumer: consumer,
 			Streams:  []string{events.StreamRideNotifications, ">"},
 			Count:    10,
-			Block:    5 * time.Second,
+			Block:    time.Second,
 		}).Result()
+		readCancel()
 		if err != nil {
 			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
 				continue
 			}
+			metrics.StreamConsumeErrors.WithLabelValues("notification-service", events.StreamRideNotifications).Inc()
+			metrics.DependencyErrors.WithLabelValues("notification-service", "redis").Inc()
 			log.Error("notification stream read failed", "error", err)
 			continue
 		}
@@ -94,11 +111,36 @@ func (s *notificationService) consume(ctx context.Context, log interface {
 						log.Error("decode assignment notification failed", "error", err)
 						continue
 					}
-					log.Info("notification simulated", "ride_id", payload.RideID, "rider_id", payload.RiderID, "driver_id", payload.DriverID)
+					log.Info("notification simulated", "event_type", envelope.Type, "ride_id", payload.RideID, "rider_id", payload.RiderID, "driver_id", payload.DriverID)
 					s.processed.Add(1)
 				}
-				_ = s.rdb.XAck(ctx, events.StreamRideNotifications, group, message.ID).Err()
+				ackCtx, ackCancel := reliability.WithRedisTimeout(ctx)
+				if err := s.rdb.XAck(ackCtx, events.StreamRideNotifications, group, message.ID).Err(); err != nil {
+					metrics.DependencyErrors.WithLabelValues("notification-service", "redis").Inc()
+					log.Error("notification ack failed", "error", err)
+				}
+				ackCancel()
 			}
 		}
 	}
+}
+
+func (s *notificationService) checkRedis(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return s.rdb.Ping(checkCtx).Err()
+}
+
+func (s *notificationService) checkNotificationStream(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return ensureGroup(checkCtx, s.rdb, events.StreamRideNotifications, s.cfg.ConsumerGroup)
+}
+
+func ensureGroup(ctx context.Context, rdb *redis.Client, stream, group string) error {
+	err := rdb.XGroupCreateMkStream(ctx, stream, group, "0").Err()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		return err
+	}
+	return nil
 }

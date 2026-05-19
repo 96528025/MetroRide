@@ -16,6 +16,8 @@ import (
 	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/metroride/metroride/shared/pkg/httpx"
 	"github.com/metroride/metroride/shared/pkg/logging"
+	"github.com/metroride/metroride/shared/pkg/metrics"
+	"github.com/metroride/metroride/shared/pkg/reliability"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -32,9 +34,15 @@ type driverService struct {
 }
 
 func main() {
+	metrics.RegisterCommon()
 	cfg := config.Load("driver-service", ":8081")
 	log := logging.New(cfg.ServiceName)
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.RedisAddr,
+		DialTimeout:  reliability.RedisTimeout,
+		ReadTimeout:  reliability.RedisTimeout,
+		WriteTimeout: reliability.RedisTimeout,
+	})
 	defer func() { _ = rdb.Close() }()
 
 	svc := &driverService{
@@ -51,7 +59,9 @@ func main() {
 	defer cancel()
 	go svc.publishLocations(ctx, log)
 
-	mux := httpx.CommonMux(log)
+	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
+		"redis": svc.checkRedis,
+	})
 	mux.HandleFunc("GET /v1/drivers", svc.listDrivers)
 	server := httpx.NewServer(cfg.HTTPAddr, mux)
 	go func() {
@@ -100,10 +110,19 @@ func (s *driverService) publishLocations(ctx context.Context, log interface {
 					log.Error("encode driver location failed", "error", err)
 					continue
 				}
-				if _, err := events.Publish(ctx, s.rdb, events.StreamDriverLocations, envelope); err != nil {
-					log.Error("publish driver location failed", "error", err, "driver_id", payload.DriverID)
+				redisCtx, cancel := reliability.WithRedisTimeout(ctx)
+				if _, err := events.Publish(redisCtx, s.rdb, events.StreamDriverLocations, envelope); err != nil {
+					metrics.DependencyErrors.WithLabelValues("driver-service", "redis").Inc()
+					log.Error("publish driver location failed", "error", err, "event_type", events.TypeDriverLocationUpdated, "driver_id", payload.DriverID)
 				}
+				cancel()
 			}
 		}
 	}
+}
+
+func (s *driverService) checkRedis(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return s.rdb.Ping(checkCtx).Err()
 }

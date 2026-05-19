@@ -16,6 +16,8 @@ import (
 	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/metroride/metroride/shared/pkg/httpx"
 	"github.com/metroride/metroride/shared/pkg/logging"
+	"github.com/metroride/metroride/shared/pkg/metrics"
+	"github.com/metroride/metroride/shared/pkg/reliability"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
@@ -52,10 +54,16 @@ type nearestDriverRequest struct {
 }
 
 func main() {
+	metrics.RegisterCommon()
 	prometheus.MustRegister(routingDuration, activeDrivers)
 	cfg := config.Load("routing-service", ":8083")
 	log := logging.New(cfg.ServiceName)
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.RedisAddr,
+		DialTimeout:  reliability.RedisTimeout,
+		ReadTimeout:  reliability.RedisTimeout,
+		WriteTimeout: reliability.RedisTimeout,
+	})
 	defer func() { _ = rdb.Close() }()
 
 	svc := &routingService{
@@ -72,7 +80,10 @@ func main() {
 	defer cancel()
 	go svc.consumeDriverLocations(ctx, log)
 
-	mux := httpx.CommonMux(log)
+	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
+		"redis":                  svc.checkRedis,
+		"driver_location_stream": svc.checkDriverLocationStream,
+	})
 	mux.HandleFunc("POST /v1/routes/nearest-driver", svc.nearestDriver)
 	server := httpx.NewServer(cfg.HTTPAddr, mux)
 	go func() {
@@ -128,30 +139,36 @@ func (s *routingService) nearestDriver(w http.ResponseWriter, r *http.Request) {
 		etaSeconds = 60
 	}
 	httpx.RespondJSON(w, http.StatusOK, map[string]any{
-		"driver_id":    selected.ID,
-		"distance_km":  math.Round(distanceKM*100) / 100,
-		"eta_seconds":  etaSeconds,
-		"algorithm":    "haversine-nearest-with-dijkstra-ready-graph",
-		"computed_at":  time.Now().UTC(),
+		"driver_id":   selected.ID,
+		"distance_km": math.Round(distanceKM*100) / 100,
+		"eta_seconds": etaSeconds,
+		"algorithm":   "haversine-nearest-with-dijkstra-ready-graph",
+		"computed_at": time.Now().UTC(),
 	})
 }
 
 func (s *routingService) consumeDriverLocations(ctx context.Context, log anyLogger) {
 	group := "routing-service"
 	consumer := "routing-service-1"
-	_ = s.rdb.XGroupCreateMkStream(ctx, events.StreamDriverLocations, group, "0").Err()
+	initCtx, initCancel := reliability.WithRedisTimeout(ctx)
+	_ = ensureGroup(initCtx, s.rdb, events.StreamDriverLocations, group)
+	initCancel()
 	for {
-		result, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		readCtx, readCancel := reliability.WithRedisTimeout(ctx)
+		result, err := s.rdb.XReadGroup(readCtx, &redis.XReadGroupArgs{
 			Group:    group,
 			Consumer: consumer,
 			Streams:  []string{events.StreamDriverLocations, ">"},
 			Count:    25,
-			Block:    5 * time.Second,
+			Block:    time.Second,
 		}).Result()
+		readCancel()
 		if err != nil {
 			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
 				continue
 			}
+			metrics.StreamConsumeErrors.WithLabelValues("routing-service", events.StreamDriverLocations).Inc()
+			metrics.DependencyErrors.WithLabelValues("routing-service", "redis").Inc()
 			log.Error("driver location stream read failed", "error", err)
 			continue
 		}
@@ -184,7 +201,12 @@ func (s *routingService) consumeDriverLocations(ctx context.Context, log anyLogg
 				}
 				activeDrivers.Set(float64(available))
 				s.logDrivers.Unlock()
-				_ = s.rdb.XAck(ctx, events.StreamDriverLocations, group, message.ID).Err()
+				ackCtx, ackCancel := reliability.WithRedisTimeout(ctx)
+				if err := s.rdb.XAck(ackCtx, events.StreamDriverLocations, group, message.ID).Err(); err != nil {
+					metrics.DependencyErrors.WithLabelValues("routing-service", "redis").Inc()
+					log.Error("driver location ack failed", "error", err)
+				}
+				ackCancel()
 			}
 		}
 	}
@@ -206,4 +228,24 @@ func haversine(lat1, lng1, lat2, lng2 float64) float64 {
 
 func degreesToRadians(value float64) float64 {
 	return value * math.Pi / 180
+}
+
+func (s *routingService) checkRedis(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return s.rdb.Ping(checkCtx).Err()
+}
+
+func (s *routingService) checkDriverLocationStream(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return ensureGroup(checkCtx, s.rdb, events.StreamDriverLocations, "routing-service")
+}
+
+func ensureGroup(ctx context.Context, rdb *redis.Client, stream, group string) error {
+	err := rdb.XGroupCreateMkStream(ctx, stream, group, "0").Err()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		return err
+	}
+	return nil
 }

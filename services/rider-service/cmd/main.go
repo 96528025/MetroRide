@@ -16,6 +16,8 @@ import (
 	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/metroride/metroride/shared/pkg/httpx"
 	"github.com/metroride/metroride/shared/pkg/logging"
+	"github.com/metroride/metroride/shared/pkg/metrics"
+	"github.com/metroride/metroride/shared/pkg/reliability"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
@@ -40,6 +42,7 @@ type service struct {
 }
 
 func main() {
+	metrics.RegisterCommon()
 	prometheus.MustRegister(rideRequests)
 	cfg := config.Load("rider-service", ":8080")
 	log := logging.New(cfg.ServiceName)
@@ -52,11 +55,19 @@ func main() {
 	}
 	defer db.Close()
 
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.RedisAddr,
+		DialTimeout:  reliability.RedisTimeout,
+		ReadTimeout:  reliability.RedisTimeout,
+		WriteTimeout: reliability.RedisTimeout,
+	})
 	defer func() { _ = rdb.Close() }()
 
 	svc := &service{log: log, db: db, rdb: rdb}
-	mux := httpx.CommonMux(log)
+	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
+		"postgres": svc.checkPostgres,
+		"redis":    svc.checkRedis,
+	})
 	mux.HandleFunc("POST /v1/rides", svc.createRide)
 	mux.HandleFunc("GET /v1/rides/{ride_id}", svc.getRide)
 
@@ -85,11 +96,14 @@ func (s *service) createRide(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	rideID := uuid.NewString()
-	_, err := s.db.Exec(r.Context(), `
+	dbCtx, dbCancel := reliability.WithPostgresTimeout(r.Context())
+	defer dbCancel()
+	_, err := s.db.Exec(dbCtx, `
 		insert into rides (id, rider_id, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, status, created_at, updated_at)
 		values ($1, $2, $3, $4, $5, $6, 'requested', $7, $7)
 	`, rideID, req.RiderID, req.PickupLat, req.PickupLng, req.DropoffLat, req.DropoffLng, now)
 	if err != nil {
+		metrics.DependencyErrors.WithLabelValues("rider-service", "postgres").Inc()
 		s.log.Error("persist ride request failed", "error", err, "ride_id", rideID)
 		httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create ride"})
 		return
@@ -109,9 +123,12 @@ func (s *service) createRide(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode event"})
 		return
 	}
-	streamID, err := events.Publish(r.Context(), s.rdb, events.StreamRideRequests, envelope)
+	redisCtx, redisCancel := reliability.WithRedisTimeout(r.Context())
+	defer redisCancel()
+	streamID, err := events.Publish(redisCtx, s.rdb, events.StreamRideRequests, envelope)
 	if err != nil {
-		s.log.Error("publish ride request failed", "error", err, "ride_id", rideID)
+		metrics.DependencyErrors.WithLabelValues("rider-service", "redis").Inc()
+		s.log.Error("publish ride request failed", "error", err, "event_type", events.TypeRideRequested, "ride_id", rideID)
 		httpx.RespondJSON(w, http.StatusAccepted, map[string]any{"ride_id": rideID, "status": "requested", "warning": "event publish failed"})
 		return
 	}
@@ -132,7 +149,9 @@ func (s *service) getRide(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt time.Time  `json:"updated_at"`
 		Assigned  *time.Time `json:"assigned_at,omitempty"`
 	}
-	err := s.db.QueryRow(r.Context(), `
+	dbCtx, dbCancel := reliability.WithPostgresTimeout(r.Context())
+	defer dbCancel()
+	err := s.db.QueryRow(dbCtx, `
 		select id, rider_id, driver_id, status, created_at, updated_at, assigned_at
 		from rides where id = $1
 	`, rideID).Scan(&response.ID, &response.RiderID, &response.DriverID, &response.Status, &response.CreatedAt, &response.UpdatedAt, &response.Assigned)
@@ -141,6 +160,18 @@ func (s *service) getRide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.RespondJSON(w, http.StatusOK, response)
+}
+
+func (s *service) checkPostgres(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return s.db.Ping(checkCtx)
+}
+
+func (s *service) checkRedis(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return s.rdb.Ping(checkCtx).Err()
 }
 
 func waitForShutdown(cfg config.Config, log *slog.Logger, server *http.Server) {

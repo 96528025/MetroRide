@@ -15,6 +15,7 @@ const (
 	StreamRideAssignments   = "events.ride.assignments"
 	StreamRideNotifications = "events.ride.notifications"
 	StreamTrafficUpdates    = "events.traffic.updates"
+	StreamDeadLetter        = "events.dead_letter"
 )
 
 const (
@@ -66,6 +67,15 @@ type TrafficUpdated struct {
 	Region     string  `json:"region"`
 	Congestion float64 `json:"congestion"`
 	UpdatedAt  string  `json:"updated_at"`
+}
+
+type DeadLetter struct {
+	OriginalEventID   string `json:"original_event_id"`
+	OriginalEventType string `json:"original_event_type"`
+	RideID            string `json:"ride_id,omitempty"`
+	Error             string `json:"error"`
+	Service           string `json:"service"`
+	FailedAt          string `json:"failed_at"`
 }
 
 func Publish(ctx context.Context, rdb *redis.Client, stream string, envelope Envelope) (string, error) {
