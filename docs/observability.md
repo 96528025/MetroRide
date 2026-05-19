@@ -23,8 +23,11 @@ Current project metrics:
 | Metric | Type | Owner | Purpose |
 | --- | --- | --- | --- |
 | `metroride_ride_requests_total` | Counter | `rider-service` | Total accepted ride requests |
+| `metroride_rides_assigned_total` | Counter | `dispatch-service` | Total successful ride assignments |
 | `metroride_dispatch_latency_seconds` | Histogram | `dispatch-service` | Assignment workflow latency |
 | `metroride_assignment_failures_total` | Counter | `dispatch-service` | Failed dispatch attempts |
+| `metroride_stream_consume_errors_total` | Counter | Shared | Redis Stream consume failures |
+| `metroride_dependency_errors_total` | Counter | Shared | Redis, PostgreSQL, and routing dependency failures |
 | `metroride_routing_computation_seconds` | Histogram | `routing-service` | Nearest-driver computation latency |
 | `metroride_active_drivers` | Gauge | `routing-service` | Available drivers in routing state |
 

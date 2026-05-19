@@ -130,13 +130,22 @@ Key metrics include:
 
 - `metroride_ride_requests_total`
 - `metroride_dispatch_latency_seconds`
+- `metroride_rides_assigned_total`
 - `metroride_assignment_failures_total`
+- `metroride_stream_consume_errors_total`
+- `metroride_dependency_errors_total`
 - `metroride_routing_computation_seconds`
 - `metroride_active_drivers`
 
 Prometheus scrapes service metrics, and Grafana provisions a MetroRide dashboard with ride request rate, dispatch latency, routing latency, active drivers, and assignment failures.
 
 See [docs/observability.md](docs/observability.md) for the monitoring strategy.
+
+## Reliability and Failure Handling
+
+MetroRide includes production hardening for dependency-aware readiness checks, bounded timeouts, retry behavior, idempotent ride assignment, and a Redis dead-letter stream for failed dispatch events.
+
+See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behavior, idempotency design, dead-letter semantics, and expected behavior during Redis, PostgreSQL, routing, and dispatch failures.
 
 ## Repository Layout
 
@@ -147,6 +156,7 @@ See [docs/observability.md](docs/observability.md) for the monitoring strategy.
 │   ├── api.md
 │   ├── architecture.md
 │   ├── observability.md
+│   ├── reliability.md
 │   └── resume-bullets.md
 ├── infrastructure/
 │   ├── docker/
@@ -242,6 +252,7 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 - [Architecture](docs/architecture.md)
 - [API](docs/api.md)
 - [Observability](docs/observability.md)
+- [Reliability](docs/reliability.md)
 - [Resume bullets](docs/resume-bullets.md)
 
 ## Scalability Roadmap
