@@ -1,0 +1,39 @@
+{
+  "uid": "metroride-overview",
+  "title": "MetroRide Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Ride Requests",
+      "gridPos": {"x": 0, "y": 0, "w": 8, "h": 8},
+      "targets": [{"expr": "rate(metroride_ride_requests_total[1m])", "legendFormat": "requests/sec"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dispatch Latency p95",
+      "gridPos": {"x": 8, "y": 0, "w": 8, "h": 8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(metroride_dispatch_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p95"}]
+    },
+    {
+      "type": "stat",
+      "title": "Active Drivers",
+      "gridPos": {"x": 16, "y": 0, "w": 8, "h": 8},
+      "targets": [{"expr": "metroride_active_drivers", "legendFormat": "drivers"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Routing Computation p95",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(metroride_routing_computation_seconds_bucket[5m])) by (le))", "legendFormat": "p95"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Assignment Failures",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [{"expr": "rate(metroride_assignment_failures_total[1m])", "legendFormat": "failures/sec"}]
+    }
+  ]
+}

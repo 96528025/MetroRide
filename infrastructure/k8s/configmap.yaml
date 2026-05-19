@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metroride-config
+  namespace: metroride
+data:
+  REDIS_ADDR: redis:6379
+  ROUTING_SERVICE_URL: http://routing-service:8083
+  POSTGRES_DSN: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable

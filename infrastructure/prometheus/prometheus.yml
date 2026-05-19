@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: rider-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["rider-service:8080"]
+
+  - job_name: dispatch-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["dispatch-service:8082"]
+
+  - job_name: routing-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["routing-service:8083"]
+
+  - job_name: driver-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["driver-service:8081"]
+
+  - job_name: notification-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["notification-service:8085"]

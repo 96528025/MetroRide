@@ -1,0 +1,29 @@
+image:
+  repository: metroride
+  tag: latest
+  pullPolicy: IfNotPresent
+
+config:
+  redisAddr: redis:6379
+  postgresDsn: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
+  routingServiceUrl: http://routing-service:8083
+
+services:
+  rider-service:
+    port: 8080
+    replicas: 2
+  driver-service:
+    port: 8081
+    replicas: 1
+  dispatch-service:
+    port: 8082
+    replicas: 2
+  routing-service:
+    port: 8083
+    replicas: 2
+  traffic-service:
+    port: 8084
+    replicas: 1
+  notification-service:
+    port: 8085
+    replicas: 1

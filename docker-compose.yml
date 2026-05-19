@@ -1,0 +1,163 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: metroride
+      POSTGRES_USER: metroride
+      POSTGRES_PASSWORD: metroride
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metroride -d metroride"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rider-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.service
+      args:
+        SERVICE: rider-service
+    environment:
+      RIDER_SERVICE_ADDR: ":8080"
+      POSTGRES_DSN: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  driver-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.service
+      args:
+        SERVICE: driver-service
+    environment:
+      DRIVER_SERVICE_ADDR: ":8081"
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  dispatch-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.service
+      args:
+        SERVICE: dispatch-service
+    environment:
+      DISPATCH_SERVICE_ADDR: ":8082"
+      POSTGRES_DSN: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
+      REDIS_ADDR: redis:6379
+      ROUTING_SERVICE_URL: http://routing-service:8083
+      CONSUMER_GROUP: dispatch-service
+      CONSUMER_NAME: dispatch-service-1
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      routing-service:
+        condition: service_started
+
+  routing-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.service
+      args:
+        SERVICE: routing-service
+    environment:
+      ROUTING_SERVICE_ADDR: ":8083"
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8083:8083"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  traffic-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.service
+      args:
+        SERVICE: traffic-service
+    environment:
+      TRAFFIC_SERVICE_ADDR: ":8084"
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8084:8084"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.service
+      args:
+        SERVICE: notification-service
+    environment:
+      NOTIFICATION_SERVICE_ADDR: ":8085"
+      REDIS_ADDR: redis:6379
+      CONSUMER_GROUP: notification-service
+      CONSUMER_NAME: notification-service-1
+    ports:
+      - "8085:8085"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - rider-service
+      - dispatch-service
+      - routing-service
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  redis-data:

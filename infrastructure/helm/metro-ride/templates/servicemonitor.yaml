@@ -1,0 +1,14 @@
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1" }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-services
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: Exists
+  endpoints:
+    - port: http
+      path: /metrics
+{{- end }}
