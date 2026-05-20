@@ -30,6 +30,30 @@ check_endpoint() {
   echo "ok: ${name}"
 }
 
+wait_for_kafka_event() {
+  local analytics_url
+  local deadline
+  local response
+  local consumed
+
+  analytics_url="$(service_url 8086)/v1/analytics/drivers"
+  deadline=$((SECONDS + TIMEOUT_SECONDS))
+  until false; do
+    response="$(curl -fsS "${analytics_url}")"
+    consumed="$(printf '%s' "${response}" | sed -n 's/.*"total_consumed":\([0-9][0-9]*\).*/\1/p')"
+    if [[ -n "${consumed}" && "${consumed}" -gt 0 && "${response}" == *'"drivers":['* ]]; then
+      echo "ok: analytics-service consumed ${consumed} Kafka driver location event(s)"
+      echo "${response}"
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "failed: analytics-service did not consume Kafka driver locations within timeout: ${response}" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 extract_json_string() {
   local key="$1"
   sed -n "s/.*\"${key}\":\"\\([^\"]*\\)\".*/\\1/p"
@@ -103,3 +127,18 @@ fi
 
 echo "ok: ride assigned to ${driver_id}"
 echo "${ride}"
+
+kafka_smoke="${ENABLE_KAFKA_SMOKE:-auto}"
+if [[ "${kafka_smoke}" == "true" ]] || {
+  [[ "${kafka_smoke}" == "auto" ]] && curl -fsS --max-time 1 "$(service_url 8086)/healthz" >/dev/null 2>&1
+}; then
+  echo "checking optional Kafka analytics extension..."
+  wait_for_endpoint "analytics-service /healthz" "$(service_url 8086)/healthz"
+  wait_for_endpoint "analytics-service /readyz" "$(service_url 8086)/readyz"
+  check_endpoint "analytics-service /metrics" "$(service_url 8086)/metrics"
+  curl -fsS "$(service_url 8086)/metrics" | grep -q "metroride_kafka_driver_location_events_total"
+  echo "ok: analytics-service exposes Kafka metrics"
+  wait_for_kafka_event
+else
+  echo "skipping optional Kafka analytics checks"
+fi

@@ -156,6 +156,25 @@ MetroRide includes production hardening for dependency-aware readiness checks, b
 
 See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behavior, idempotency design, dead-letter semantics, and expected behavior during Redis, PostgreSQL, routing, and dispatch failures.
 
+## Optional Kafka Streaming Extension
+
+MetroRide includes a lightweight optional Kafka profile for driver location telemetry. The core Redis Streams dispatch workflow is unchanged; Kafka is used only to demonstrate topic-based streaming, producers, consumers, consumer groups, partition keys, and replay concepts.
+
+Kafka does not start by default:
+
+```bash
+docker compose up -d
+```
+
+Start the optional Kafka extension explicitly:
+
+```bash
+docker compose --profile kafka up -d
+ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
+```
+
+See [docs/kafka-lightweight-extension.md](docs/kafka-lightweight-extension.md) and [docs/kafka-interview-notes.md](docs/kafka-interview-notes.md).
+
 ## Testing and CI
 
 MetroRide includes GitHub Actions CI for Go package tests, Docker Compose validation, image builds, stack startup, smoke testing, and backend integration tests against the running distributed system.
@@ -173,6 +192,8 @@ See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local 
 │   ├── architecture-decisions.md
 │   ├── interview-qa-bilingual.md
 │   ├── interview-talk-track.md
+│   ├── kafka-interview-notes.md
+│   ├── kafka-lightweight-extension.md
 │   ├── observability.md
 │   ├── reliability.md
 │   ├── resume-bullets.md
@@ -275,6 +296,8 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 - [Bilingual Interview Q&A](docs/interview-qa-bilingual.md)
 - [Architecture decisions](docs/architecture-decisions.md)
 - [API](docs/api.md)
+- [Kafka lightweight extension](docs/kafka-lightweight-extension.md)
+- [Kafka interview notes](docs/kafka-interview-notes.md)
 - [Observability](docs/observability.md)
 - [Reliability](docs/reliability.md)
 - [Testing and CI](docs/testing-and-ci.md)

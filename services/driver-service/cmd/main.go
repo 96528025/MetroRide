@@ -15,6 +15,7 @@ import (
 	"github.com/metroride/metroride/shared/pkg/config"
 	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/metroride/metroride/shared/pkg/httpx"
+	sharedkafka "github.com/metroride/metroride/shared/pkg/kafka"
 	"github.com/metroride/metroride/shared/pkg/logging"
 	"github.com/metroride/metroride/shared/pkg/metrics"
 	"github.com/metroride/metroride/shared/pkg/reliability"
@@ -29,8 +30,11 @@ type simulatedDriver struct {
 }
 
 type driverService struct {
-	drivers []simulatedDriver
-	rdb     *redis.Client
+	drivers       []simulatedDriver
+	rdb           *redis.Client
+	kafkaProducer *sharedkafka.Producer
+	kafkaEnabled  bool
+	redisEnabled  bool
 }
 
 func main() {
@@ -44,9 +48,23 @@ func main() {
 		WriteTimeout: reliability.RedisTimeout,
 	})
 	defer func() { _ = rdb.Close() }()
+	kafkaCfg := sharedkafka.LoadConfig("")
+	var kafkaProducer *sharedkafka.Producer
+	if kafkaCfg.Enabled {
+		kafkaProducer = sharedkafka.NewProducer(kafkaCfg)
+		defer func() { _ = kafkaProducer.Close() }()
+		log.Info("kafka driver location stream enabled", "topic", kafkaCfg.Topic, "brokers", kafkaCfg.Brokers)
+	}
+	redisEnabled := os.Getenv("ENABLE_REDIS_LOCATION_STREAM") != "false"
+	if !redisEnabled {
+		log.Info("redis driver location stream disabled")
+	}
 
 	svc := &driverService{
-		rdb: rdb,
+		rdb:           rdb,
+		kafkaProducer: kafkaProducer,
+		kafkaEnabled:  kafkaCfg.Enabled,
+		redisEnabled:  redisEnabled,
 		drivers: []simulatedDriver{
 			{ID: "driver-1001", Latitude: 37.7749, Longitude: -122.4194, Available: true},
 			{ID: "driver-1002", Latitude: 37.7840, Longitude: -122.4075, Available: true},
@@ -91,6 +109,7 @@ func (s *driverService) publishLocations(ctx context.Context, log interface {
 }) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	nextKafkaPublish := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -101,24 +120,58 @@ func (s *driverService) publishLocations(ctx context.Context, log interface {
 				s.drivers[i].Longitude += (rand.Float64() - 0.5) / 2000
 				s.drivers[i].Latitude = math.Round(s.drivers[i].Latitude*1000000) / 1000000
 				s.drivers[i].Longitude = math.Round(s.drivers[i].Longitude*1000000) / 1000000
-				payload := events.DriverLocationUpdated{
-					DriverID: s.drivers[i].ID, Latitude: s.drivers[i].Latitude, Longitude: s.drivers[i].Longitude,
-					Available: s.drivers[i].Available, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				if s.redisEnabled {
+					payload := events.DriverLocationUpdated{
+						DriverID: s.drivers[i].ID, Latitude: s.drivers[i].Latitude, Longitude: s.drivers[i].Longitude,
+						Available: s.drivers[i].Available, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+					}
+					envelope, err := events.NewEnvelope(uuid.NewString(), events.TypeDriverLocationUpdated, "driver-service", payload.DriverID, payload)
+					if err != nil {
+						log.Error("encode driver location failed", "error", err)
+						continue
+					}
+					redisCtx, cancel := reliability.WithRedisTimeout(ctx)
+					if _, err := events.Publish(redisCtx, s.rdb, events.StreamDriverLocations, envelope); err != nil {
+						metrics.DependencyErrors.WithLabelValues("driver-service", "redis").Inc()
+						log.Error("publish driver location failed", "error", err, "event_type", events.TypeDriverLocationUpdated, "driver_id", payload.DriverID)
+					}
+					cancel()
 				}
-				envelope, err := events.NewEnvelope(uuid.NewString(), events.TypeDriverLocationUpdated, "driver-service", payload.DriverID, payload)
-				if err != nil {
-					log.Error("encode driver location failed", "error", err)
-					continue
+				if s.kafkaEnabled && !time.Now().Before(nextKafkaPublish) {
+					s.publishKafkaLocation(ctx, log, s.drivers[i])
 				}
-				redisCtx, cancel := reliability.WithRedisTimeout(ctx)
-				if _, err := events.Publish(redisCtx, s.rdb, events.StreamDriverLocations, envelope); err != nil {
-					metrics.DependencyErrors.WithLabelValues("driver-service", "redis").Inc()
-					log.Error("publish driver location failed", "error", err, "event_type", events.TypeDriverLocationUpdated, "driver_id", payload.DriverID)
-				}
-				cancel()
+			}
+			if s.kafkaEnabled && !time.Now().Before(nextKafkaPublish) {
+				nextKafkaPublish = time.Now().Add(10 * time.Second)
 			}
 		}
 	}
+}
+
+func (s *driverService) publishKafkaLocation(ctx context.Context, log interface {
+	Info(string, ...any)
+	Error(string, ...any)
+}, driver simulatedDriver) {
+	if s.kafkaProducer == nil {
+		return
+	}
+	event := sharedkafka.DriverLocationEvent{
+		EventID:   uuid.NewString(),
+		EventType: events.TypeDriverLocationUpdated,
+		DriverID:  driver.ID,
+		Lat:       driver.Latitude,
+		Lng:       driver.Longitude,
+		Available: driver.Available,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	kafkaCtx, cancel := context.WithTimeout(ctx, sharedkafka.WriteTimeout())
+	defer cancel()
+	if err := s.kafkaProducer.PublishJSON(kafkaCtx, driver.ID, event); err != nil {
+		metrics.DependencyErrors.WithLabelValues("driver-service", "kafka").Inc()
+		log.Error("publish kafka driver location failed", "error", err, "event_type", event.EventType, "driver_id", driver.ID)
+		return
+	}
+	log.Info("published kafka driver location", "event_type", event.EventType, "driver_id", driver.ID)
 }
 
 func (s *driverService) checkRedis(ctx context.Context) error {
