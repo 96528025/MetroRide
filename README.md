@@ -156,6 +156,12 @@ MetroRide includes production hardening for dependency-aware readiness checks, b
 
 See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behavior, idempotency design, dead-letter semantics, and expected behavior during Redis, PostgreSQL, routing, and dispatch failures.
 
+## Testing and CI
+
+MetroRide includes GitHub Actions CI for Go package tests, Docker Compose validation, image builds, stack startup, smoke testing, and backend integration tests against the running distributed system.
+
+See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local test commands, smoke test coverage, integration test coverage, and future testing improvements.
+
 ## Repository Layout
 
 ```text
@@ -170,7 +176,8 @@ See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behav
 │   ├── observability.md
 │   ├── reliability.md
 │   ├── resume-bullets.md
-│   └── system-design.md
+│   ├── system-design.md
+│   └── testing-and-ci.md
 ├── infrastructure/
 │   ├── docker/
 │   ├── grafana/
@@ -270,6 +277,7 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 - [API](docs/api.md)
 - [Observability](docs/observability.md)
 - [Reliability](docs/reliability.md)
+- [Testing and CI](docs/testing-and-ci.md)
 - [Resume bullets](docs/resume-bullets.md)
 
 ## Scalability Roadmap
