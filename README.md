@@ -124,6 +124,7 @@ MetroRide is a production-style local distributed systems project designed to de
 
 - [System design](docs/system-design.md)
 - [Interview talk track](docs/interview-talk-track.md)
+- [Bilingual Interview Q&A](docs/interview-qa-bilingual.md)
 - [Architecture decisions](docs/architecture-decisions.md)
 
 ## Observability
@@ -164,6 +165,7 @@ See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behav
 │   ├── api.md
 │   ├── architecture.md
 │   ├── architecture-decisions.md
+│   ├── interview-qa-bilingual.md
 │   ├── interview-talk-track.md
 │   ├── observability.md
 │   ├── reliability.md
@@ -263,6 +265,7 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 - [Architecture](docs/architecture.md)
 - [System design](docs/system-design.md)
 - [Interview talk track](docs/interview-talk-track.md)
+- [Bilingual Interview Q&A](docs/interview-qa-bilingual.md)
 - [Architecture decisions](docs/architecture-decisions.md)
 - [API](docs/api.md)
 - [Observability](docs/observability.md)
