@@ -323,13 +323,13 @@ The main bottlenecks are the event backbone, the synchronous routing call, Postg
 
 ### 中文理解
 
-简单理解：Kafka 更强大，但本地项目一开始用 Kafka 会增加很多运维复杂度。Redis Streams 足够展示 event-driven、consumer group、ack 和 retry。
+简单理解：Kafka 更强大，但把所有核心工作流一开始都放到 Kafka 会增加很多运维复杂度。MetroRide 保留 Redis Streams 处理核心派单，同时通过可选 Kafka profile 展示 driver telemetry analytics。
 
-工程解释：技术选择要和项目阶段匹配。MetroRide 是 local production-style project，不是真实大规模系统。Redis Streams 保持可运行性，同时事件 envelope 保留未来迁移 Kafka 的空间。
+工程解释：技术选择要和项目阶段匹配。MetroRide 是 local production-style project，不是真实大规模系统。默认六个核心服务使用 Redis Streams；可选 Kafka profile 增加第七种应用服务职责 `analytics-service`，以及一个额外的 driver producer 运行实例。
 
 ### English answer to memorize
 
-Kafka would be a strong choice for a real high-volume event platform, but it adds operational complexity for a local portfolio project. Redis Streams gives me the core concepts I wanted to demonstrate: durable streams, consumer groups, acknowledgements, retries, and replay behavior. It keeps the system easy to run with Docker Compose. I also designed the event envelope so the transport can be replaced later. So Redis Streams is a pragmatic starting point, while Kafka is a clear future scaling path.
+Kafka would be a strong choice for a real high-volume event platform, but moving every core workflow to it would add unnecessary local complexity. MetroRide keeps the six-service core dispatch path on Redis Streams and offers a Kafka profile that adds `analytics-service` as a seventh application role for driver telemetry. The extra `driver-kafka-producer` is a second driver-service instance, not another service role. This demonstrates Kafka producers, consumers, groups, and partitioning without claiming that the core dispatch transport has been migrated.
 
 ### Keywords
 
@@ -350,7 +350,7 @@ Kafka would be a strong choice for a real high-volume event platform, but it add
 
 ### English answer to memorize
 
-Docker Compose is the right starting point because it makes the full local system easy to run and debug. Kubernetes is more realistic for production deployment, but it adds setup and operational overhead during early development. MetroRide includes Kubernetes manifests and Helm scaffolding to show the deployment direction without making local development harder. If I were deploying this in the cloud, I would use Kubernetes Deployments, Services, ConfigMaps, Secrets, managed Redis/PostgreSQL, resource limits, and autoscaling. So Compose is for local productivity, and Kubernetes is the production path.
+Docker Compose is the right starting point because it makes the default core local system easy to run and debug. Kubernetes can be appropriate for a production deployment, but it adds setup and operational overhead during early development. MetroRide includes Kubernetes manifests and Helm scaffolding to show a deployment direction; those files are not presented as a production deployment. A real cloud rollout would still need registry images, Secrets, managed dependencies or persistent storage, resource limits, ingress, monitoring, and autoscaling.
 
 ### Keywords
 
@@ -365,13 +365,13 @@ Docker Compose is the right starting point because it makes the full local syste
 
 ### 中文理解
 
-简单理解：这个项目为了清晰展示架构，选择了简单但真实的组件。比如用 Redis Streams 而不是 Kafka，用 REST 而不是 gRPC，用内存 routing state 而不是真实地图系统。
+简单理解：这个项目为了清晰展示架构，选择了简单但真实的组件。比如核心派单使用 Redis Streams、Kafka 只作为可选 telemetry extension，用 REST 而不是 gRPC，用内存 routing state 而不是真实地图系统。
 
-工程解释：tradeoff 是降低运维复杂度，换取本地可运行和清晰架构。未来可以加 Kafka、gRPC、outbox、OpenTelemetry、autoscaling 和 region partition。
+工程解释：tradeoff 是降低运维复杂度，换取本地可运行和清晰架构。未来可以扩大 Kafka 覆盖，并增加 gRPC、outbox、OpenTelemetry、autoscaling 和 region partition。
 
 ### English answer to memorize
 
-The main tradeoff was choosing simplicity where it helps the project remain runnable locally, while still preserving production-style patterns. I used Redis Streams instead of Kafka to reduce operational complexity. I used REST for internal routing calls instead of gRPC because it is easier to inspect and sufficient for the MVP. Routing uses simulated in-memory driver state instead of a real geospatial system. I also do not claim exactly-once distributed transactions; a transactional outbox would be a future improvement. These tradeoffs keep the project understandable while still demonstrating distributed systems concepts honestly.
+The main tradeoff was choosing simplicity where it helps the project remain runnable locally, while still preserving production-style patterns. I kept Redis Streams for the core dispatch workflow and limited Kafka to an optional driver-telemetry extension. I used REST for internal routing calls instead of gRPC because it is easier to inspect and sufficient for the MVP. Routing uses simulated in-memory driver state instead of a real geospatial system. I also do not claim exactly-once distributed transactions; a transactional outbox would be a future improvement.
 
 ### Keywords
 

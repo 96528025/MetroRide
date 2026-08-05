@@ -2,6 +2,8 @@
 
 MetroRide is a production-style distributed ride dispatch platform focused on backend systems design. The system models a real-time workflow where rider requests, driver locations, routing decisions, traffic updates, and notifications are owned by separate services and coordinated through asynchronous events.
 
+The default Docker Compose profile runs six core application service roles and 10 total Compose components after PostgreSQL, Redis, Prometheus, and Grafana are included. The optional `kafka` profile adds a seventh role, `analytics-service`, plus a second driver-service runtime instance, Kafka, and the one-shot Kafka init job, for 14 profile-expanded Compose components. Runtime instances and infrastructure containers are not counted as new application service roles.
+
 ## Design Goals
 
 - Isolate service responsibilities so each component has a clear operational boundary.
@@ -24,14 +26,15 @@ Separating these responsibilities makes the architecture easier to scale and rea
 
 ## Service Boundaries
 
-| Service | Primary Ownership | State |
-| --- | --- | --- |
-| `rider-service` | Ride request API and rider-facing ride status | PostgreSQL ride rows |
-| `driver-service` | Simulated driver availability and coordinate updates | In-memory simulation, Redis Stream output |
-| `dispatch-service` | Assignment workflow and ride state transition | PostgreSQL assignment rows, Redis Stream offsets |
-| `routing-service` | Driver proximity and ETA calculation | In-memory driver cache hydrated from events |
-| `traffic-service` | Regional congestion simulation | In-memory traffic model, Redis Stream output |
-| `notification-service` | Simulated rider/driver notification handling | Consumer group offsets |
+| Service role | Startup | Primary Ownership | State |
+| --- | --- | --- | --- |
+| `rider-service` | Default | Ride request API and rider-facing ride status | PostgreSQL ride rows |
+| `driver-service` | Default | Simulated driver availability and coordinate updates | In-memory simulation, Redis Stream output |
+| `dispatch-service` | Default | Assignment workflow and ride state transition | PostgreSQL assignment rows, Redis Stream offsets |
+| `routing-service` | Default | Driver proximity and ETA calculation | In-memory driver cache hydrated from events |
+| `traffic-service` | Default | Regional congestion simulation | In-memory traffic model, Redis Stream output |
+| `notification-service` | Default | Simulated rider/driver notification handling | Consumer group offsets |
+| `analytics-service` | Optional `kafka` profile | Driver-location telemetry analytics | In-memory view hydrated from a Kafka consumer group |
 
 ## Event-Driven Architecture
 
@@ -89,7 +92,7 @@ MetroRide includes foundational production hooks:
 - Structured logs include service names and workflow identifiers for cross-service debugging.
 - Docker Compose health checks gate Redis and PostgreSQL readiness before dependent services start.
 
-Next resilience steps would include idempotency keys, dead-letter streams, retry budgets, circuit breakers around routing calls, and stream lag alerting.
+Dispatch currently uses bounded retries, an idempotent PostgreSQL state transition, and `events.dead_letter` for retry-exhausted failures. The routing-outage integration test automatically validates that path. Next resilience steps include dead-letter replay tooling, a transactional outbox, circuit breakers around routing calls, and stream lag alerting.
 
 ## Scalability Considerations
 
@@ -110,4 +113,4 @@ See `docs/observability.md` for the metric and dashboard strategy.
 
 ## Production Deployment Goals
 
-The repository includes Docker Compose for local orchestration, Kubernetes manifests for cloud-native deployment structure, and Helm scaffolding for parameterized releases. The current manifests provide the shape of a production deployment, while leaving room for environment-specific additions such as secrets, ingress, persistent volumes, service monitors, autoscaling, and resource limits.
+The repository includes Docker Compose for local orchestration, Kubernetes manifests for cloud-native deployment structure, and Helm scaffolding for parameterized releases. These Kubernetes and Helm files are scaffolding, not evidence of a production deployment. They leave environment-specific work such as secrets, ingress, persistent volumes, service monitors, autoscaling, and resource limits for future implementation.
