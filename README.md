@@ -8,11 +8,11 @@
 ![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
 ![Kubernetes](https://img.shields.io/badge/Kubernetes-ready-326CE5?logo=kubernetes&logoColor=white)
 
-MetroRide is a production-style distributed ride dispatch platform focused on event-driven backend architecture and cloud-native infrastructure engineering. It models a real-time dispatch domain with independently deployable Go services, Redis Streams for asynchronous coordination, PostgreSQL for durable ride state, and an observability stack built around Prometheus and Grafana.
+MetroRide is a production-style distributed ride dispatch platform focused on event-driven backend architecture and cloud-native infrastructure engineering. Its default Docker Compose profile runs six core Go application services, with Redis Streams for asynchronous coordination, PostgreSQL for durable ride state, and an observability stack built around Prometheus and Grafana. An optional Kafka profile adds a seventh application role, `analytics-service`, for driver-location telemetry.
 
 The project is designed as a backend systems portfolio artifact: the emphasis is service ownership, event contracts, failure boundaries, operational visibility, and a path from local Docker Compose to Kubernetes-based deployment.
 
-## System Architecture
+## Default Core System Architecture
 
 ```mermaid
 flowchart LR
@@ -38,6 +38,8 @@ flowchart LR
     Notification -.->|/metrics| Prometheus
     Prometheus --> Grafana[Grafana]
 ```
+
+The default profile contains six application service roles: rider, driver, dispatch, routing, traffic, and notification. With PostgreSQL, Redis, Prometheus, and Grafana, that is 10 default Compose components. The optional `kafka` profile adds `analytics-service`, a second `driver-service` runtime instance named `driver-kafka-producer`, a Kafka broker, and the one-shot `kafka-init` job, bringing the profile-expanded Compose inventory to 14 components. The producer instance is not an eighth application role, and the init job is not a long-running service; the producer runs the existing driver-service binary with Kafka publishing enabled.
 
 ## Event Flow
 
@@ -91,19 +93,20 @@ flowchart TB
 
 ## Service Ownership
 
-| Service | Responsibility | Communication Pattern |
-| --- | --- | --- |
-| `rider-service` | Accepts ride requests, persists rider-facing state, emits `ride_requested`. | REST ingress, PostgreSQL writes, Redis Streams publish |
-| `driver-service` | Simulates live driver coordinates and availability. | Redis Streams publish |
-| `dispatch-service` | Consumes ride requests, coordinates driver assignment, persists assignment state. | Redis Streams consumer group, REST call to routing, PostgreSQL writes |
-| `routing-service` | Maintains available driver state and calculates nearest-driver ETA. | REST API, Redis Streams consumer |
-| `traffic-service` | Produces dynamic congestion updates for future route weighting. | Redis Streams publish |
-| `notification-service` | Consumes assignment events and simulates rider/driver delivery. | Redis Streams consumer group |
+| Service role | Startup | Responsibility | Communication Pattern |
+| --- | --- | --- | --- |
+| `rider-service` | Default | Accepts ride requests, persists rider-facing state, emits `ride_requested`. | REST ingress, PostgreSQL writes, Redis Streams publish |
+| `driver-service` | Default | Simulates live driver coordinates and availability. | Redis Streams publish |
+| `dispatch-service` | Default | Consumes ride requests, coordinates driver assignment, persists assignment state. | Redis Streams consumer group, REST call to routing, PostgreSQL writes |
+| `routing-service` | Default | Maintains available driver state and calculates nearest-driver ETA. | REST API, Redis Streams consumer |
+| `traffic-service` | Default | Produces dynamic congestion updates for future route weighting. | Redis Streams publish |
+| `notification-service` | Default | Consumes assignment events and simulates rider/driver delivery. | Redis Streams consumer group |
+| `analytics-service` | Optional `kafka` profile | Maintains a queryable view of driver telemetry from Kafka. | Kafka consumer group, REST read API |
 
 ## Technology Stack
 
-- **Language:** Go for backend services; Python reserved for future simulation or analytics utilities.
-- **Event bus:** Redis Streams with consumer groups for durable asynchronous workflows.
+- **Language:** Go for all current backend services.
+- **Event transport:** Redis Streams with consumer groups for the core asynchronous workflow; optional Kafka for driver-location telemetry.
 - **Storage:** PostgreSQL as the system of record for ride and assignment state.
 - **APIs:** REST for synchronous service boundaries, with protobuf/gRPC scaffolding reserved in `shared/proto`.
 - **Observability:** Prometheus metrics, Grafana dashboards, structured JSON logs, health and readiness probes.
@@ -114,7 +117,7 @@ flowchart TB
 
 MetroRide separates state mutation, assignment coordination, routing computation, and notification delivery into independently deployable services. Ride intake is synchronous only at the API boundary; downstream dispatch work is asynchronous through Redis Streams. This design keeps rider request latency decoupled from assignment processing, makes dispatch consumers horizontally scalable, and provides a foundation for replay, backpressure handling, and transport migration.
 
-Redis Streams are used as the initial event log because they provide persistent streams, consumer groups, explicit acknowledgements, and simple local development ergonomics. The event envelope in `shared/pkg/events` keeps transport concerns isolated so Kafka can be introduced later without rewriting domain payloads.
+Redis Streams are used as the core workflow event log because they provide persistent streams, consumer groups, explicit acknowledgements, and simple local development ergonomics. The event envelope in `shared/pkg/events` keeps transport concerns isolated so the optional Kafka usage can expand to additional streams later without rewriting domain payloads.
 
 PostgreSQL remains the authoritative store for ride status. Redis carries workflow events; it does not own long-term ride truth. This separation mirrors production systems where event logs coordinate distributed work while relational storage protects transactional state and queryability.
 
@@ -177,9 +180,17 @@ See [docs/kafka-lightweight-extension.md](docs/kafka-lightweight-extension.md) a
 
 ## Testing and CI
 
-MetroRide includes GitHub Actions CI for Go package tests, Docker Compose validation, image builds, stack startup, smoke testing, and backend integration tests against the running distributed system.
+MetroRide includes GitHub Actions CI for Go package tests, Docker Compose validation, image builds, stack startup, smoke testing, and backend integration tests against the running distributed system. Automated integration coverage includes:
 
-See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local test commands, smoke test coverage, integration test coverage, and future testing improvements.
+- Happy-path ride assignment.
+- Duplicate-event idempotency.
+- A real routing outage created by stopping `routing-service`.
+- Dispatch retry exhaustion through the production retry path.
+- Dead-letter verification in the real `events.dead_letter` Redis Stream, including confirmation that the ride remains unassigned in PostgreSQL.
+
+The suite does not claim coverage of every dependency or recovery mode.
+
+See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local test commands, smoke test coverage, and integration test coverage.
 
 ## Repository Layout
 
@@ -206,14 +217,19 @@ See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local 
 │   ├── k8s/
 │   └── prometheus/
 ├── scripts/
+│   ├── failure-integration-test.sh
 │   └── smoke-test.sh
 ├── services/
+│   ├── analytics-service/       # optional kafka profile
 │   ├── dispatch-service/
 │   ├── driver-service/
 │   ├── notification-service/
 │   ├── rider-service/
 │   ├── routing-service/
 │   └── traffic-service/
+├── tests/
+│   ├── failureintegration/
+│   └── integration/
 └── shared/
     ├── events/
     ├── pkg/
@@ -258,6 +274,7 @@ bash scripts/smoke-test.sh
 | `routing-service` | `8083` |
 | `traffic-service` | `8084` |
 | `notification-service` | `8085` |
+| `analytics-service` (optional `kafka` profile) | `8086` |
 | Prometheus | `9090` |
 | Grafana | `3000` |
 | PostgreSQL | `5432` |
@@ -312,4 +329,4 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 - **Multi-region deployment:** Partition drivers and rides by region, then replicate critical events across regions.
 - **AI-assisted ETA prediction:** Introduce an ETA model service using traffic, driver, and route features.
 - **Demand forecasting:** Add regional demand prediction to pre-position driver supply.
-- **Resilience hardening:** Add dead-letter streams, idempotency keys, retry budgets, and circuit breakers.
+- **Resilience hardening:** Add dead-letter replay tooling, transactional outbox delivery, retry budgets, and circuit breakers.

@@ -4,13 +4,15 @@ Use this document to explain MetroRide as a backend infrastructure project in in
 
 ## 30-Second Project Pitch
 
-MetroRide is a Go-based distributed ride dispatch platform I built to demonstrate backend infrastructure concepts. It uses six microservices, Redis Streams for event-driven coordination, PostgreSQL for durable ride state, and Prometheus/Grafana for observability. A rider request is persisted, published as an event, consumed by dispatch workers, routed to an available driver, assigned idempotently, and then emitted as a notification event. The project focuses on service boundaries, reliability, observability, and cloud-native deployment patterns rather than frontend features.
+MetroRide is a Go-based distributed ride dispatch platform I built to demonstrate backend infrastructure concepts. Its default stack uses six core microservices, Redis Streams for event-driven coordination, PostgreSQL for durable ride state, and Prometheus/Grafana for observability. An optional Kafka profile adds a seventh application role for driver telemetry analytics. A rider request is persisted, published as an event, consumed by dispatch workers, routed to an available driver, assigned idempotently, and then emitted as a notification event. The project focuses on service boundaries, reliability, observability, and cloud-native deployment patterns rather than frontend features.
 
 ## 2-Minute Technical Explanation
 
 MetroRide models the core backend workflow of ride dispatch. `rider-service` accepts ride requests over REST and writes the requested ride to PostgreSQL. It then publishes a `ride_requested` event to Redis Streams. `dispatch-service` consumes that stream through a consumer group, checks PostgreSQL to make sure the ride has not already been assigned, calls `routing-service` to find the nearest available driver, and persists the assignment. After that, it publishes assignment and notification events.
 
 Driver state is fed by `driver-service`, which simulates location updates. `routing-service` consumes those updates and maintains an in-memory view of available drivers for ETA calculation. `notification-service` consumes assignment notifications. `traffic-service` simulates congestion updates for future route weighting.
+
+The optional Kafka profile runs `analytics-service` and a second driver-service instance configured as a Kafka producer. That additional instance is not a new service responsibility; it publishes driver telemetry for the analytics consumer while the six-service core Redis workflow remains unchanged.
 
 The reliability story includes dependency-aware readiness checks, explicit timeouts, bounded retries, idempotent assignment logic, and a Redis dead-letter stream for failed dispatch events. Observability is handled with `/metrics`, Prometheus, Grafana dashboards, health checks, readiness checks, and structured JSON logs.
 
@@ -28,7 +30,7 @@ Reliability is handled through timeouts, retries, and idempotency. If routing is
 
 Observability is built into every service. Each service exposes health, readiness, and Prometheus metrics. Grafana visualizes request rate, dispatch latency, routing duration, assignment failures, and active drivers. Structured logs include service names, event types, ride IDs, driver IDs, and errors.
 
-For cloud deployment, Docker Compose runs the full local system, and Kubernetes/Helm artifacts show how the services could be deployed with service discovery, health probes, and future autoscaling.
+For cloud deployment, Docker Compose runs the default core local system, and Kubernetes/Helm scaffolding shows how the services could later be deployed with service discovery, health probes, and autoscaling. The repository does not claim that this scaffold is a production deployment.
 
 ## Common Interviewer Questions
 

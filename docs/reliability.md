@@ -53,6 +53,12 @@ After retries are exhausted, `dispatch-service` publishes a dead-letter event co
 
 If dead-letter publication succeeds, the original stream message is acknowledged so it does not poison the consumer group indefinitely. If dead-letter publication fails, the original message is left unacknowledged for later recovery.
 
+### Automated Verification Status
+
+The CI-required routing-outage integration test verifies this path across real components rather than mocks. It stops `routing-service`, creates a ride through `rider-service`, lets the running dispatch consumer exhaust bounded retries, reads the matching entry from the real Redis dead-letter stream, and confirms in PostgreSQL that the ride remains `requested` with no assignment row.
+
+The test validates this routing failure path only. Redis outages, PostgreSQL outages, dispatch crash recovery, and dead-letter replay remain outside the current automated integration coverage.
+
 ## Failure Modes
 
 ### Routing Service Unavailable
@@ -80,7 +86,7 @@ If PostgreSQL is unavailable:
 
 ### Dispatch Service Restarts
 
-Redis Stream consumer groups preserve unacknowledged messages. If `dispatch-service` restarts before acknowledging a message, the message remains pending and can be recovered by a future consumer. The idempotency check prevents duplicate assignment if the ride was already assigned before the restart.
+Redis Stream consumer groups preserve unacknowledged messages. If `dispatch-service` restarts before acknowledging a message, the message remains pending, and the idempotency check protects an already-assigned ride from a duplicate state transition. The current worker reads new messages with `>` but does not yet claim abandoned pending entries; production recovery still requires `XAUTOCLAIM`/`XCLAIM` handling or dedicated replay tooling.
 
 ## Metrics
 
