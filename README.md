@@ -126,8 +126,6 @@ PostgreSQL remains the authoritative store for ride status. Redis carries workfl
 MetroRide is a production-style local distributed systems project designed to demonstrate backend infrastructure concepts: service decomposition, asynchronous workflow coordination, durable state, reliability controls, and observability. It is not presented as a real production deployment at scale; it is structured so the architecture can be explained and extended like a production backend system.
 
 - [System design](docs/system-design.md)
-- [Interview talk track](docs/interview-talk-track.md)
-- [Bilingual Interview Q&A](docs/interview-qa-bilingual.md)
 - [Architecture decisions](docs/architecture-decisions.md)
 
 ## Observability
@@ -176,7 +174,7 @@ docker compose --profile kafka up -d
 ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 ```
 
-See [docs/kafka-lightweight-extension.md](docs/kafka-lightweight-extension.md) and [docs/kafka-interview-notes.md](docs/kafka-interview-notes.md).
+See [docs/kafka-lightweight-extension.md](docs/kafka-lightweight-extension.md).
 
 ## Testing and CI
 
@@ -201,13 +199,9 @@ See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local 
 │   ├── api.md
 │   ├── architecture.md
 │   ├── architecture-decisions.md
-│   ├── interview-qa-bilingual.md
-│   ├── interview-talk-track.md
-│   ├── kafka-interview-notes.md
 │   ├── kafka-lightweight-extension.md
 │   ├── observability.md
 │   ├── reliability.md
-│   ├── resume-bullets.md
 │   ├── system-design.md
 │   └── testing-and-ci.md
 ├── infrastructure/
@@ -309,16 +303,12 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 
 - [Architecture](docs/architecture.md)
 - [System design](docs/system-design.md)
-- [Interview talk track](docs/interview-talk-track.md)
-- [Bilingual Interview Q&A](docs/interview-qa-bilingual.md)
 - [Architecture decisions](docs/architecture-decisions.md)
 - [API](docs/api.md)
 - [Kafka lightweight extension](docs/kafka-lightweight-extension.md)
-- [Kafka interview notes](docs/kafka-interview-notes.md)
 - [Observability](docs/observability.md)
 - [Reliability](docs/reliability.md)
 - [Testing and CI](docs/testing-and-ci.md)
-- [Resume bullets](docs/resume-bullets.md)
 
 ## Scalability Roadmap
 
