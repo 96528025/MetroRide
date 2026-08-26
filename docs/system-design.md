@@ -6,7 +6,7 @@ MetroRide is a production-style local distributed systems project that demonstra
 
 Ride dispatch is a real-time coordination problem. A rider creates a request, drivers continuously publish location updates, a dispatch system chooses an available driver, routing estimates distance and ETA, and notifications are emitted after assignment. The system must coordinate these steps without tightly coupling every service through synchronous calls.
 
-MetroRide models this workflow with Go microservices, Redis Streams, PostgreSQL, Docker Compose, Kubernetes manifests, Helm scaffolding, Prometheus, and Grafana.
+MetroRide models this workflow with six default core Go application services, Redis Streams, PostgreSQL, Docker Compose, Kubernetes manifests, Helm scaffolding, Prometheus, and Grafana. An optional Kafka profile adds `analytics-service` as a seventh application role for driver-location telemetry; its extra driver producer is another instance of the existing driver-service role.
 
 ## System Goals
 
@@ -34,18 +34,19 @@ MetroRide uses a service-oriented architecture with asynchronous workflow coordi
 - Redis Streams are used for durable event flow and consumer-group processing.
 - PostgreSQL stores authoritative ride and assignment state.
 - Prometheus and Grafana provide metrics and dashboards.
-- Docker Compose runs the full local system, while Kubernetes and Helm artifacts show the deployment direction.
+- Docker Compose runs the default core local system, while Kubernetes and Helm artifacts show a scaffolded deployment direction.
 
 ## Service Responsibilities
 
-| Service | Responsibility |
-| --- | --- |
-| `rider-service` | Accepts ride requests, stores ride state, publishes `ride_requested`. |
-| `driver-service` | Simulates driver location and availability updates. |
-| `dispatch-service` | Consumes ride requests, coordinates routing, persists assignments, emits assignment and notification events. |
-| `routing-service` | Maintains driver-location state and computes nearest-driver ETA. |
-| `traffic-service` | Simulates congestion updates for future route weighting. |
-| `notification-service` | Consumes assignment notifications and simulates delivery. |
+| Service role | Startup | Responsibility |
+| --- | --- | --- |
+| `rider-service` | Default | Accepts ride requests, stores ride state, publishes `ride_requested`. |
+| `driver-service` | Default | Simulates driver location and availability updates. |
+| `dispatch-service` | Default | Consumes ride requests, coordinates routing, persists assignments, emits assignment and notification events. |
+| `routing-service` | Default | Maintains driver-location state and computes nearest-driver ETA. |
+| `traffic-service` | Default | Simulates congestion updates for future route weighting. |
+| `notification-service` | Default | Consumes assignment notifications and simulates delivery. |
+| `analytics-service` | Optional `kafka` profile | Consumes Kafka driver telemetry and exposes the latest per-driver analytics view. |
 
 ## End-to-End Ride Request Flow
 
@@ -161,7 +162,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 
 ## Future Improvements
 
-- Add Kafka as the event backbone.
+- Migrate appropriate core event streams to Kafka if production throughput and retention requirements justify it; the current Kafka profile is an optional telemetry extension only.
 - Move service-to-service calls to gRPC with deadlines and typed protobuf contracts.
 - Add OpenTelemetry distributed tracing.
 - Add a transactional outbox for reliable event publication.
