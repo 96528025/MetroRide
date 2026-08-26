@@ -30,6 +30,24 @@ check_endpoint() {
   echo "ok: ${name}"
 }
 
+check_metric() {
+  local name="$1"
+  local url="$2"
+  local metric="$3"
+  local body
+
+  # Capture the body instead of piping into `grep -q`: `grep -q` exits at its
+  # first match and closes the pipe, so curl can finish with exit 23
+  # (CURLE_WRITE_ERROR) even when the metric was present, and `set -o pipefail`
+  # then aborts the whole smoke test.
+  body="$(curl -fsS "${url}")"
+  if [[ "${body}" != *"${metric}"* ]]; then
+    echo "failed: ${name} did not expose ${metric}" >&2
+    return 1
+  fi
+  echo "ok: ${name} exposes ${metric}"
+}
+
 wait_for_kafka_event() {
   local analytics_url
   local deadline
@@ -88,10 +106,8 @@ done
 
 echo "checking metrics endpoints..."
 check_endpoint "rider-service /metrics" "$(service_url 8080)/metrics"
-curl -fsS "$(service_url 8082)/metrics" | grep -q "metroride_dispatch_latency_seconds"
-echo "ok: dispatch-service exposes dispatch latency metric"
-curl -fsS "$(service_url 8083)/metrics" | grep -q "metroride_routing_computation_seconds"
-echo "ok: routing-service exposes routing computation metric"
+check_metric "dispatch-service" "$(service_url 8082)/metrics" "metroride_dispatch_latency_seconds"
+check_metric "routing-service" "$(service_url 8083)/metrics" "metroride_routing_computation_seconds"
 
 echo "creating ride request..."
 response="$(curl -fsS -X POST "$(service_url 8080)/v1/rides" \
@@ -136,8 +152,7 @@ if [[ "${kafka_smoke}" == "true" ]] || {
   wait_for_endpoint "analytics-service /healthz" "$(service_url 8086)/healthz"
   wait_for_endpoint "analytics-service /readyz" "$(service_url 8086)/readyz"
   check_endpoint "analytics-service /metrics" "$(service_url 8086)/metrics"
-  curl -fsS "$(service_url 8086)/metrics" | grep -q "metroride_kafka_driver_location_events_total"
-  echo "ok: analytics-service exposes Kafka metrics"
+  check_metric "analytics-service" "$(service_url 8086)/metrics" "metroride_kafka_driver_location_events_total"
   wait_for_kafka_event
 else
   echo "skipping optional Kafka analytics checks"
