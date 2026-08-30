@@ -80,7 +80,7 @@ Use Docker Compose as the primary local runtime.
 
 ### Tradeoffs
 
-Docker Compose keeps local setup simple and reproducible. It is not a production orchestrator, so the repo also includes Kubernetes manifests and Helm scaffolding to show the cloud-native direction.
+Docker Compose keeps local setup simple and reproducible. It is not a production orchestrator, so the repo also includes raw Kubernetes manifests to show the cloud-native direction, and a Helm chart that CI actually installs on a throwaway KinD cluster to prove each release deploys and works. That cluster is deployment validation inside a CI runner, not a hosted environment.
 
 ## ADR 005: Prometheus and Grafana for Observability
 

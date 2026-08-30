@@ -3,10 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  # workflow_dispatch is a trusted, explicitly selected delivery event: only
+  # accounts with write access to this repository can start one.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  # Obsolete runs on the same branch/PR are cancelled so they do not hold runners.
+  # Pushes to main are never cancelled: they are the trusted delivery path.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   backend:
@@ -21,8 +31,22 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
           cache: true
+
+      - name: Check Go formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "${unformatted}"
+            echo "Run 'gofmt -w .' locally and commit the result."
+            exit 1
+          fi
+          echo "ok: all tracked Go files are gofmt-formatted"
+
+      - name: Run go vet
+        run: go vet ./...
 
       - name: Run Go tests
         run: go test ./...
@@ -58,3 +82,76 @@ jobs:
       - name: Shut down Docker Compose stack
         if: always()
         run: docker compose down -v
+
+  publish-images:
+    name: Publish ${{ matrix.service }} to GHCR
+    needs: backend
+    # Never publish from a pull request: forks and untrusted branches must not
+    # be able to write packages. `needs: backend` makes publishing impossible
+    # unless the full validation job passed first.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - rider-service
+          - driver-service
+          - dispatch-service
+          - routing-service
+          - traffic-service
+          - notification-service
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and push immutable image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          # Release tags get an extra human-readable tag alongside the
+          # immutable SHA tag. Deployments always reference the SHA.
+          IMAGE_EXTRA_TAGS: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          SERVICE: ${{ matrix.service }}
+        run: bash scripts/build-images.sh --push "${SERVICE}"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  deploy-validation-pull-request:
+    name: Deploy validation (pull request)
+    needs: backend
+    if: github.event_name == 'pull_request'
+    # No package access: the pull-request path never touches a registry.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy-validation.yml
+    with:
+      image_source: pr
+      # For pull_request events this is the merge-commit SHA, which is exactly
+      # the tree the images are built from.
+      image_tag: ${{ github.sha }}
+
+  deploy-validation-release:
+    name: Deploy validation (GHCR artifacts)
+    needs: publish-images
+    if: github.event_name != 'pull_request'
+    # packages: read is what lets the runner pull the images back. The token
+    # never enters the cluster.
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/deploy-validation.yml
+    with:
+      image_source: ghcr
+      image_tag: ${{ github.sha }}

@@ -3,6 +3,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $name }}
+  labels:
+    {{- include "metroride.labels" $ | nindent 4 }}
+    app: {{ $name }}
 spec:
   replicas: {{ $svc.replicas }}
   selector:
@@ -11,14 +14,23 @@ spec:
   template:
     metadata:
       labels:
+        {{- include "metroride.labels" $ | nindent 8 }}
         app: {{ $name }}
+      annotations:
+        # How the image running here was acquired: local-build for pull
+        # requests, ghcr-pull for trusted delivery. Visible in kubectl describe.
+        metroride.io/image-source: {{ $.Values.imageSource | quote }}
+        # Roll pods when configuration changes even though the tag has not.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
     spec:
+      {{- include "metroride.dependencyWait" (dict "root" $ "dependsOn" $svc.dependsOn) | nindent 6 }}
       containers:
         - name: {{ $name }}
-          image: "{{ $.Values.image.repository }}/{{ $name }}:{{ $.Values.image.tag }}"
+          image: {{ include "metroride.image" (dict "root" $ "service" $name) | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           ports:
-            - containerPort: {{ $svc.port }}
+            - name: http
+              containerPort: {{ $svc.port }}
           envFrom:
             - configMapRef:
                 name: {{ $.Release.Name }}-config
@@ -44,10 +56,14 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: {{ $svc.port }}
+              port: http
+            {{- toYaml $.Values.probes.readiness | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /healthz
-              port: {{ $svc.port }}
+              port: http
+            {{- toYaml $.Values.probes.liveness | nindent 12 }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
 ---
 {{- end }}

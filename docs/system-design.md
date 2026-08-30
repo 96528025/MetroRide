@@ -34,7 +34,7 @@ MetroRide uses a service-oriented architecture with asynchronous workflow coordi
 - Redis Streams are used for durable event flow and consumer-group processing.
 - PostgreSQL stores authoritative ride and assignment state.
 - Prometheus and Grafana provide metrics and dashboards.
-- Docker Compose runs the default core local system, while Kubernetes and Helm artifacts show a scaffolded deployment direction.
+- Docker Compose runs the default core local system. The Helm chart is deployed for real on every CI run, to a throwaway KinD cluster inside the runner that is validated end to end and then deleted; the raw Kubernetes manifests remain a scaffolded deployment direction.
 
 ## Service Responsibilities
 

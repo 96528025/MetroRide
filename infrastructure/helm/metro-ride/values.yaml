@@ -1,29 +1,146 @@
+# Default values for the metro-ride chart.
+#
+# Defaults describe a cluster that pulls published images from GHCR and is
+# given its own PostgreSQL and Redis. The ephemeral KinD release-validation
+# profile overrides this via values-kind.yaml (plus values-kind-pr.yaml or
+# values-kind-ghcr.yaml).
+
 image:
-  repository: metroride
-  tag: latest
+  # Rendered reference: <registry>/<namespace>/<namePrefix><service>:<tag>
+  # e.g. ghcr.io/96528025/metroride-rider-service:<full-commit-sha>
+  # Kept identical to scripts/lib/images.sh so the chart, the workflow and the
+  # documentation cannot drift.
+  registry: ghcr.io
+  namespace: "96528025"
+  namePrefix: metroride-
+  # Immutable tag. CI always sets this to the full commit SHA; empty falls back
+  # to the chart appVersion. Deployments never reference a floating tag.
+  tag: ""
+  # IfNotPresent lets a cluster run images that were side-loaded with
+  # `kind load docker-image`, so no registry credential is needed in-cluster.
   pullPolicy: IfNotPresent
+
+# Recorded as a pod annotation so `kubectl describe pod` shows how the running
+# images were acquired: local-build (pull requests) or ghcr-pull (trusted
+# delivery). Purely informational.
+imageSource: unspecified
 
 config:
   redisAddr: redis:6379
   postgresDsn: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
   routingServiceUrl: http://routing-service:8083
 
+# Sized for a single-node KinD cluster on a GitHub-hosted runner. The Go
+# services are small static binaries; the limits exist to keep one misbehaving
+# pod from starving the node, not to model production capacity.
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 500m
+    memory: 192Mi
+
+probes:
+  # Readiness is the startup-ordering mechanism: dispatch-service reports
+  # not-ready until PostgreSQL, Redis, its consumer group and routing-service
+  # all answer, so `helm --wait` blocks on real dependency health rather than
+  # on a fixed sleep.
+  readiness:
+    initialDelaySeconds: 3
+    periodSeconds: 3
+    timeoutSeconds: 3
+    failureThreshold: 40
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+
+# Bounded init container that blocks a service from starting until its data
+# dependencies accept TCP connections. Prevents avoidable CrashLoopBackOff for
+# the services that exit when Redis is unavailable at startup.
+dependencyWait:
+  enabled: false
+  timeoutSeconds: 180
+  # Each probe speaks the dependency's own protocol using an image the cluster
+  # already has loaded, so no extra image is introduced.
+  redisImage: redis:7-alpine
+  postgresImage: postgres:16-alpine
+  postgresHost: postgres
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi
+
+# Chart-owned, test-only PostgreSQL and Redis.
+#
+# Disabled by default: a real environment brings its own managed data stores.
+# The KinD release-validation profile enables them so the ephemeral deployment
+# contains every dependency the tested ride flow needs. These are deliberately
+# plain Deployments with emptyDir storage and no persistence, no backups and no
+# secret management: they exist for the lifetime of one CI job. No external
+# dependency charts are used.
+dependencies:
+  enabled: false
+  postgres:
+    image: postgres:16-alpine
+    database: metroride
+    username: metroride
+    # Throwaway credential for a database that is never reachable outside the
+    # ephemeral cluster and is destroyed with it. It matches the value already
+    # used by docker-compose.yml so local and CI runs behave identically.
+    password: metroride
+    # Schema for the test database. Supplied at install time with
+    #   --set-file dependencies.postgres.initSql=infrastructure/docker/postgres/init.sql
+    # so the schema has exactly one source of truth, shared with Compose.
+    initSql: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+  redis:
+    image: redis:7-alpine
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+
+# The six core services. analytics-service is not included: it only runs under
+# the optional Kafka Compose profile.
+# dependsOn mirrors the depends_on graph already expressed in
+# docker-compose.yml and drives the bounded startup-ordering init containers.
 services:
   rider-service:
     port: 8080
     replicas: 2
+    dependsOn: [postgres, redis]
   driver-service:
     port: 8081
     replicas: 1
+    dependsOn: [redis]
   dispatch-service:
     port: 8082
     replicas: 2
+    dependsOn: [postgres, redis]
   routing-service:
     port: 8083
     replicas: 2
+    dependsOn: [redis]
   traffic-service:
     port: 8084
     replicas: 1
+    dependsOn: [redis]
   notification-service:
     port: 8085
     replicas: 1
+    dependsOn: [redis]
