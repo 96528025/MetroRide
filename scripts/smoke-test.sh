@@ -4,6 +4,16 @@ set -euo pipefail
 BASE_HOST="${BASE_HOST:-localhost}"
 TIMEOUT_SECONDS="${SMOKE_TIMEOUT_SECONDS:-60}"
 
+# The exact end-to-end ride request this smoke test drives through the system.
+# rider-service must answer HTTP 202, and the ride must reach status "assigned"
+# with a non-empty driver_id. Kept here as a named constant so the contract is
+# readable without tracing the curl invocation below.
+SMOKE_RIDE_REQUEST='{"rider_id":"smoke-rider","pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}'
+
+# Optional: write the created ride id here so a caller can assert final state
+# through another channel (for example directly in PostgreSQL).
+SMOKE_RIDE_ID_FILE="${SMOKE_RIDE_ID_FILE:-}"
+
 service_url() {
   local port="$1"
   printf 'http://%s:%s' "${BASE_HOST}" "${port}"
@@ -110,14 +120,26 @@ check_metric "dispatch-service" "$(service_url 8082)/metrics" "metroride_dispatc
 check_metric "routing-service" "$(service_url 8083)/metrics" "metroride_routing_computation_seconds"
 
 echo "creating ride request..."
-response="$(curl -fsS -X POST "$(service_url 8080)/v1/rides" \
+create_body="$(mktemp)"
+create_status="$(curl -sS -o "${create_body}" -w '%{http_code}' -X POST "$(service_url 8080)/v1/rides" \
   -H 'Content-Type: application/json' \
-  -d '{"rider_id":"smoke-rider","pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}')"
+  -d "${SMOKE_RIDE_REQUEST}")"
+response="$(cat "${create_body}")"
+rm -f "${create_body}"
+
+if [[ "${create_status}" != "202" ]]; then
+  echo "failed: expected HTTP 202 from POST /v1/rides, got ${create_status}: ${response}" >&2
+  exit 1
+fi
+echo "ok: POST /v1/rides returned HTTP 202"
 
 ride_id="$(printf '%s' "${response}" | extract_json_string "ride_id")"
 if [[ -z "${ride_id}" ]]; then
   echo "failed: could not parse ride_id from response: ${response}" >&2
   exit 1
+fi
+if [[ -n "${SMOKE_RIDE_ID_FILE}" ]]; then
+  printf '%s' "${ride_id}" > "${SMOKE_RIDE_ID_FILE}"
 fi
 
 echo "created ride: ${ride_id}"

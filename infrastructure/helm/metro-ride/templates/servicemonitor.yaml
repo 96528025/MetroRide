@@ -3,11 +3,12 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: {{ .Release.Name }}-services
+  labels:
+    {{- include "metroride.labels" . | nindent 4 }}
 spec:
   selector:
-    matchExpressions:
-      - key: app
-        operator: Exists
+    matchLabels:
+      metroride.io/metrics: "true"
   endpoints:
     - port: http
       path: /metrics

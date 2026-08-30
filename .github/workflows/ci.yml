@@ -127,3 +127,31 @@ jobs:
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io
+
+  deploy-validation-pull-request:
+    name: Deploy validation (pull request)
+    needs: backend
+    if: github.event_name == 'pull_request'
+    # No package access: the pull-request path never touches a registry.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy-validation.yml
+    with:
+      image_source: pr
+      # For pull_request events this is the merge-commit SHA, which is exactly
+      # the tree the images are built from.
+      image_tag: ${{ github.sha }}
+
+  deploy-validation-release:
+    name: Deploy validation (GHCR artifacts)
+    needs: publish-images
+    if: github.event_name != 'pull_request'
+    # packages: read is what lets the runner pull the images back. The token
+    # never enters the cluster.
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/deploy-validation.yml
+    with:
+      image_source: ghcr
+      image_tag: ${{ github.sha }}

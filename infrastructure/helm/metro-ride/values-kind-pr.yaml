@@ -1,0 +1,7 @@
+# Pull-request image acquisition.
+#
+# The six service images are built from this commit inside the runner and side-
+# loaded into KinD with `kind load docker-image`. Nothing is published to GHCR
+# and nothing is pulled from any registry, so pull-request validation never
+# depends on registry access, package visibility or image pull secrets.
+imageSource: local-build

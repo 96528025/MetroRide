@@ -1,0 +1,11 @@
+# Trusted-delivery image acquisition.
+#
+# The six service images were published to ghcr.io/96528025/metroride-<service>
+# under the full commit SHA, then pulled back onto the runner with the
+# workflow's GITHUB_TOKEN and side-loaded into KinD with
+# `kind load docker-image`. Deploying these exact artifacts is what proves the
+# published images are real, retrievable and runnable.
+#
+# The registry credential stays on the runner: it is never placed inside the
+# cluster as an imagePullSecret.
+imageSource: ghcr-pull
