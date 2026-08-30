@@ -3,7 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  # workflow_dispatch is a trusted, explicitly selected delivery event: only
+  # accounts with write access to this repository can start one.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -78,3 +82,48 @@ jobs:
       - name: Shut down Docker Compose stack
         if: always()
         run: docker compose down -v
+
+  publish-images:
+    name: Publish ${{ matrix.service }} to GHCR
+    needs: backend
+    # Never publish from a pull request: forks and untrusted branches must not
+    # be able to write packages. `needs: backend` makes publishing impossible
+    # unless the full validation job passed first.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - rider-service
+          - driver-service
+          - dispatch-service
+          - routing-service
+          - traffic-service
+          - notification-service
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and push immutable image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          # Release tags get an extra human-readable tag alongside the
+          # immutable SHA tag. Deployments always reference the SHA.
+          IMAGE_EXTRA_TAGS: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          SERVICE: ${{ matrix.service }}
+        run: bash scripts/build-images.sh --push "${SERVICE}"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
