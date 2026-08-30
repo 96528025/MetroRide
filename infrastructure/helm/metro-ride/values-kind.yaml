@@ -1,0 +1,46 @@
+# Ephemeral KinD release-validation profile.
+#
+# This profile is used by CI to stand up the six core services plus their data
+# dependencies inside a throwaway single-node KinD cluster that lives only for
+# the duration of one GitHub Actions job. It is deployment validation, not
+# hosting: nothing here outlives the runner.
+#
+# Combine with exactly one image-acquisition profile:
+#   -f values-kind-pr.yaml    images built locally in the runner (pull requests)
+#   -f values-kind-ghcr.yaml  images pulled back from GHCR (trusted delivery)
+#
+# Prometheus and Grafana are deliberately absent. They are not exercised by the
+# ride flow this profile validates, and omitting them keeps the cluster inside
+# the resources of a GitHub-hosted runner. Their Docker Compose support is
+# unchanged; observability is not removed from the project.
+
+# Images are side-loaded with `kind load docker-image`, so the kubelet must
+# never try to reach a registry and no imagePullSecret is required.
+image:
+  pullPolicy: IfNotPresent
+
+# Chart-owned, test-only PostgreSQL and Redis, with deterministic in-cluster
+# DNS names (postgres:5432, redis:6379) matching the service configuration.
+dependencies:
+  enabled: true
+
+# Bounded protocol-level startup ordering instead of fixed sleeps.
+dependencyWait:
+  enabled: true
+  timeoutSeconds: 180
+
+# One replica per service: the validated behaviour is end-to-end correctness,
+# not capacity, and a single-node runner has better things to do with its CPU.
+services:
+  rider-service:
+    replicas: 1
+  driver-service:
+    replicas: 1
+  dispatch-service:
+    replicas: 1
+  routing-service:
+    replicas: 1
+  traffic-service:
+    replicas: 1
+  notification-service:
+    replicas: 1

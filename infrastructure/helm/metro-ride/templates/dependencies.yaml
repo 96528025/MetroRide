@@ -1,0 +1,166 @@
+{{- if .Values.dependencies.enabled }}
+{{- $pg := .Values.dependencies.postgres }}
+{{- $redis := .Values.dependencies.redis }}
+# Test-only PostgreSQL and Redis owned by this chart.
+#
+# These exist so an ephemeral validation cluster contains every dependency the
+# tested ride flow needs, without pulling in Bitnami or any other external
+# dependency chart. Storage is emptyDir: the data lives and dies with the pod,
+# which is exactly right for a cluster that is deleted at the end of a CI job
+# and is never how a real environment should run PostgreSQL.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-postgres-init
+  labels:
+    {{- include "metroride.labels" . | nindent 4 }}
+data:
+  init.sql: |
+{{ required "dependencies.postgres.initSql is required when dependencies.enabled is true; install with --set-file dependencies.postgres.initSql=infrastructure/docker/postgres/init.sql" $pg.initSql | indent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    {{- include "metroride.labels" . | nindent 4 }}
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "metroride.labels" . | nindent 8 }}
+        app: postgres
+      annotations:
+        checksum/init-sql: {{ $pg.initSql | sha256sum }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ $pg.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: {{ $pg.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ $pg.username | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ $pg.password | quote }}
+            # The default data directory is the mount point of the emptyDir
+            # volume; using a subdirectory keeps initdb happy.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          readinessProbe:
+            exec:
+# -h 127.0.0.1 forces a TCP check: during initdb the entrypoint runs a
+              # temporary server on the unix socket only, so a socket-based probe
+              # would report ready before init.sql has been applied.
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", {{ $pg.username | quote }}, "-d", {{ $pg.database | quote }}]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            exec:
+# -h 127.0.0.1 forces a TCP check: during initdb the entrypoint runs a
+              # temporary server on the unix socket only, so a socket-based probe
+              # would report ready before init.sql has been applied.
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", {{ $pg.username | quote }}, "-d", {{ $pg.database | quote }}]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: init
+          configMap:
+            name: {{ .Release.Name }}-postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    {{- include "metroride.labels" . | nindent 4 }}
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    {{- include "metroride.labels" . | nindent 4 }}
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        {{- include "metroride.labels" . | nindent 8 }}
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: {{ $redis.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["redis-server", "--appendonly", "no", "--save", ""]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            {{- toYaml $redis.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    {{- include "metroride.labels" . | nindent 4 }}
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+{{- end }}

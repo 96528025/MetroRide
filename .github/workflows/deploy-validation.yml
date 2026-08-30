@@ -1,0 +1,100 @@
+# Ephemeral Kubernetes deployment validation.
+#
+# Reusable so the pull-request path and the trusted-delivery path run byte-for-
+# byte identical cluster creation, deployment, smoke testing, diagnostics and
+# teardown. The only thing that differs is how the images get onto the runner,
+# which is what `image_source` selects:
+#
+#   pr    - the six service images are built here from the checked-out commit.
+#           Nothing is published to or pulled from any registry.
+#   ghcr  - the six SHA-tagged images were already published to GHCR by the
+#           publish-images job; they are pulled back onto this runner with the
+#           workflow's GITHUB_TOKEN and deployed as-is.
+#
+# In both cases the images are side-loaded into KinD with
+# `kind load docker-image`, so the cluster itself never talks to a registry and
+# no imagePullSecret exists. The cluster lives only inside this runner and is
+# deleted unconditionally; nothing is created outside it.
+name: Deploy validation
+
+on:
+  workflow_call:
+    inputs:
+      image_source:
+        description: "Image acquisition mechanism: 'pr' (built here) or 'ghcr' (pulled back from GHCR)"
+        required: true
+        type: string
+      image_tag:
+        description: "Immutable image tag to deploy (the full commit SHA)"
+        required: true
+        type: string
+
+# Permissions are deliberately not declared here: this workflow inherits
+# whatever the calling job grants, so the pull-request path runs without any
+# package access at all.
+
+jobs:
+  kind:
+    name: KinD (${{ inputs.image_source }})
+    runs-on: ubuntu-latest
+    # The whole create/deploy/validate/destroy cycle must fit comfortably
+    # inside a GitHub-hosted runner budget.
+    timeout-minutes: 30
+    env:
+      IMAGE_SOURCE: ${{ inputs.image_source }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      KIND_CLUSTER_NAME: metroride
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install kubectl, Helm and KinD
+        run: bash scripts/ci/install-k8s-tools.sh
+
+      - name: Validate Helm chart
+        run: bash scripts/ci/validate-helm-chart.sh
+
+      # --- image acquisition: exactly one of the two paths below runs ---
+
+      - name: Build service images in the runner (pull-request path)
+        if: inputs.image_source == 'pr'
+        run: bash scripts/build-images.sh
+
+      - name: Log in to GHCR (trusted delivery path)
+        if: inputs.image_source == 'ghcr'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Pull the published images back from GHCR (trusted delivery path)
+        if: inputs.image_source == 'ghcr'
+        run: bash scripts/pull-images.sh
+
+      - name: Log out of GHCR
+        if: inputs.image_source == 'ghcr'
+        # The registry credential is discarded before the cluster is created:
+        # it is only ever needed on the runner, never inside Kubernetes.
+        run: docker logout ghcr.io
+
+      # --- ephemeral cluster ---
+
+      - name: Create ephemeral KinD cluster
+        run: bash scripts/kind-up.sh
+
+      - name: Load images into KinD
+        run: bash scripts/kind-load-images.sh
+
+      - name: Deploy Helm release and wait for workloads
+        run: bash scripts/kind-deploy.sh
+
+      - name: Post-deployment health, readiness and end-to-end smoke test
+        run: bash scripts/kind-smoke-test.sh
+
+      - name: Collect cluster diagnostics
+        if: failure()
+        run: bash scripts/kind-diagnostics.sh
+
+      - name: Delete ephemeral KinD cluster
+        if: always()
+        run: bash scripts/kind-down.sh
