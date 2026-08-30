@@ -113,4 +113,8 @@ See `docs/observability.md` for the metric and dashboard strategy.
 
 ## Production Deployment Goals
 
-The repository includes Docker Compose for local orchestration, Kubernetes manifests for cloud-native deployment structure, and Helm scaffolding for parameterized releases. These Kubernetes and Helm files are scaffolding, not evidence of a production deployment. They leave environment-specific work such as secrets, ingress, persistent volumes, service monitors, autoscaling, and resource limits for future implementation.
+The repository includes Docker Compose for local orchestration, raw Kubernetes manifests for cloud-native deployment structure, and a Helm chart for parameterized releases.
+
+The Helm chart is not scaffolding: CI installs it on an ephemeral KinD cluster on every run, with commit-SHA-pinned images, tuned health and readiness probes, resource requests and limits, and chart-owned test-only PostgreSQL and Redis, then drives a real ride through the deployed system before deleting the cluster. See [cicd.md](cicd.md).
+
+What that does *not* demonstrate is a hosted environment. No cloud account or persistent infrastructure exists, and environment-specific work such as secrets management, ingress, persistent volumes and autoscaling is deliberately left for future implementation. The raw manifests in `infrastructure/k8s` remain scaffolding.
