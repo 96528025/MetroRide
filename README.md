@@ -1,5 +1,7 @@
 # MetroRide
 
+[![CI](https://github.com/96528025/MetroRide/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/96528025/MetroRide/actions/workflows/ci.yml)
+
 ![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)
 ![Redis Streams](https://img.shields.io/badge/Redis%20Streams-event%20bus-DC382D?logo=redis&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-system%20of%20record-4169E1?logo=postgresql&logoColor=white)
@@ -78,12 +80,15 @@ flowchart TB
         Compose --> Grafana[Grafana]
     end
 
-    subgraph Cloud["Cloud-Native Deployment Path"]
-        K8s[Kubernetes Manifests]
-        Helm[Helm Chart Scaffold]
-        K8s --> Deployments[Service Deployments]
-        K8s --> Services[Cluster Services]
-        Helm --> Templates[Parameterized Templates]
+    subgraph CI["GitHub Actions - Ephemeral Deployment Validation"]
+        Images[GHCR images tagged by commit SHA]
+        Kind[Throwaway KinD cluster]
+        Helm[metro-ride Helm release]
+        Images --> Kind
+        Kind --> Helm
+        Helm --> Workloads[6 services + test PostgreSQL/Redis]
+        Workloads --> Smoke[End-to-end ride smoke test]
+        Smoke --> Teardown[Cluster deleted]
     end
 
     Prometheus --> Grafana
@@ -111,7 +116,7 @@ flowchart TB
 - **APIs:** REST for synchronous service boundaries, with protobuf/gRPC scaffolding reserved in `shared/proto`.
 - **Observability:** Prometheus metrics, Grafana dashboards, structured JSON logs, health and readiness probes.
 - **Runtime:** Docker Compose for local orchestration.
-- **Cloud-native deployment:** Kubernetes manifests and Helm chart scaffold.
+- **Cloud-native deployment:** Helm chart deployed to an ephemeral KinD cluster on every CI run, plus raw Kubernetes manifests. Validation only; no hosted environment.
 
 ## Distributed Systems Design
 
@@ -176,19 +181,100 @@ ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 
 See [docs/kafka-lightweight-extension.md](docs/kafka-lightweight-extension.md).
 
-## Testing and CI
+## Continuous Integration and Delivery
 
-MetroRide includes GitHub Actions CI for Go package tests, Docker Compose validation, image builds, stack startup, smoke testing, and backend integration tests against the running distributed system. Automated integration coverage includes:
+Every change to MetroRide is tested, packaged and **actually deployed** before
+it is considered good. One GitHub Actions workflow does all of it, and it
+behaves differently depending on how much the code is trusted.
 
-- Happy-path ride assignment.
-- Duplicate-event idempotency.
-- A real routing outage created by stopping `routing-service`.
-- Dispatch retry exhaustion through the production retry path.
-- Dead-letter verification in the real `events.dead_letter` Redis Stream, including confirmation that the ride remains unassigned in PostgreSQL.
+**On every pull request** the pipeline runs formatting and vet checks, the Go
+package tests, Docker Compose config validation and image builds, then starts
+the full stack and runs smoke tests, integration tests and a real
+routing-outage dead-letter failure test. It then builds the six service images
+inside the runner, spins up a throwaway Kubernetes cluster (KinD), loads those
+images into it, installs the Helm release and runs an end-to-end ride through
+the deployed system. Pull requests never publish container images and never
+need registry access.
+
+**On a push to `main`** (or a `v*` release tag, or a manual run) the same
+validation runs first, and only then are the six images published to the GitHub
+Container Registry, each tagged with the full commit SHA. The pipeline then
+authenticates back to the registry, **pulls those exact published images down
+again**, deploys them to a fresh throwaway Kubernetes cluster and runs the same
+end-to-end ride test. That round trip is the point: it proves the published
+artifacts are real, retrievable and runnable, rather than assuming a successful
+`docker push` means a working release.
+
+Published images look like this — an immutable commit SHA, never `latest`:
+
+```text
+ghcr.io/96528025/metroride-rider-service:<full-commit-sha>
+ghcr.io/96528025/metroride-driver-service:<full-commit-sha>
+ghcr.io/96528025/metroride-dispatch-service:<full-commit-sha>
+ghcr.io/96528025/metroride-routing-service:<full-commit-sha>
+ghcr.io/96528025/metroride-traffic-service:<full-commit-sha>
+ghcr.io/96528025/metroride-notification-service:<full-commit-sha>
+```
+
+All six are built from one shared Dockerfile with the service name as a build
+argument; there are no duplicated per-service Dockerfiles. Authentication uses
+the token GitHub provides to the workflow automatically, so no personal access
+token or long-lived credential exists anywhere in this repository.
+
+In both paths the images are side-loaded into the cluster with
+`kind load docker-image` and deployed with `imagePullPolicy: IfNotPresent`, so
+the cluster itself never contacts a registry and there is no Kubernetes image
+pull secret to manage.
+
+### The deployed test
+
+The Kubernetes deployment is not just "did the pods start". After every
+required workload reports Available and every service answers `/healthz` and
+`/readyz`, the pipeline posts a real ride request:
+
+```http
+POST /v1/rides  ->  HTTP 202
+{"rider_id":"smoke-rider","pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}
+```
+
+and then waits for `GET /v1/rides/<ride_id>` to report `"status":"assigned"`
+with a driver attached. Getting there means the whole distributed path worked:
+the ride was persisted to PostgreSQL, `ride_requested` was published to Redis
+Streams, `dispatch-service` consumed it through its consumer group, called
+`routing-service` for the nearest driver, and committed the assignment. The
+result is then confirmed independently in PostgreSQL and through
+`notification-service`'s statistics endpoint. If anything fails, the workflow
+dumps pod, deployment, service, event, describe and log output — including
+previous-container logs for anything that crash-looped — and deletes the
+cluster regardless of outcome.
+
+### The Kubernetes environment is ephemeral
+
+The KinD cluster lives for a few minutes inside a GitHub Actions runner and is
+then deleted. **It is deployment validation, not production hosting.** No cloud
+account, managed Kubernetes cluster, custom domain, public ingress, or paid or
+persistent infrastructure of any kind is created by this project.
+
+Prometheus and Grafana are deliberately left out of that ephemeral deployment:
+the ride flow under test does not exercise them, and omitting them keeps the
+cluster within a free runner's resources. Their Docker Compose support is
+unchanged — every service still exposes `/metrics`, Grafana still provisions
+the MetroRide dashboard locally, and the Helm chart still renders a
+`ServiceMonitor` on clusters that have the Prometheus Operator.
+
+### Test coverage that already existed
+
+Automated coverage includes happy-path ride assignment, duplicate-event
+idempotency, a real routing outage created by stopping `routing-service`,
+dispatch retry exhaustion through the production retry path, and dead-letter
+verification in the real `events.dead_letter` Redis Stream including
+confirmation that the ride remains unassigned in PostgreSQL.
 
 The suite does not claim coverage of every dependency or recovery mode.
 
-See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local test commands, smoke test coverage, and integration test coverage.
+See [docs/cicd.md](docs/cicd.md) for the full pipeline, permission model,
+image strategy and local reproduction commands, and
+[docs/testing-and-ci.md](docs/testing-and-ci.md) for the test layers.
 
 ## Repository Layout
 
@@ -199,18 +285,30 @@ See [docs/testing-and-ci.md](docs/testing-and-ci.md) for the CI pipeline, local 
 │   ├── api.md
 │   ├── architecture.md
 │   ├── architecture-decisions.md
+│   ├── cicd.md
 │   ├── kafka-lightweight-extension.md
 │   ├── observability.md
 │   ├── reliability.md
 │   ├── system-design.md
 │   └── testing-and-ci.md
 ├── infrastructure/
-│   ├── docker/
+│   ├── docker/                  # one Dockerfile, SERVICE as a build arg
 │   ├── grafana/
-│   ├── helm/
+│   ├── helm/                    # metro-ride chart + ephemeral KinD profiles
 │   ├── k8s/
+│   ├── kind/                    # ephemeral cluster definition
 │   └── prometheus/
 ├── scripts/
+│   ├── ci/                      # tool install + Helm chart validation
+│   ├── lib/                     # shared image naming and KinD settings
+│   ├── build-images.sh
+│   ├── pull-images.sh
+│   ├── kind-up.sh
+│   ├── kind-load-images.sh
+│   ├── kind-deploy.sh
+│   ├── kind-smoke-test.sh
+│   ├── kind-diagnostics.sh
+│   ├── kind-down.sh
 │   ├── failure-integration-test.sh
 │   └── smoke-test.sh
 ├── services/
@@ -284,20 +382,40 @@ Docker Compose is the primary local runtime:
 docker compose up --build
 ```
 
-Kubernetes manifests live in `infrastructure/k8s`:
+Raw Kubernetes manifests live in `infrastructure/k8s`:
 
 ```bash
 kubectl apply -f infrastructure/k8s/namespace.yaml
 kubectl apply -f infrastructure/k8s/
 ```
 
-Helm scaffold lives in `infrastructure/helm/metro-ride`:
+The Helm chart in `infrastructure/helm/metro-ride` is what CI actually deploys.
+It renders `ghcr.io/96528025/metroride-<service>:<tag>` image references, and
+its ephemeral profile adds test-only PostgreSQL and Redis so a throwaway
+cluster contains every dependency the ride flow needs:
 
 ```bash
-helm install metro-ride infrastructure/helm/metro-ride
+# validate the chart in every configuration it is installed in
+bash scripts/ci/validate-helm-chart.sh
+
+# stand up the whole thing on a local KinD cluster, exactly as CI does
+export IMAGE_TAG="$(git rev-parse HEAD)" IMAGE_SOURCE=pr
+bash scripts/build-images.sh
+bash scripts/kind-up.sh
+bash scripts/kind-load-images.sh
+bash scripts/kind-deploy.sh
+bash scripts/kind-smoke-test.sh
+bash scripts/kind-down.sh
 ```
 
-The Kubernetes and Helm artifacts are intentionally scaffolded for production evolution: image registries, secrets management, persistent volumes, ingress, autoscaling, and service monitors can be layered in without changing service code.
+**That cluster is ephemeral deployment validation, not production hosting.** It
+is created inside a CI runner (or on your machine), used for a few minutes and
+deleted. This project deploys to no cloud account and creates no persistent or
+paid infrastructure. Persistent volumes, secrets management, ingress and
+autoscaling remain deliberately out of scope; the chart is structured so they
+could be layered in without changing service code.
+
+See [docs/cicd.md](docs/cicd.md) for the full delivery pipeline.
 
 ## Documentation
 
@@ -309,6 +427,7 @@ The Kubernetes and Helm artifacts are intentionally scaffolded for production ev
 - [Observability](docs/observability.md)
 - [Reliability](docs/reliability.md)
 - [Testing and CI](docs/testing-and-ci.md)
+- [CI/CD pipeline](docs/cicd.md)
 
 ## Scalability Roadmap
 

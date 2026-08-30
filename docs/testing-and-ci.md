@@ -4,22 +4,49 @@ MetroRide uses automated validation to keep the local distributed system reliabl
 
 ## CI Pipeline
 
-GitHub Actions runs on `push` and `pull_request`.
+GitHub Actions runs on `pull_request`, on `push` to `main`, on `v*` tags and on
+manual dispatch. The full pipeline — including how images are published and
+deployed — is documented in [cicd.md](cicd.md); this page covers the test
+layers.
 
-The pipeline performs:
+### Validation job (every event)
 
 1. Checkout repository.
-2. Set up Go.
-3. Run package tests with `go test ./...`.
-4. Validate Docker Compose with `docker compose config`.
-5. Build all service images with `docker compose build`.
-6. Start the stack with `docker compose up -d`.
-7. Run `bash scripts/smoke-test.sh`.
-8. Run integration tests with `go test -tags=integration ./tests/integration`.
-9. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
-10. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged PostgreSQL ride state.
-11. Print focused dispatch, routing, and Redis logs if the failure-path test fails, plus full Compose logs for any CI failure.
-12. Shut down the stack with `docker compose down -v`, even when an earlier step fails.
+2. Set up Go from the version in `go.mod`.
+3. Fail if any tracked Go file is not `gofmt`-formatted. The check compares
+   `gofmt` output and reports the offending files; it never rewrites files
+   during CI.
+4. Run `go vet ./...`.
+5. Run package tests with `go test ./...`.
+6. Validate Docker Compose with `docker compose config`.
+7. Build all service images with `docker compose build`.
+8. Start the stack with `docker compose up -d`.
+9. Run `bash scripts/smoke-test.sh`.
+10. Run integration tests with `go test -tags=integration ./tests/integration`.
+11. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
+12. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
+    PostgreSQL ride state.
+13. Print focused dispatch, routing, and Redis logs if the failure-path test
+    fails, plus full Compose logs for any CI failure.
+14. Shut down the stack with `docker compose down -v`, even when an earlier
+    step fails.
+
+Nothing is published and nothing is deployed unless this job passes.
+
+### Deployment-validation job (every event)
+
+After validation, the release is installed on a throwaway KinD cluster and the
+smoke test is re-run against the deployed system. Pull requests deploy images
+built in the runner; trusted events deploy the exact SHA-tagged images that
+were published to and pulled back from GHCR. Both paths run the same
+deployment, smoke test, diagnostics and unconditional teardown — see
+[cicd.md](cicd.md).
+
+### Concurrency
+
+Superseded pull-request runs on the same ref are cancelled so obsolete runs do
+not hold runners. Cancellation is disabled for pushes to `main`, so a trusted
+delivery run is never interrupted mid-publish.
 
 ## Unit Tests vs Smoke Tests vs Integration Tests
 
@@ -42,12 +69,34 @@ The smoke test assumes the Compose stack is already running. It validates:
 - `/healthz` for every Go service.
 - `/readyz` for every Go service.
 - `/metrics` for key services.
-- Ride creation through `rider-service`.
+- Ride creation through `rider-service`, asserting an exact `HTTP 202`.
 - Event-driven dispatch through Redis Streams.
 - Final ride state becomes `assigned`.
 - Assigned ride includes a non-empty `driver_id`.
 
 The script waits for services before asserting behavior, so it works both locally and in GitHub Actions.
+
+### Kubernetes Smoke Test
+
+```bash
+bash scripts/kind-smoke-test.sh
+```
+
+Runs against the Helm release installed on the ephemeral KinD cluster. It waits
+for `postgres`, `redis` and all six core service Deployments to report
+Available, opens `kubectl port-forward` to the six services, and then runs the
+same `scripts/smoke-test.sh` above, so Compose and Kubernetes are validated by
+identical assertions.
+
+It then confirms the same outcome through two further channels:
+
+- **PostgreSQL:** the `rides` row is `assigned` with a non-null `driver_id`, and
+  exactly one `ride_assignments` row exists for that ride.
+- **notification-service:** `GET /v1/notifications/stats` reports at least one
+  processed assignment event.
+
+Every wait is bounded polling against a deadline with a descriptive failure
+message. There are no fixed sleeps used as synchronisation.
 
 ### Integration Tests
 
@@ -86,6 +135,8 @@ The test uses a 30-second context deadline and Redis blocking reads with short p
 ## Running Everything Locally
 
 ```bash
+gofmt -l .                     # must print nothing
+go vet ./...
 go test ./...
 docker compose config
 docker compose build
@@ -95,6 +146,9 @@ go test -tags=integration ./tests/integration
 bash scripts/failure-integration-test.sh
 docker compose down -v
 ```
+
+To also reproduce the Kubernetes deployment validation locally, see the
+step-by-step commands in [cicd.md](cicd.md#running-it-locally).
 
 If local ports are unavailable, stop the conflicting process or adjust the Compose port mappings before running the stack.
 
@@ -109,4 +163,5 @@ The automated suite covers the happy path, duplicate-event idempotency, routing 
 - Add stream lag assertions.
 - Add contract tests for event envelopes.
 - Add GitHub Actions matrix testing across Go versions.
+- Add Kubernetes failure-path validation (dependency outage inside the cluster).
 - Add race detector runs for selected packages.
