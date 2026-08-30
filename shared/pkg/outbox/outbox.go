@@ -171,16 +171,29 @@ func (r *Relay) publishBatch(ctx context.Context) error {
 	}
 	rows.Close()
 
-	for _, item := range records {
+	// Relay progress must be monotonic. Redis already holds every event published
+	// before a failure, so discarding their published_at marks would republish all
+	// of them on the next poll, and a record that always fails sits at the head of
+	// the created_at order and would repeat that batch indefinitely. Stop at the
+	// first failure, commit the progress made ahead of it, then record the failure
+	// on its own connection once the commit has released the row locks.
+	var (
+		failedItem *record
+		failedErr  error
+	)
+	for i := range records {
+		item := &records[i]
 		redisCtx, cancel := reliability.WithRedisTimeout(ctx)
 		_, publishErr := events.Publish(redisCtx, r.rdb, item.stream, item.envelope)
 		cancel()
 		if publishErr != nil {
-			publishFailures.WithLabelValues(r.service, item.stream).Inc()
-			_ = tx.Rollback(ctx)
-			r.recordFailure(ctx, item.id, item.stream, publishErr)
-			return fmt.Errorf("publish outbox event %s: %w", item.id, publishErr)
+			failedItem, failedErr = item, publishErr
+			break
 		}
+		// A failure here aborts the transaction, so the batch's progress is lost
+		// and those events are published again after the next poll. Postgres
+		// forbids committing an aborted transaction, so the duplicate is the only
+		// safe outcome; consumers stay idempotent for exactly this reason.
 		if _, err := tx.Exec(ctx, `
 			update event_outbox
 			set published_at = now(), publish_attempts = publish_attempts + 1, last_error = null
@@ -193,6 +206,12 @@ func (r *Relay) publishBatch(ctx context.Context) error {
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit outbox relay transaction: %w", err)
+	}
+
+	if failedItem != nil {
+		publishFailures.WithLabelValues(r.service, failedItem.stream).Inc()
+		r.recordFailure(ctx, failedItem.id, failedItem.stream, failedErr)
+		return fmt.Errorf("publish outbox event %s: %w", failedItem.id, failedErr)
 	}
 	return nil
 }

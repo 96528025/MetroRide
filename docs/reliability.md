@@ -44,6 +44,8 @@ Both state-changing workflow steps use a PostgreSQL outbox:
 
 Delivery is intentionally at-least-once. If Redis accepts an event and the relay crashes before PostgreSQL records the publication, the same envelope may be published again. The envelope ID remains stable across attempts, and the authoritative assignment transition is idempotent. This tradeoff avoids event loss without claiming impossible exactly-once delivery across PostgreSQL and Redis.
 
+Relay progress is monotonic. When one event in a batch cannot be published, the relay stops at that event, commits the publication marks for the events it already delivered, and records the failure on a separate connection once the commit has released the row locks. Without this, a single undeliverable record would sit at the head of the `created_at` order and cause every event ahead of it to be republished on each poll. `tests/integration/outbox_relay_test.go` holds the behavior in place by pointing one event at a Redis key that already holds a string, then asserting the healthy stream received each of its events exactly once.
+
 ## Dead-Letter Stream
 
 Failed dispatch events are published to:

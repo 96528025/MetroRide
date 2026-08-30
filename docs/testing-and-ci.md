@@ -116,8 +116,11 @@ Integration tests require the Docker Compose stack to be running. They validate 
 - Happy path ride assignment.
 - Duplicate `ride_requested` event handling.
 - Idempotency: a duplicated event must not create a second assignment for the same ride.
+- Outbox relay progress: a batch containing one undeliverable event must still commit the events it already published.
 
 The tests use the public rider API, Redis Streams, and PostgreSQL state to verify distributed behavior.
+
+The relay-progress test runs its own relay under a unique `source_service` so it never competes with the running services for rows. It points one event at a Redis key that already holds a string, which makes `XADD` fail with `WRONGTYPE` on every attempt, waits for two recorded publish attempts on that event, and then asserts the healthy stream contains each of its events exactly once. A relay that discarded a batch's progress on failure republishes the delivered events on every poll, so this assertion fails immediately.
 
 ### Routing-Outage Failure Integration Test
 
@@ -170,7 +173,7 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, outbox relay progress across a partially failing batch, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 
