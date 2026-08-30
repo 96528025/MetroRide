@@ -14,6 +14,14 @@ MetroRide is a production-style distributed ride dispatch platform focused on ev
 
 The project is designed as a backend systems portfolio artifact: the emphasis is service ownership, event contracts, failure boundaries, operational visibility, and a path from local Docker Compose to Kubernetes-based deployment.
 
+## Engineering Highlights
+
+- **Robust asynchronous workflows:** PostgreSQL transactional outboxes close the database/event-bus dual-write gap. Relays provide at-least-once Redis Stream delivery, while guarded state transitions make assignment idempotent.
+- **Measured algorithmic work:** Nearest-driver selection is a deterministic, allocation-free `O(n)` scan rather than an `O(n log n)` full sort; a committed 10,000-driver benchmark makes the claim reproducible.
+- **Failure-driven testing:** CI exercises the happy path, duplicate delivery, routing retry exhaustion and dead-lettering, plus a real Redis outage followed by automatic outbox recovery.
+- **Explicit engineering judgment:** ADRs document why the core uses Redis Streams, where Kafka is a better fit, why PostgreSQL owns ride state, and which delivery guarantees the system provides.
+- **Production-minded delivery:** Every pull request builds the full stack, runs integration and outage tests, deploys six images to an ephemeral Kubernetes cluster, and completes an end-to-end ride before passing.
+
 ## Default Core System Architecture
 
 ```mermaid
@@ -21,16 +29,15 @@ flowchart LR
     RiderClient[Ride Request Client] -->|REST POST /v1/rides| Rider[rider-service]
     DriverSim[Driver Simulation] --> Driver[driver-service]
 
-    Rider -->|persist ride| Postgres[(PostgreSQL)]
-    Rider -->|ride_requested| Redis[(Redis Streams)]
+    Rider -->|ride + outbox event| Postgres[(PostgreSQL)]
+    Postgres -->|outbox relay| Redis[(Redis Streams)]
     Driver -->|driver_location_updated| Redis
     Traffic[traffic-service] -->|traffic_updated| Redis
 
     Redis -->|consumer group| Dispatch[dispatch-service]
     Redis -->|driver location stream| Routing[routing-service]
     Dispatch -->|nearest-driver query| Routing
-    Dispatch -->|assignment state| Postgres
-    Dispatch -->|ride_assigned| Redis
+    Dispatch -->|assignment + outbox events| Postgres
     Redis -->|assignment notification| Notification[notification-service]
 
     Rider -.->|/metrics| Prometheus[Prometheus]
@@ -56,14 +63,14 @@ sequenceDiagram
     participant Notify as notification-service
 
     Client->>Rider: POST /v1/rides
-    Rider->>DB: Insert ride(status=requested)
-    Rider->>Bus: XADD ride_requested
+    Rider->>DB: Commit ride + ride_requested outbox row
+    DB->>Bus: Outbox relay XADD ride_requested
     Dispatch->>Bus: XREADGROUP events.ride.requests
     Dispatch->>Routing: POST /v1/routes/nearest-driver
     Routing-->>Dispatch: driver_id, distance_km, eta_seconds
-    Dispatch->>DB: Update ride(status=assigned)
-    Dispatch->>Bus: XADD ride_assigned
-    Dispatch->>Bus: XADD notification event
+    Dispatch->>DB: Commit assignment + two outbox rows
+    DB->>Bus: Outbox relay XADD ride_assigned
+    DB->>Bus: Outbox relay XADD notification event
     Notify->>Bus: XREADGROUP events.ride.notifications
 ```
 
@@ -124,7 +131,7 @@ MetroRide separates state mutation, assignment coordination, routing computation
 
 Redis Streams are used as the core workflow event log because they provide persistent streams, consumer groups, explicit acknowledgements, and simple local development ergonomics. The event envelope in `shared/pkg/events` keeps transport concerns isolated so the optional Kafka usage can expand to additional streams later without rewriting domain payloads.
 
-PostgreSQL remains the authoritative store for ride status. Redis carries workflow events; it does not own long-term ride truth. This separation mirrors production systems where event logs coordinate distributed work while relational storage protects transactional state and queryability.
+PostgreSQL remains the authoritative store for ride status. Redis carries workflow events; it does not own long-term ride truth. Transactional outbox rows are committed beside ride mutations, then relayed to Redis with at-least-once delivery. This closes the failure window where state could commit but its event could be lost; stable event IDs and guarded state transitions make duplicate delivery safe.
 
 ## System Design Narrative
 
@@ -149,6 +156,8 @@ Key metrics include:
 - `metroride_assignment_failures_total`
 - `metroride_stream_consume_errors_total`
 - `metroride_dependency_errors_total`
+- `metroride_outbox_events_published_total`
+- `metroride_outbox_publish_failures_total`
 - `metroride_routing_computation_seconds`
 - `metroride_active_drivers`
 
@@ -158,7 +167,7 @@ See [docs/observability.md](docs/observability.md) for the monitoring strategy.
 
 ## Reliability and Failure Handling
 
-MetroRide includes production hardening for dependency-aware readiness checks, bounded timeouts, retry behavior, idempotent ride assignment, and a Redis dead-letter stream for failed dispatch events.
+MetroRide includes production hardening for dependency-aware readiness checks, bounded timeouts, retry behavior, idempotent ride assignment, transactional outbox delivery, and a Redis dead-letter stream for failed dispatch events.
 
 See [docs/reliability.md](docs/reliability.md) for timeout strategy, retry behavior, idempotency design, dead-letter semantics, and expected behavior during Redis, PostgreSQL, routing, and dispatch failures.
 
@@ -189,8 +198,8 @@ behaves differently depending on how much the code is trusted.
 
 **On every pull request** the pipeline runs formatting and vet checks, the Go
 package tests, Docker Compose config validation and image builds, then starts
-the full stack and runs smoke tests, integration tests and a real
-routing-outage dead-letter failure test. It then builds the six service images
+the full stack and runs smoke tests, integration tests, a Redis-outage outbox
+recovery test and a routing-outage dead-letter test. It then builds the six service images
 inside the runner, spins up a throwaway Kubernetes cluster (KinD), loads those
 images into it, installs the Helm release and runs an end-to-end ride through
 the deployed system. Pull requests never publish container images and never
@@ -262,13 +271,13 @@ unchanged — every service still exposes `/metrics`, Grafana still provisions
 the MetroRide dashboard locally, and the Helm chart still renders a
 `ServiceMonitor` on clusters that have the Prometheus Operator.
 
-### Test coverage that already existed
+### Automated test coverage
 
 Automated coverage includes happy-path ride assignment, duplicate-event
-idempotency, a real routing outage created by stopping `routing-service`,
+idempotency, durable request acceptance and automatic relay recovery during a
+real Redis outage, a real routing outage created by stopping `routing-service`,
 dispatch retry exhaustion through the production retry path, and dead-letter
-verification in the real `events.dead_letter` Redis Stream including
-confirmation that the ride remains unassigned in PostgreSQL.
+verification in the real `events.dead_letter` Redis Stream.
 
 The suite does not claim coverage of every dependency or recovery mode.
 
@@ -425,6 +434,7 @@ See [docs/cicd.md](docs/cicd.md) for the full delivery pipeline.
 - [API](docs/api.md)
 - [Kafka lightweight extension](docs/kafka-lightweight-extension.md)
 - [Observability](docs/observability.md)
+- [Performance](docs/performance.md)
 - [Reliability](docs/reliability.md)
 - [Testing and CI](docs/testing-and-ci.md)
 - [CI/CD pipeline](docs/cicd.md)
@@ -438,4 +448,4 @@ See [docs/cicd.md](docs/cicd.md) for the full delivery pipeline.
 - **Multi-region deployment:** Partition drivers and rides by region, then replicate critical events across regions.
 - **AI-assisted ETA prediction:** Introduce an ETA model service using traffic, driver, and route features.
 - **Demand forecasting:** Add regional demand prediction to pre-position driver supply.
-- **Resilience hardening:** Add dead-letter replay tooling, transactional outbox delivery, retry budgets, and circuit breakers.
+- **Resilience hardening:** Add dead-letter replay tooling, pending-message claiming, retry budgets, and circuit breakers.

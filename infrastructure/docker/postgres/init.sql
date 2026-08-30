@@ -25,3 +25,21 @@ create table if not exists ride_assignments (
 );
 
 create index if not exists ride_assignments_driver_id_idx on ride_assignments (driver_id);
+
+create table if not exists event_outbox (
+    id text not null,
+    source_service text not null,
+    aggregate_id text not null,
+    event_type text not null,
+    stream text not null,
+    envelope jsonb not null,
+    created_at timestamptz not null,
+    published_at timestamptz,
+    publish_attempts integer not null default 0,
+    last_error text,
+    primary key (id, stream)
+);
+
+create index if not exists event_outbox_unpublished_idx
+    on event_outbox (source_service, created_at)
+    where published_at is null;

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -114,26 +113,14 @@ func (s *routingService) nearestDriver(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logDrivers.RLock()
-	candidates := make([]driver, 0, len(s.drivers))
-	for _, d := range s.drivers {
-		if d.Available {
-			candidates = append(candidates, d)
-		}
-	}
+	selected, distanceKM, found := selectNearestDriver(s.drivers, req.PickupLat, req.PickupLng)
 	s.logDrivers.RUnlock()
 
-	if len(candidates) == 0 {
+	if !found {
 		httpx.RespondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no available drivers"})
 		return
 	}
 
-	sort.Slice(candidates, func(i, j int) bool {
-		return haversine(req.PickupLat, req.PickupLng, candidates[i].Latitude, candidates[i].Longitude) <
-			haversine(req.PickupLat, req.PickupLng, candidates[j].Latitude, candidates[j].Longitude)
-	})
-
-	selected := candidates[0]
-	distanceKM := haversine(req.PickupLat, req.PickupLng, selected.Latitude, selected.Longitude)
 	etaSeconds := int((distanceKM / 32.0) * 3600)
 	if etaSeconds < 60 {
 		etaSeconds = 60
@@ -145,6 +132,27 @@ func (s *routingService) nearestDriver(w http.ResponseWriter, r *http.Request) {
 		"algorithm":   "haversine-nearest-with-dijkstra-ready-graph",
 		"computed_at": time.Now().UTC(),
 	})
+}
+
+// selectNearestDriver only needs the minimum, so it scans once instead of
+// copying and sorting every candidate. Ties use the driver ID for deterministic
+// results even though Go map iteration order is intentionally random.
+func selectNearestDriver(drivers map[string]driver, pickupLat, pickupLng float64) (driver, float64, bool) {
+	var selected driver
+	bestDistance := math.Inf(1)
+	found := false
+	for _, candidate := range drivers {
+		if !candidate.Available {
+			continue
+		}
+		distance := haversine(pickupLat, pickupLng, candidate.Latitude, candidate.Longitude)
+		if !found || distance < bestDistance || (distance == bestDistance && candidate.ID < selected.ID) {
+			selected = candidate
+			bestDistance = distance
+			found = true
+		}
+	}
+	return selected, bestDistance, found
 }
 
 func (s *routingService) consumeDriverLocations(ctx context.Context, log anyLogger) {

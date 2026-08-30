@@ -60,7 +60,7 @@ Use PostgreSQL as the system of record for ride and assignment data.
 
 ### Tradeoffs
 
-PostgreSQL provides transactional writes, indexes, relational constraints, and simple status queries. The tradeoff is that event publication and database mutation are not atomic without an outbox pattern, which is a future improvement.
+PostgreSQL provides transactional writes, indexes, relational constraints, and simple status queries. State changes also enqueue events in a transactional outbox; a separate relay bridges those committed events to Redis Streams.
 
 ## ADR 004: Docker Compose for Local Orchestration
 
@@ -141,3 +141,23 @@ Publish failed dispatch events to `events.dead_letter` after bounded retries.
 ### Tradeoffs
 
 A dead-letter stream makes failures inspectable and prevents poison messages from blocking progress. It requires operational follow-up: replay tooling, dashboards, and alerting would be needed in a production system.
+
+## ADR 008: Transactional Outbox for State-to-Event Delivery
+
+### Context
+
+Writing PostgreSQL state and publishing to Redis are two independent operations. A process crash or Redis outage between them can leave committed state with no corresponding workflow event.
+
+### Decision
+
+Insert the complete event envelope into `event_outbox` in the same PostgreSQL transaction as the domain change. Per-service relays lock pending rows with `FOR UPDATE SKIP LOCKED`, publish them to the target Redis Stream, and mark them published.
+
+### Alternatives Considered
+
+- Publish to Redis before committing PostgreSQL.
+- Retry the original request or stream handler after a partial failure.
+- Use distributed transactions across PostgreSQL and Redis.
+
+### Tradeoffs
+
+The outbox prevents event loss and accepts writes while Redis is unavailable. Delivery is at-least-once rather than exactly-once: a relay crash after `XADD` but before marking the row published can create a duplicate with the same envelope ID. Consumers therefore need idempotent state transitions. Holding row locks during publication keeps this implementation compact; a higher-throughput system could use leases and partitioned relay workers.
