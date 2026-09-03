@@ -1,6 +1,6 @@
 # MetroRide Architecture
 
-MetroRide is a production-style distributed ride dispatch platform focused on backend systems design. The system models a real-time workflow where rider requests, driver locations, routing decisions, traffic updates, and notifications are owned by separate services and coordinated through asynchronous events.
+MetroRide is a portfolio-scale distributed ride dispatch project focused on backend systems design. It models a real-time workflow where rider requests, driver locations, routing decisions, traffic updates, and notifications are owned by separate services and coordinated through asynchronous events.
 
 The default Docker Compose profile runs six core application service roles and 10 total Compose components after PostgreSQL, Redis, Prometheus, and Grafana are included. The optional `kafka` profile adds a seventh role, `analytics-service`, plus a second driver-service runtime instance, Kafka, and the one-shot Kafka init job, for 14 profile-expanded Compose components. Runtime instances and infrastructure containers are not counted as new application service roles.
 
@@ -86,7 +86,7 @@ Kafka is the natural next transport when the system requires stronger partitioni
 
 MetroRide includes foundational production hooks:
 
-- Consumer groups allow failed dispatch or notification work to remain pending rather than disappear.
+- Consumer groups keep unacknowledged dispatch or notification work pending rather than dropping it; the current workers do not yet reclaim abandoned pending entries.
 - PostgreSQL is the authoritative store for ride status and assignment state.
 - Services expose `/healthz` and `/readyz` for orchestration and load balancer integration.
 - Structured logs include service names and workflow identifiers for cross-service debugging.
@@ -96,7 +96,7 @@ Dispatch currently uses bounded retries, an idempotent PostgreSQL state transiti
 
 ## Scalability Considerations
 
-Dispatch workers can scale horizontally within the same Redis consumer group. Routing can scale independently behind a service endpoint. Driver location processing can be partitioned by geographic region. PostgreSQL can be indexed and eventually partitioned by region or creation time as ride volume grows.
+Redis consumer groups can divide new dispatch messages across workers, but the current implementation still needs pending-entry recovery and load testing before making a horizontal-scale claim. Routing cannot safely share its current process-local driver view across replicas without a shared store or explicit regional partitioning. PostgreSQL can be indexed and eventually partitioned by region or creation time as ride volume grows.
 
 The architecture is intentionally region-aware in concept: future work can shard drivers and riders by city or geohash, then replicate cross-region events for failover and analytics.
 

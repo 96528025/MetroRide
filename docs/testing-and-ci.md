@@ -50,13 +50,13 @@ delivery run is never interrupted mid-publish.
 
 ## Unit Tests vs Smoke Tests vs Integration Tests
 
-### Unit and Package Tests
+### Package Build/Test Gate
 
 ```bash
 go test ./...
 ```
 
-These tests compile all Go packages and run normal package-level tests. They do not require Docker Compose or external services.
+This command compiles all Go packages and would run any untagged package tests. The current repository has no untagged `*_test.go` files, so behavioral evidence comes from the tagged integration tests and smoke scripts below. This gate does not require Docker Compose or external services.
 
 ### Smoke Test
 

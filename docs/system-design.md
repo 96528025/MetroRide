@@ -1,6 +1,6 @@
 # MetroRide System Design
 
-MetroRide is a production-style local distributed systems project that demonstrates backend infrastructure concepts through a ride dispatch domain. It is not deployed at real production scale; it is designed to show how a distributed backend can be decomposed, instrumented, and hardened for reliability.
+MetroRide is a portfolio-scale local distributed-systems project that demonstrates backend infrastructure concepts through a ride dispatch domain. It is not deployed at real production scale; it is designed to show how a distributed backend can be decomposed, instrumented, and hardened for reliability.
 
 ## Problem Statement
 
@@ -111,7 +111,7 @@ MetroRide includes production-oriented reliability controls:
 
 ## Idempotency Design
 
-Redis Streams can redeliver messages after failures or restarts. `dispatch-service` handles this by checking persisted ride state before assignment. If a ride is already assigned or no longer in `requested` status, the event is skipped. The update query also guards on `status = 'requested'`, so concurrent workers cannot assign the same ride twice.
+Duplicate logical ride requests can occur, and multiple dispatch workers can race on the same ride. `dispatch-service` checks persisted ride state before routing and also guards the update with `status = 'requested'`, so only one worker can create the assignment state transition. The current stream reader does not reclaim abandoned pending entries after a consumer crash; pending recovery is a separate missing capability.
 
 ## Dead-Letter Stream Design
 
@@ -146,8 +146,8 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 
 ## Scalability Considerations
 
-- `dispatch-service` can scale horizontally through Redis consumer groups.
-- `routing-service` can scale behind a service endpoint.
+- Redis consumer groups can divide new dispatch messages across multiple workers; production use still needs pending-entry recovery and load testing.
+- `routing-service` needs shared or explicitly partitioned driver state before multiple replicas can return a coherent view.
 - Driver location processing can be partitioned by region or geohash.
 - PostgreSQL can be indexed and eventually partitioned by time or region.
 - Redis Streams can be replaced by Kafka for stronger partitioning, retention, and high-throughput fanout.

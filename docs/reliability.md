@@ -32,7 +32,7 @@ Retries are intentionally bounded. Infinite retry loops can hide outages, increa
 3. Assignment updates are guarded with `where status = 'requested'`.
 4. If another worker already assigned the ride, the duplicate worker exits without creating another assignment.
 
-This protects against Redis Stream redelivery, consumer restarts, and duplicate events. A future production version would add a transactional outbox so assignment persistence and event publication are committed atomically.
+This protects the PostgreSQL state transition when the same logical ride request is delivered more than once. It does not by itself recover work abandoned by a crashed consumer: the current readers request only new stream entries and do not claim pending entries. A future version would add pending-entry recovery and a transactional outbox so assignment persistence and event publication can be coordinated reliably.
 
 ## Dead-Letter Stream
 
@@ -51,7 +51,7 @@ After retries are exhausted, `dispatch-service` publishes a dead-letter event co
 - Service name.
 - Failure timestamp.
 
-If dead-letter publication succeeds, the original stream message is acknowledged so it does not poison the consumer group indefinitely. If dead-letter publication fails, the original message is left unacknowledged for later recovery.
+If dead-letter publication succeeds, the original stream message is acknowledged so it does not poison the consumer group indefinitely. If dead-letter publication fails, the original message remains pending. The repository does not yet include the claim/replay worker needed to recover that pending entry automatically.
 
 ### Automated Verification Status
 
@@ -63,7 +63,7 @@ The test validates this routing failure path only. Redis outages, PostgreSQL out
 
 ### Routing Service Unavailable
 
-If `routing-service` is unavailable, `dispatch-service` retries the route request. If all retries fail, the ride remains in `requested` state and the failed event is written to `events.dead_letter`. Operators can inspect the dead-letter payload and replay or repair the ride after routing recovers.
+If `routing-service` is unavailable, `dispatch-service` retries the route request. If all retries fail, the ride remains in `requested` state and the failed event is written to `events.dead_letter`. Operators can inspect the payload, but replay or repair is currently manual because no dead-letter replay tool is implemented.
 
 ### Redis Unavailable
 
@@ -86,7 +86,7 @@ If PostgreSQL is unavailable:
 
 ### Dispatch Service Restarts
 
-Redis Stream consumer groups preserve unacknowledged messages. If `dispatch-service` restarts before acknowledging a message, the message remains pending, and the idempotency check protects an already-assigned ride from a duplicate state transition. The current worker reads new messages with `>` but does not yet claim abandoned pending entries; production recovery still requires `XAUTOCLAIM`/`XCLAIM` handling or dedicated replay tooling.
+Redis Stream consumer groups preserve unacknowledged messages. If `dispatch-service` restarts before acknowledging one, the entry remains pending rather than disappearing. The current worker reads new messages with `>` and does not claim abandoned pending entries, so it will not resume that work automatically. `XAUTOCLAIM`/`XCLAIM` handling or dedicated replay tooling is required; if a request is later delivered again, the PostgreSQL guard prevents a second assignment state transition.
 
 ## Metrics
 
