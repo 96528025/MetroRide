@@ -53,6 +53,8 @@ type nearestDriverRequest struct {
 	PickupLng float64 `json:"pickup_lng"`
 }
 
+const nearestDriverAlgorithm = "haversine-nearest"
+
 func main() {
 	metrics.RegisterCommon()
 	prometheus.MustRegister(routingDuration, activeDrivers)
@@ -142,7 +144,7 @@ func (s *routingService) nearestDriver(w http.ResponseWriter, r *http.Request) {
 		"driver_id":   selected.ID,
 		"distance_km": math.Round(distanceKM*100) / 100,
 		"eta_seconds": etaSeconds,
-		"algorithm":   "haversine-nearest-with-dijkstra-ready-graph",
+		"algorithm":   nearestDriverAlgorithm,
 		"computed_at": time.Now().UTC(),
 	})
 }
