@@ -21,7 +21,7 @@ This is a portfolio-scale systems project, not a production ride-hailing service
 | Reliability | Two-second dependency deadlines, bounded foreground retries, capped-backoff outbox relay, dependency-aware readiness, dead-letter stream |
 | Routing | Deterministic `O(n)` scan of available drivers using Haversine distance; fixed-speed ETA estimate; opt-in microbenchmark |
 | Observability | Structured JSON logs, Prometheus metrics, provisioned Grafana dashboard, `/healthz`, `/readyz`, and `/metrics` |
-| Verification | Four routing and two rider-readiness unit tests; happy-path, duplicate-delivery, relay-progress, Redis-outage, and routing-outage checks; post-deployment KinD smoke test |
+| Verification | 33 untagged unit tests across eight of 15 Go packages; happy-path, duplicate-delivery, relay-progress, Redis-outage, and routing-outage checks; post-deployment KinD smoke test |
 | Delivery | Six non-root service images; immutable commit-SHA tags; Helm release installed in an ephemeral KinD cluster in CI |
 | Optional streaming | Single-broker Kafka profile for driver-location telemetry and an in-memory analytics view; separate from core dispatch |
 
@@ -75,7 +75,7 @@ The checked-in tests and CI scripts establish the following narrow claims:
 | Kubernetes release | CI installs the Helm chart in KinD, drives a ride through it, then independently checks PostgreSQL and notification state |
 | Published artifacts | Trusted runs publish six SHA-tagged images, pull those exact tags back, side-load them into KinD, and test them |
 
-There is no coverage-percentage claim. The repository has four untagged routing unit tests, three tagged integration tests for the workflow and outbox relay, and one tagged routing-outage integration test; smoke scripts add broader runtime, recovery, and deployment assertions.
+There is no coverage-percentage or comprehensive-coverage claim. `go test ./...` runs 33 untagged unit tests across eight of 15 Go packages; seven packages still have no unit-test files. The repository also has three tagged integration tests for the workflow and outbox relay and one tagged routing-outage integration test; smoke scripts add broader runtime, recovery, and deployment assertions.
 
 ## Quick Start
 
@@ -166,7 +166,7 @@ go test ./...
 docker compose config
 ```
 
-`go test ./...` compiles all packages and runs the nearest-driver, outbox-backoff, and rider-readiness unit tests. The routing benchmark is opt-in:
+`go test ./...` compiles all 15 packages and runs 33 untagged unit tests across eight packages. They cover event envelopes, configuration parsing, shared HTTP/readiness behavior, retry and timeout helpers, the dispatch-to-routing client, nearest-driver selection, outbox backoff, and rider readiness. Seven packages still have no unit-test files. The routing benchmark is opt-in:
 
 ```bash
 go test -run '^$' -bench BenchmarkSelectNearestDriver10000 -benchmem ./services/routing-service/cmd
