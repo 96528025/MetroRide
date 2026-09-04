@@ -57,7 +57,9 @@ delivery run is never interrupted mid-publish.
 go test ./...
 ```
 
-This command compiles all Go packages and runs four routing tests, the outbox-backoff test, and two rider-readiness tests. They cover the API algorithm label, nearest-driver correctness, unavailable-driver filtering, deterministic tie handling, retry-delay capping, and the rider service's PostgreSQL-only readiness contract. It does not require Docker Compose or external services.
+This command compiles all 15 Go packages and runs 33 untagged unit tests across eight packages. They cover event-envelope encoding and decoding, configuration defaults and overrides, common HTTP and readiness behavior, retry and timeout helpers, the dispatch-to-routing request contract and failure paths, the API algorithm label, nearest-driver correctness, retry-delay capping, and the rider service's PostgreSQL-only readiness contract. The tests do not require Docker Compose or external services.
+
+Seven packages still have no unit-test files: the analytics, driver, notification, and traffic service entry points, plus the Kafka, logging, and metrics helpers. The repository therefore makes no comprehensive unit-coverage claim.
 
 The routing benchmark is opt-in so ordinary test runs remain fast:
 
@@ -177,10 +179,10 @@ The automated suite covers the happy path, duplicate-event idempotency, Redis ou
 
 ## Future Testing Improvements
 
-- Add service-level unit tests for retry and readiness helpers.
+- Add focused tests for the seven remaining packages where their behavior warrants isolation.
 - Add dead-letter replay tests.
 - Add stream lag assertions and pending-entry claiming tests.
-- Add contract tests for event envelopes.
+- Add Redis-backed publish/consume contract tests for event envelopes.
 - Add GitHub Actions matrix testing across Go versions.
 - Add Kubernetes failure-path validation (dependency outage inside the cluster).
 - Add race detector runs for selected packages.
