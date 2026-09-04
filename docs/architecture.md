@@ -61,13 +61,13 @@ The shared event envelope includes event ID, type, source, correlation ID, times
 ## Runtime Workflow
 
 1. `rider-service` receives `POST /v1/rides`.
-2. The ride is inserted into PostgreSQL with `requested` status.
-3. `rider-service` publishes `ride_requested` to Redis Streams.
+2. The ride and a pending `ride_requested` outbox event are committed together in PostgreSQL.
+3. `rider-service` returns `202`; its relay publishes the pending event to Redis Streams asynchronously.
 4. `dispatch-service` consumes the request with a Redis consumer group.
 5. `dispatch-service` calls `routing-service` for nearest-driver selection.
 6. `routing-service` calculates distance and ETA from its driver-location view.
-7. `dispatch-service` persists the assignment and updates ride status to `assigned`.
-8. `dispatch-service` emits assignment and notification events.
+7. `dispatch-service` commits the assignment, status update, and pending assignment and notification outbox events together.
+8. Its relay publishes both pending events to their Redis Streams asynchronously.
 9. `notification-service` consumes notification events and logs simulated delivery.
 
 ## Why Redis Streams?
@@ -92,7 +92,7 @@ MetroRide includes foundational production hooks:
 - Structured logs include service names and workflow identifiers for cross-service debugging.
 - Docker Compose health checks gate Redis and PostgreSQL readiness before dependent services start.
 
-Dispatch currently uses bounded retries, an idempotent PostgreSQL state transition, and `events.dead_letter` for retry-exhausted failures. The routing-outage integration test automatically validates that path. Next resilience steps include dead-letter replay tooling, a transactional outbox, circuit breakers around routing calls, and stream lag alerting.
+Dispatch uses bounded retries, an idempotent PostgreSQL state transition, a transactional outbox, and `events.dead_letter` for retry-exhausted failures. Automated outage tests validate both routing dead-letter behavior and Redis recovery without event loss. Next resilience steps include dead-letter replay tooling, abandoned pending-message claiming, circuit breakers around routing calls, and stream lag alerting.
 
 ## Scalability Considerations
 

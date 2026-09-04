@@ -30,11 +30,11 @@ The Kafka extension focuses on driver location telemetry, a realistic stream-lik
 
 MetroRide still uses Redis Streams for the core ride dispatch workflow. That path is intentionally unchanged:
 
-1. `rider-service` publishes `ride_requested`.
+1. `rider-service` commits `ride_requested` to its PostgreSQL outbox, whose relay publishes it.
 2. `dispatch-service` consumes the request.
 3. `dispatch-service` calls `routing-service`.
-4. `dispatch-service` persists assignment state.
-5. Assignment and notification events are emitted.
+4. `dispatch-service` atomically persists assignment state and its downstream outbox events.
+5. Its relay publishes the assignment and notification events.
 
 Redis Streams remains a good fit for the local MVP because it is lightweight, simple to operate, and already supports consumer groups and acknowledgement semantics.
 

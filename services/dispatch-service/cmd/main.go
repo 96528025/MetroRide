@@ -20,6 +20,7 @@ import (
 	"github.com/metroride/metroride/shared/pkg/httpx"
 	"github.com/metroride/metroride/shared/pkg/logging"
 	"github.com/metroride/metroride/shared/pkg/metrics"
+	"github.com/metroride/metroride/shared/pkg/outbox"
 	"github.com/metroride/metroride/shared/pkg/reliability"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
@@ -62,6 +63,7 @@ type dispatcher struct {
 
 func main() {
 	metrics.RegisterCommon()
+	outbox.RegisterMetrics()
 	prometheus.MustRegister(dispatchLatency, assignmentFailures, ridesAssigned)
 	cfg := config.Load("dispatch-service", ":8082")
 	log := logging.New(cfg.ServiceName)
@@ -81,6 +83,13 @@ func main() {
 		WriteTimeout: reliability.RedisTimeout,
 	})
 	defer func() { _ = rdb.Close() }()
+	schemaCtx, schemaCancel := reliability.WithPostgresTimeout(ctx)
+	err = outbox.EnsureSchema(schemaCtx, db)
+	schemaCancel()
+	if err != nil {
+		log.Error("ensure outbox schema failed", "error", err)
+		os.Exit(1)
+	}
 
 	d := &dispatcher{
 		cfg:    cfg,
@@ -97,6 +106,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	go outbox.NewRelay(cfg.ServiceName, log, db, rdb).Run(ctx)
 	go d.consume(ctx)
 
 	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
@@ -214,6 +224,18 @@ func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) 
 	}
 	assignmentID := uuid.NewString()
 	now := time.Now().UTC()
+	assignment := events.RideAssigned{
+		RideID:       payload.RideID,
+		RiderID:      payload.RiderID,
+		DriverID:     route.DriverID,
+		DistanceKM:   route.DistanceKM,
+		ETASeconds:   route.ETASeconds,
+		AssignmentID: assignmentID,
+	}
+	out, err := events.NewEnvelope(uuid.NewString(), events.TypeRideAssigned, "dispatch-service", payload.RideID, assignment)
+	if err != nil {
+		return err
+	}
 	dbCtx, dbCancel := reliability.WithPostgresTimeout(ctx)
 	defer dbCancel()
 	tx, err := d.db.Begin(dbCtx)
@@ -244,29 +266,19 @@ func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) 
 		metrics.DependencyErrors.WithLabelValues("dispatch-service", "postgres").Inc()
 		return err
 	}
+	if err := outbox.Enqueue(dbCtx, tx, events.StreamRideAssignments, out); err != nil {
+		metrics.DependencyErrors.WithLabelValues("dispatch-service", "postgres").Inc()
+		return err
+	}
+	if err := outbox.Enqueue(dbCtx, tx, events.StreamRideNotifications, out); err != nil {
+		metrics.DependencyErrors.WithLabelValues("dispatch-service", "postgres").Inc()
+		return err
+	}
 	if err := tx.Commit(dbCtx); err != nil {
 		metrics.DependencyErrors.WithLabelValues("dispatch-service", "postgres").Inc()
 		return err
 	}
 
-	assignment := events.RideAssigned{
-		RideID:       payload.RideID,
-		RiderID:      payload.RiderID,
-		DriverID:     route.DriverID,
-		DistanceKM:   route.DistanceKM,
-		ETASeconds:   route.ETASeconds,
-		AssignmentID: assignmentID,
-	}
-	out, err := events.NewEnvelope(uuid.NewString(), events.TypeRideAssigned, "dispatch-service", payload.RideID, assignment)
-	if err != nil {
-		return err
-	}
-	if _, err := d.publishWithRetry(ctx, events.StreamRideAssignments, out); err != nil {
-		return err
-	}
-	if _, err := d.publishWithRetry(ctx, events.StreamRideNotifications, out); err != nil {
-		return err
-	}
 	ridesAssigned.Inc()
 	dispatchLatency.Observe(time.Since(start).Seconds())
 	d.log.Info("ride assigned", "event_type", events.TypeRideAssigned, "ride_id", payload.RideID, "driver_id", route.DriverID, "eta_seconds", route.ETASeconds)

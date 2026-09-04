@@ -34,7 +34,7 @@ Base URL: `http://localhost:8080`
 
 ### Create Ride
 
-Creates a ride request, persists it in PostgreSQL, and publishes `ride_requested` to Redis Streams.
+Creates a ride request and atomically persists both the ride and a pending `ride_requested` outbox event in PostgreSQL. A `202` response confirms that durable commit; a background relay may publish the event to Redis Streams after the response.
 
 ```http
 POST /v1/rides
@@ -94,7 +94,7 @@ Response:
 
 Base URL: `http://localhost:8082`
 
-The dispatch service is primarily event-driven. It consumes `ride_requested` from `events.ride.requests`, calls routing synchronously for nearest-driver selection, updates PostgreSQL, then emits `ride_assigned` and notification events.
+The dispatch service is primarily event-driven. It consumes `ride_requested` from `events.ride.requests`, calls routing synchronously for nearest-driver selection, then atomically commits the PostgreSQL assignment and pending `ride_assigned` and notification outbox events. A background relay publishes those events to Redis Streams.
 
 Operational endpoints:
 

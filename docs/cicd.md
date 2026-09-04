@@ -167,9 +167,10 @@ cluster has the Prometheus Operator CRDs installed.
 
 There are no fixed sleeps. Ordering comes from readiness:
 
-- Bounded init containers block each service until its data stores actually
-  serve, checked with `redis-cli ping` and `pg_isready` rather than a port
-  probe, using images the node already has.
+- Bounded init containers block each service until its startup-critical data
+  stores actually serve, checked with `redis-cli ping` and `pg_isready` rather
+  than a port probe, using images the node already has. `rider-service` waits
+  only for PostgreSQL; its Redis outbox relay can recover asynchronously.
 - `dispatch-service`'s own `/readyz` reports not-ready until PostgreSQL, Redis,
   its Redis consumer group and `routing-service` all answer, so
   `helm --wait` blocks on real dependency health.
@@ -271,7 +272,7 @@ docker compose config
 docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
-go test -tags=integration ./tests/integration
+go test -count=1 -tags=integration ./tests/integration
 bash scripts/failure-integration-test.sh
 docker compose down -v
 

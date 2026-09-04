@@ -123,7 +123,7 @@ services:
   rider-service:
     port: 8080
     replicas: 2
-    dependsOn: [postgres, redis]
+    dependsOn: [postgres]
   driver-service:
     port: 8081
     replicas: 1

@@ -40,9 +40,9 @@ MetroRide uses a service-oriented architecture with asynchronous workflow coordi
 
 | Service role | Startup | Responsibility |
 | --- | --- | --- |
-| `rider-service` | Default | Accepts ride requests, stores ride state, publishes `ride_requested`. |
+| `rider-service` | Default | Accepts ride requests, atomically stores ride state and a `ride_requested` outbox event, then relays it. |
 | `driver-service` | Default | Simulates driver location and availability updates. |
-| `dispatch-service` | Default | Consumes ride requests, coordinates routing, persists assignments, emits assignment and notification events. |
+| `dispatch-service` | Default | Consumes ride requests, coordinates routing, atomically persists assignments and downstream outbox events, then relays them. |
 | `routing-service` | Default | Maintains driver-location state and computes nearest-driver ETA. |
 | `traffic-service` | Default | Simulates congestion updates for future route weighting. |
 | `notification-service` | Default | Consumes assignment notifications and simulates delivery. |
@@ -51,14 +51,14 @@ MetroRide uses a service-oriented architecture with asynchronous workflow coordi
 ## End-to-End Ride Request Flow
 
 1. A client sends `POST /v1/rides` to `rider-service`.
-2. `rider-service` inserts a ride row in PostgreSQL with status `requested`.
-3. `rider-service` publishes a `ride_requested` event to `events.ride.requests`.
+2. `rider-service` atomically commits the `requested` ride and a pending `ride_requested` outbox event in PostgreSQL.
+3. Its relay publishes that event to `events.ride.requests` asynchronously.
 4. `dispatch-service` consumes the event through a Redis consumer group.
 5. `dispatch-service` checks PostgreSQL to avoid duplicate assignment.
 6. `dispatch-service` calls `routing-service` for nearest-driver selection.
 7. `routing-service` uses its driver-location view to return driver ID, distance, and ETA.
-8. `dispatch-service` updates the ride to `assigned` inside PostgreSQL.
-9. `dispatch-service` emits `ride_assigned` and notification events.
+8. `dispatch-service` atomically commits the `assigned` state and pending `ride_assigned` and notification outbox events.
+9. Its relay publishes both events asynchronously.
 10. `notification-service` consumes the notification event and logs simulated delivery.
 
 ## Why Microservices?
@@ -156,7 +156,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 
 - Redis Streams are simple and local-friendly, but Kafka would be more appropriate for very high event volume.
 - The dispatch-to-routing call is synchronous, which keeps assignment simple but adds routing availability to the critical path.
-- Assignment persistence and event publication are not atomic across PostgreSQL and Redis; a transactional outbox would improve reliability.
+- Outbox delivery is at-least-once, so consumers must remain idempotent when a relay repeats a stable event ID.
 - Routing state is in memory, which is acceptable for the simulation but would need partitioning or a shared location store at scale.
 - The system prioritizes clear architecture and operational hooks over full domain completeness.
 
@@ -165,7 +165,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 - Migrate appropriate core event streams to Kafka if production throughput and retention requirements justify it; the current Kafka profile is an optional telemetry extension only.
 - Move service-to-service calls to gRPC with deadlines and typed protobuf contracts.
 - Add OpenTelemetry distributed tracing.
-- Add a transactional outbox for reliable event publication.
+- Add durable idempotency keys to every side-effecting consumer.
 - Add dead-letter replay tooling.
 - Add Kubernetes autoscaling based on stream lag and latency.
 - Partition drivers and rides by region.
