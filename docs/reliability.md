@@ -1,6 +1,6 @@
 # MetroRide Reliability and Failure Handling
 
-MetroRide uses dependency readiness, bounded retries, explicit timeouts, idempotent assignment, transactional outbox delivery, and dead-letter handling around the core ride workflow.
+MetroRide uses dependency readiness, bounded foreground retries, explicit timeouts, idempotent assignment, transactional outbox delivery, and dead-letter handling around the core ride workflow.
 
 ## Timeout Strategy
 
@@ -15,13 +15,13 @@ The goal is to fail fast, log clearly, and preserve the ability to retry transie
 
 ## Retry Strategy
 
-Transient operations use bounded retries with exponential backoff:
+Foreground transient operations use bounded retries with exponential backoff:
 
 - Dispatch message processing retries before a ride request is considered failed.
 - Dispatch-to-routing calls retry because routing failures may be transient.
-- Dead-letter publication uses bounded retries before surfacing failure; outbox relays retry pending rows on their polling loop.
+- Dead-letter publication uses bounded retries before surfacing failure.
 
-Retries are intentionally bounded. Infinite retry loops can hide outages, increase tail latency, and prevent failed events from moving into an inspectable failure path.
+Those request and consumer retries are intentionally bounded. The durable outbox is the explicit exception: unpublished rows remain scheduled until delivery succeeds, using exponential backoff capped at 30 seconds. A failed row does not extend request latency or block other eligible rows, but there is not yet an attempt ceiling or outbox dead-letter path.
 
 ## Idempotency Design
 
@@ -44,7 +44,7 @@ Both state-changing workflow steps use a PostgreSQL outbox:
 
 Delivery is intentionally at-least-once. If Redis accepts an event and the relay crashes before PostgreSQL records the publication, the same envelope may be published again. The envelope ID remains stable across attempts, and the authoritative assignment transition is idempotent. This avoids the state/event dual-write gap without claiming exactly-once delivery across PostgreSQL and Redis.
 
-Relay progress is monotonic within a batch. When one event cannot be published, the relay stops at that event, commits the publication marks for the events it already delivered, and records the failure after the commit releases the row locks. The relay-progress integration test creates a real Redis `WRONGTYPE` failure and verifies that earlier events are not republished on later polling cycles.
+Relay progress is isolated per row. When one event cannot be published, the relay records that attempt, assigns a capped exponential retry time, and continues through the batch. Eligible rows are ordered by retry time so poison rows cannot monopolize every batch while retries still make progress during sustained new traffic. The relay-progress integration test creates real Redis `WRONGTYPE` failures and verifies both that an earlier delivery is not replayed and that a healthy event behind a full batch of poison rows is still published.
 
 ## Dead-Letter Stream
 
@@ -81,8 +81,10 @@ If `routing-service` is unavailable, `dispatch-service` retries the route reques
 
 If Redis is unavailable:
 
-- Readiness checks for Redis-dependent services fail.
-- Event publishers increment dependency error metrics and log structured errors.
+- `rider-service` remains ready while PostgreSQL is healthy because accepting a ride only requires the database transaction that stores the ride and its outbox event. Redis is not a startup or readiness dependency for this service.
+- The rider outbox relay treats Redis loss as degraded delivery: it logs publication failures and increments `metroride_outbox_publish_failures_total` while retrying unpublished rows.
+- Readiness checks for services that must use Redis synchronously still fail.
+- Direct Redis operations increment dependency error metrics and log structured errors; outbox relays use their dedicated failure metric.
 - Stream consumers increment stream consume error metrics.
 - Ride creation commits both the ride and its outbox event, still returns `202`, and requires no client retry.
 - The relay retains the unpublished row, records failed attempts, and publishes it after Redis recovers.

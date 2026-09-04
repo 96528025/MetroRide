@@ -22,7 +22,7 @@ layers.
 7. Build all service images with `docker compose build`.
 8. Start the stack with `docker compose up -d`.
 9. Run `bash scripts/smoke-test.sh`.
-10. Run integration tests with `go test -tags=integration ./tests/integration`.
+10. Run integration tests without the Go test cache using `go test -count=1 -tags=integration ./tests/integration`.
 11. Stop Redis, accept a ride durably, restart Redis, and verify automatic outbox recovery.
 12. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
 13. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
@@ -57,7 +57,7 @@ delivery run is never interrupted mid-publish.
 go test ./...
 ```
 
-This command compiles all Go packages and runs the routing unit tests for nearest-driver correctness, unavailable-driver filtering, and deterministic tie handling. It does not require Docker Compose or external services.
+This command compiles all Go packages and runs four routing tests, the outbox-backoff test, and two rider-readiness tests. They cover the API algorithm label, nearest-driver correctness, unavailable-driver filtering, deterministic tie handling, retry-delay capping, and the rider service's PostgreSQL-only readiness contract. It does not require Docker Compose or external services.
 
 The routing benchmark is opt-in so ordinary test runs remain fast:
 
@@ -108,7 +108,7 @@ message. There are no fixed sleeps used as synchronisation.
 ### Integration Tests
 
 ```bash
-go test -tags=integration ./tests/integration
+go test -count=1 -tags=integration ./tests/integration
 ```
 
 Integration tests require the Docker Compose stack to be running. They validate the backend workflow through real service boundaries:
@@ -116,11 +116,11 @@ Integration tests require the Docker Compose stack to be running. They validate 
 - Happy path ride assignment.
 - Duplicate `ride_requested` event handling.
 - Idempotency: a duplicated event must not create a second assignment for the same ride.
-- Outbox relay progress: a batch containing one undeliverable event must still commit the events it already published.
+- Outbox relay progress: undeliverable rows must neither replay an earlier delivery nor starve healthy work queued behind them.
 
 The tests use the public rider API, Redis Streams, and PostgreSQL state to verify distributed behavior.
 
-The relay-progress test runs its own relay under a unique `source_service`, points one event at a Redis key containing the wrong data type, waits for repeated attempts on that event, and verifies the healthy stream still contains each earlier event exactly once.
+The relay-progress test runs its own relay under a unique `source_service` and points 25 events at a Redis key containing the wrong data type. This fills the production-sized batch with poison rows. The test waits for repeated attempts, verifies an earlier healthy event was not replayed, and verifies a later healthy event still reached its stream.
 
 ### Routing-Outage Failure Integration Test
 
@@ -148,7 +148,7 @@ The test uses a 30-second context deadline and Redis blocking reads with short p
 bash scripts/outbox-recovery-test.sh
 ```
 
-The script stops the real Redis container, creates a ride through the public API, and confirms PostgreSQL contains exactly one unpublished `ride_requested` outbox row. It then restarts Redis and waits until the relay has published every event for that ride and dispatch has assigned it. This verifies that the accepted request recovers without a client retry.
+The script stops the real Redis container, verifies that `rider-service` remains ready, creates a ride through the public API with an exact `HTTP 202`, and confirms PostgreSQL contains exactly one unpublished `ride_requested` outbox row. It then restarts Redis and waits until the relay has published every event for that ride and dispatch has assigned it. This verifies that deployment readiness preserves traffic to the durable write path and that the accepted request recovers without a client retry.
 
 ## Running Everything Locally
 
@@ -160,7 +160,7 @@ docker compose config
 docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
-go test -tags=integration ./tests/integration
+go test -count=1 -tags=integration ./tests/integration
 bash scripts/outbox-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
@@ -173,7 +173,7 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, outbox relay progress across a partially failing batch, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 

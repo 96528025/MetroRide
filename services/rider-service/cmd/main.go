@@ -39,7 +39,12 @@ type createRideRequest struct {
 type service struct {
 	log *slog.Logger
 	db  *pgxpool.Pool
-	rdb *redis.Client
+}
+
+func riderReadinessChecks(checkPostgres httpx.ReadinessCheck) map[string]httpx.ReadinessCheck {
+	return map[string]httpx.ReadinessCheck{
+		"postgres": checkPostgres,
+	}
 }
 
 func main() {
@@ -49,33 +54,33 @@ func main() {
 	cfg := config.Load("rider-service", ":8080")
 	log := logging.New(cfg.ServiceName)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	db, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
 		log.Error("connect postgres", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
-
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         cfg.RedisAddr,
 		DialTimeout:  reliability.RedisTimeout,
 		ReadTimeout:  reliability.RedisTimeout,
 		WriteTimeout: reliability.RedisTimeout,
 	})
-	defer func() { _ = rdb.Close() }()
-	if err := outbox.EnsureSchema(ctx, db); err != nil {
+	schemaCtx, schemaCancel := reliability.WithPostgresTimeout(ctx)
+	err = outbox.EnsureSchema(schemaCtx, db)
+	schemaCancel()
+	if err != nil {
 		log.Error("ensure outbox schema failed", "error", err)
 		os.Exit(1)
 	}
-	go outbox.NewRelay(cfg.ServiceName, log, db, rdb).Run(ctx)
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		outbox.NewRelay(cfg.ServiceName, log, db, rdb).Run(ctx)
+	}()
 
-	svc := &service{log: log, db: db, rdb: rdb}
-	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
-		"postgres": svc.checkPostgres,
-		"redis":    svc.checkRedis,
-	})
+	svc := &service{log: log, db: db}
+	mux := httpx.CommonMuxWithReadiness(log, riderReadinessChecks(svc.checkPostgres))
 	mux.HandleFunc("POST /v1/rides", svc.createRide)
 	mux.HandleFunc("GET /v1/rides/{ride_id}", svc.getRide)
 
@@ -89,6 +94,12 @@ func main() {
 	}()
 
 	waitForShutdown(cfg, log, server)
+	cancel()
+	<-relayDone
+	if err := rdb.Close(); err != nil {
+		log.Error("close redis client failed", "error", err)
+	}
+	db.Close()
 }
 
 func (s *service) createRide(w http.ResponseWriter, r *http.Request) {
@@ -184,12 +195,6 @@ func (s *service) checkPostgres(ctx context.Context) error {
 	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
 	defer cancel()
 	return s.db.Ping(checkCtx)
-}
-
-func (s *service) checkRedis(ctx context.Context) error {
-	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
-	defer cancel()
-	return s.rdb.Ping(checkCtx).Err()
 }
 
 func waitForShutdown(cfg config.Config, log *slog.Logger, server *http.Server) {

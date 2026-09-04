@@ -36,10 +36,11 @@ create table if not exists event_outbox (
     created_at timestamptz not null,
     published_at timestamptz,
     publish_attempts integer not null default 0,
+    next_attempt_at timestamptz not null default now(),
     last_error text,
     primary key (id, stream)
 );
 
-create index if not exists event_outbox_unpublished_idx
-    on event_outbox (source_service, created_at)
+create index if not exists event_outbox_unpublished_schedule_idx
+    on event_outbox (source_service, next_attempt_at, created_at, id)
     where published_at is null;

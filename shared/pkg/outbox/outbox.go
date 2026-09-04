@@ -19,6 +19,7 @@ import (
 const (
 	defaultBatchSize    = 25
 	defaultPollInterval = 250 * time.Millisecond
+	maxRetryBackoff     = 30 * time.Second
 )
 
 var (
@@ -51,6 +52,7 @@ func EnsureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			created_at timestamptz not null,
 			published_at timestamptz,
 			publish_attempts integer not null default 0,
+			next_attempt_at timestamptz not null default now(),
 			last_error text,
 			primary key (id, stream)
 		)
@@ -59,12 +61,22 @@ func EnsureSchema(ctx context.Context, db *pgxpool.Pool) error {
 		return fmt.Errorf("create event outbox: %w", err)
 	}
 	_, err = db.Exec(ctx, `
-		create index if not exists event_outbox_unpublished_idx
-		on event_outbox (source_service, created_at)
+		alter table event_outbox
+		add column if not exists next_attempt_at timestamptz not null default now()
+	`)
+	if err != nil {
+		return fmt.Errorf("add outbox retry schedule: %w", err)
+	}
+	_, err = db.Exec(ctx, `
+		create index if not exists event_outbox_unpublished_schedule_idx
+		on event_outbox (source_service, next_attempt_at, created_at, id)
 		where published_at is null
 	`)
 	if err != nil {
 		return fmt.Errorf("index event outbox: %w", err)
+	}
+	if _, err = db.Exec(ctx, `drop index if exists event_outbox_unpublished_idx`); err != nil {
+		return fmt.Errorf("remove obsolete outbox index: %w", err)
 	}
 	return nil
 }
@@ -115,7 +127,7 @@ func (r *Relay) Run(ctx context.Context) {
 	defer ticker.Stop()
 
 	for {
-		if err := r.publishBatch(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := r.PublishPending(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			r.log.Error("outbox relay failed", "error", err)
 		}
 		select {
@@ -127,27 +139,52 @@ func (r *Relay) Run(ctx context.Context) {
 }
 
 type record struct {
-	id       string
-	stream   string
-	envelope events.Envelope
+	id              string
+	stream          string
+	envelope        events.Envelope
+	publishAttempts int
 }
 
-func (r *Relay) publishBatch(ctx context.Context) error {
-	tx, err := r.db.Begin(ctx)
+func retryBackoff(previousAttempts int) time.Duration {
+	delay := defaultPollInterval
+	for attempt := 0; attempt < previousAttempts; attempt++ {
+		if delay >= maxRetryBackoff/2 {
+			return maxRetryBackoff
+		}
+		delay *= 2
+	}
+	if delay > maxRetryBackoff {
+		return maxRetryBackoff
+	}
+	return delay
+}
+
+// PublishPending publishes at most one batch of currently eligible events.
+// Callers may use it for a bounded drain; Run invokes it on every poll.
+func (r *Relay) PublishPending(ctx context.Context) error {
+	dbCtx, cancel := reliability.WithPostgresTimeout(ctx)
+	tx, err := r.db.Begin(dbCtx)
+	cancel()
 	if err != nil {
 		return fmt.Errorf("begin outbox relay transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() {
+		rollbackCtx, rollbackCancel := reliability.WithPostgresTimeout(context.Background())
+		defer rollbackCancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
 
-	rows, err := tx.Query(ctx, `
-		select id, stream, envelope
+	dbCtx, cancel = reliability.WithPostgresTimeout(ctx)
+	rows, err := tx.Query(dbCtx, `
+		select id, stream, envelope, publish_attempts
 		from event_outbox
-		where source_service = $1 and published_at is null
-		order by created_at
+		where source_service = $1 and published_at is null and next_attempt_at <= now()
+		order by next_attempt_at, created_at, id
 		limit $2
 		for update skip locked
 	`, r.service, r.batchSize)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("query pending outbox events: %w", err)
 	}
 
@@ -155,75 +192,91 @@ func (r *Relay) publishBatch(ctx context.Context) error {
 	for rows.Next() {
 		var item record
 		var body []byte
-		if err := rows.Scan(&item.id, &item.stream, &body); err != nil {
+		if err := rows.Scan(&item.id, &item.stream, &body, &item.publishAttempts); err != nil {
 			rows.Close()
+			cancel()
 			return fmt.Errorf("scan outbox event: %w", err)
 		}
 		if err := json.Unmarshal(body, &item.envelope); err != nil {
 			rows.Close()
+			cancel()
 			return fmt.Errorf("decode outbox event %s: %w", item.id, err)
 		}
 		records = append(records, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
+		cancel()
 		return fmt.Errorf("iterate outbox events: %w", err)
 	}
 	rows.Close()
+	cancel()
 
-	// Relay progress must be monotonic. Redis already holds every event published
-	// before a failure, so discarding their published_at marks would republish all
-	// of them on the next poll, and a record that always fails sits at the head of
-	// the created_at order and would repeat that batch indefinitely. Stop at the
-	// first failure, commit the progress made ahead of it, then record the failure
-	// on its own connection once the commit has released the row locks.
-	var (
-		failedItem *record
-		failedErr  error
-	)
+	// A failed destination must not block unrelated streams. Record every attempt
+	// in this transaction and continue through the batch. Failed rows receive a
+	// capped exponential retry time; ordering all eligible rows by that time keeps
+	// both retries and newly queued work moving without either class starving.
+	type publishFailure struct {
+		item record
+		err  error
+	}
+	published := make([]record, 0, len(records))
+	failures := make([]publishFailure, 0)
 	for i := range records {
 		item := &records[i]
 		redisCtx, cancel := reliability.WithRedisTimeout(ctx)
 		_, publishErr := events.Publish(redisCtx, r.rdb, item.stream, item.envelope)
 		cancel()
 		if publishErr != nil {
-			failedItem, failedErr = item, publishErr
-			break
+			retryDelaySeconds := retryBackoff(item.publishAttempts).Seconds()
+			dbCtx, cancel := reliability.WithPostgresTimeout(ctx)
+			_, err := tx.Exec(dbCtx, `
+				update event_outbox
+				set publish_attempts = publish_attempts + 1,
+					next_attempt_at = clock_timestamp() + make_interval(secs => $3),
+					last_error = $4
+				where id = $1 and stream = $2 and published_at is null
+			`, item.id, item.stream, retryDelaySeconds, publishErr.Error())
+			cancel()
+			if err != nil {
+				return fmt.Errorf("record outbox event %s publish failure: %w", item.id, err)
+			}
+			failures = append(failures, publishFailure{item: *item, err: publishErr})
+			continue
 		}
 		// A failure here aborts the transaction, so the batch's progress is lost
 		// and those events are published again after the next poll. Postgres
 		// forbids committing an aborted transaction, so the duplicate is the only
 		// safe outcome; consumers stay idempotent for exactly this reason.
-		if _, err := tx.Exec(ctx, `
+		dbCtx, cancel := reliability.WithPostgresTimeout(ctx)
+		_, err := tx.Exec(dbCtx, `
 			update event_outbox
-			set published_at = now(), publish_attempts = publish_attempts + 1, last_error = null
+			set published_at = clock_timestamp(), publish_attempts = publish_attempts + 1, last_error = null
 			where id = $1 and stream = $2
-		`, item.id, item.stream); err != nil {
+		`, item.id, item.stream)
+		cancel()
+		if err != nil {
 			return fmt.Errorf("mark outbox event %s published: %w", item.id, err)
 		}
-		publishedEvents.WithLabelValues(r.service, item.stream).Inc()
+		published = append(published, *item)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	dbCtx, cancel = reliability.WithPostgresTimeout(ctx)
+	err = tx.Commit(dbCtx)
+	cancel()
+	if err != nil {
 		return fmt.Errorf("commit outbox relay transaction: %w", err)
 	}
 
-	if failedItem != nil {
-		publishFailures.WithLabelValues(r.service, failedItem.stream).Inc()
-		r.recordFailure(ctx, failedItem.id, failedItem.stream, failedErr)
-		return fmt.Errorf("publish outbox event %s: %w", failedItem.id, failedErr)
+	for _, item := range published {
+		publishedEvents.WithLabelValues(r.service, item.stream).Inc()
+	}
+	for _, failure := range failures {
+		publishFailures.WithLabelValues(r.service, failure.item.stream).Inc()
+	}
+	if len(failures) > 0 {
+		first := failures[0]
+		return fmt.Errorf("publish %d outbox event(s); first failure for %s: %w", len(failures), first.item.id, first.err)
 	}
 	return nil
-}
-
-func (r *Relay) recordFailure(ctx context.Context, id, stream string, cause error) {
-	dbCtx, cancel := reliability.WithPostgresTimeout(ctx)
-	defer cancel()
-	if _, err := r.db.Exec(dbCtx, `
-		update event_outbox
-		set publish_attempts = publish_attempts + 1, last_error = $3
-		where id = $1 and stream = $2 and published_at is null
-	`, id, stream, cause.Error()); err != nil {
-		r.log.Error("record outbox publish failure failed", "error", err, "event_id", id)
-	}
 }

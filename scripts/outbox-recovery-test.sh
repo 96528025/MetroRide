@@ -31,6 +31,17 @@ fi
 echo "stopping Redis to open the database/event-bus failure window..."
 docker compose stop -t 5 redis >/dev/null
 
+if ! readiness_response="$(curl -fsS --max-time 3 "http://${BASE_HOST}:8080/readyz")"; then
+  echo "failed: rider-service left the ready pool even though PostgreSQL can still accept durable requests" >&2
+  exit 1
+fi
+readiness_status="$(printf '%s' "${readiness_response}" | extract_json_string status)"
+if [[ "${readiness_status}" != "ready" ]]; then
+  echo "failed: rider-service reported unexpected readiness during Redis outage: ${readiness_response}" >&2
+  exit 1
+fi
+echo "ok: rider-service remains ready while Redis delivery is degraded"
+
 response_file="$(mktemp)"
 status_code="$(curl -sS -o "${response_file}" -w '%{http_code}' -X POST "http://${BASE_HOST}:8080/v1/rides" \
   -H 'Content-Type: application/json' \

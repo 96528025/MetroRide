@@ -18,10 +18,10 @@ This is a portfolio-scale systems project, not a production ride-hailing service
 | --- | --- |
 | Service architecture | Six Go services; REST at the client and routing boundaries; Redis Streams consumer groups for dispatch and notification |
 | State and consistency | PostgreSQL ride/assignment schema; state changes and publication intent committed together through an outbox; guarded `status = 'requested'` transition |
-| Reliability | Two-second dependency deadlines, bounded retries, dependency-aware readiness, at-least-once outbox relay, dead-letter stream |
+| Reliability | Two-second dependency deadlines, bounded foreground retries, capped-backoff outbox relay, dependency-aware readiness, dead-letter stream |
 | Routing | Deterministic `O(n)` scan of available drivers using Haversine distance; fixed-speed ETA estimate; opt-in microbenchmark |
 | Observability | Structured JSON logs, Prometheus metrics, provisioned Grafana dashboard, `/healthz`, `/readyz`, and `/metrics` |
-| Verification | Three routing unit tests; happy-path, duplicate-delivery, relay-progress, Redis-outage, and routing-outage checks; post-deployment KinD smoke test |
+| Verification | Four routing and two rider-readiness unit tests; happy-path, duplicate-delivery, relay-progress, Redis-outage, and routing-outage checks; post-deployment KinD smoke test |
 | Delivery | Six non-root service images; immutable commit-SHA tags; Helm release installed in an ephemeral KinD cluster in CI |
 | Optional streaming | Single-broker Kafka profile for driver-location telemetry and an in-memory analytics view; separate from core dispatch |
 
@@ -68,14 +68,14 @@ The checked-in tests and CI scripts establish the following narrow claims:
 | --- | --- |
 | End-to-end assignment | A real API request crosses rider, Redis, dispatch, routing, and PostgreSQL and reaches `assigned` with a driver |
 | Duplicate-event handling | A second `ride_requested` event preserves the original driver and exactly one `ride_assignments` row |
-| Outbox batch progress | A real Redis `WRONGTYPE` failure after two valid events leaves those earlier events published exactly once and records another attempt for the failing row |
+| Outbox batch progress | Real Redis `WRONGTYPE` failures neither replay an earlier delivery nor starve a healthy event queued behind a full batch of poison rows |
 | Redis outage recovery | CI accepts a ride while Redis is stopped, verifies its pending outbox row, restarts Redis, and observes assignment without a client retry |
 | Routing outage | CI stops `routing-service`; dispatch exhausts bounded retries, writes a matching dead letter, and leaves the ride unassigned |
 | Runtime readiness | The smoke test requires `/healthz` and `/readyz` from all six core services and checks selected metrics endpoints |
 | Kubernetes release | CI installs the Helm chart in KinD, drives a ride through it, then independently checks PostgreSQL and notification state |
 | Published artifacts | Trusted runs publish six SHA-tagged images, pull those exact tags back, side-load them into KinD, and test them |
 
-There is no coverage-percentage claim. The repository has three untagged routing unit tests, three tagged integration tests for the workflow and outbox relay, and one tagged routing-outage integration test; smoke scripts add broader runtime, recovery, and deployment assertions.
+There is no coverage-percentage claim. The repository has four untagged routing unit tests, three tagged integration tests for the workflow and outbox relay, and one tagged routing-outage integration test; smoke scripts add broader runtime, recovery, and deployment assertions.
 
 ## Quick Start
 
@@ -119,7 +119,7 @@ This is idempotent state mutation, not exactly-once message processing.
 
 `rider-service` commits a new ride and its `ride_requested` publication intent together. `dispatch-service` likewise commits the guarded assignment and both downstream publication intents together. Each service runs a relay that selects its pending rows with `FOR UPDATE SKIP LOCKED`, publishes them to Redis Streams, and records successful publication.
 
-Delivery is at-least-once. A crash after Redis accepts an event but before PostgreSQL records `published_at` can publish the same stable event envelope again, so consumers still require idempotent handling. A partially failing relay batch commits the progress made before the failure instead of replaying those earlier events on every poll.
+Delivery is at-least-once. A crash after Redis accepts an event but before PostgreSQL records `published_at` can publish the same stable event envelope again, so consumers still require idempotent handling. A partially failing relay batch records each outcome and continues past failed destinations. Failed rows receive capped exponential backoff and eligible work is ordered by retry time, so neither a poison row nor a steady flow of new events can starve the other class.
 
 ### Bounded dependency work
 
@@ -166,7 +166,7 @@ go test ./...
 docker compose config
 ```
 
-`go test ./...` compiles all packages and runs the nearest-driver unit tests. The routing benchmark is opt-in:
+`go test ./...` compiles all packages and runs the nearest-driver, outbox-backoff, and rider-readiness unit tests. The routing benchmark is opt-in:
 
 ```bash
 go test -run '^$' -bench BenchmarkSelectNearestDriver10000 -benchmem ./services/routing-service/cmd
@@ -213,7 +213,7 @@ The chart's normal defaults expect externally supplied PostgreSQL and Redis endp
 
 ## Current Limitations
 
-- Outbox delivery is at-least-once, so a relay crash between Redis publication and the `published_at` update can duplicate a stable event envelope. The relay also holds PostgreSQL row locks while publishing; a higher-throughput implementation would use leases or partitioned workers.
+- Outbox delivery is at-least-once, so a relay crash between Redis publication and the `published_at` update can duplicate a stable event envelope. Failed rows use capped exponential backoff but still have no attempt ceiling or outbox dead-letter path. The relay also holds PostgreSQL row locks while publishing; a higher-throughput implementation would use leases or partitioned workers.
 - Consumers read new Redis Stream entries but do not reclaim abandoned pending entries with `XAUTOCLAIM`/`XCLAIM`; crash recovery and dead-letter replay tooling remain future work.
 - Routing state is process-local. The CI profile uses one routing replica; multiple replicas would need partitioned or shared driver state rather than the current consumer-group arrangement.
 - Driver availability is simulated and not reserved when a ride is assigned. Traffic events are produced but not yet used by routing, and notifications are logs plus a counter rather than external delivery.

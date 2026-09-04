@@ -83,7 +83,10 @@ func main() {
 		WriteTimeout: reliability.RedisTimeout,
 	})
 	defer func() { _ = rdb.Close() }()
-	if err := outbox.EnsureSchema(ctx, db); err != nil {
+	schemaCtx, schemaCancel := reliability.WithPostgresTimeout(ctx)
+	err = outbox.EnsureSchema(schemaCtx, db)
+	schemaCancel()
+	if err != nil {
 		log.Error("ensure outbox schema failed", "error", err)
 		os.Exit(1)
 	}
