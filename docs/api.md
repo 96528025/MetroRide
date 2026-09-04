@@ -115,7 +115,7 @@ Base URL: `http://localhost:8083`
 
 ### Find Nearest Driver
 
-Calculates the nearest available driver using the routing service's current driver-location view.
+Calculates the nearest available driver using the routing service's current driver-location view. Distance is the Haversine great-circle distance rather than a road-network route, and ETA assumes a constant 32 km/h speed with a 60-second minimum.
 
 ```http
 POST /v1/routes/nearest-driver
@@ -138,7 +138,7 @@ Response:
   "driver_id": "driver-1001",
   "distance_km": 0.08,
   "eta_seconds": 60,
-  "algorithm": "haversine-nearest-with-dijkstra-ready-graph",
+  "algorithm": "haversine-nearest",
   "computed_at": "2026-05-19T20:00:02Z"
 }
 ```
