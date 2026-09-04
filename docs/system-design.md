@@ -156,7 +156,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 
 - Redis Streams are simple and local-friendly, but Kafka would be more appropriate for very high event volume.
 - The dispatch-to-routing call is synchronous, which keeps assignment simple but adds routing availability to the critical path.
-- Assignment persistence and event publication are not atomic across PostgreSQL and Redis; a transactional outbox would improve reliability.
+- Outbox delivery is at-least-once, so consumers must remain idempotent when a relay repeats a stable event ID.
 - Routing state is in memory, which is acceptable for the simulation but would need partitioning or a shared location store at scale.
 - The system prioritizes clear architecture and operational hooks over full domain completeness.
 
@@ -165,7 +165,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 - Migrate appropriate core event streams to Kafka if production throughput and retention requirements justify it; the current Kafka profile is an optional telemetry extension only.
 - Move service-to-service calls to gRPC with deadlines and typed protobuf contracts.
 - Add OpenTelemetry distributed tracing.
-- Add a transactional outbox for reliable event publication.
+- Add durable idempotency keys to every side-effecting consumer.
 - Add dead-letter replay tooling.
 - Add Kubernetes autoscaling based on stream lag and latency.
 - Partition drivers and rides by region.

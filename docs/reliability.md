@@ -1,6 +1,6 @@
 # MetroRide Reliability and Failure Handling
 
-MetroRide keeps the existing service architecture and event flow while adding production-oriented reliability controls around dependency readiness, bounded retries, explicit timeouts, idempotent assignment, and dead-letter handling.
+MetroRide uses dependency readiness, bounded retries, explicit timeouts, idempotent assignment, transactional outbox delivery, and dead-letter handling around the core ride workflow.
 
 ## Timeout Strategy
 
@@ -19,7 +19,7 @@ Transient operations use bounded retries with exponential backoff:
 
 - Dispatch message processing retries before a ride request is considered failed.
 - Dispatch-to-routing calls retry because routing failures may be transient.
-- Redis publishes from dispatch retry before surfacing failure.
+- Dead-letter publication uses bounded retries before surfacing failure; outbox relays retry pending rows on their polling loop.
 
 Retries are intentionally bounded. Infinite retry loops can hide outages, increase tail latency, and prevent failed events from moving into an inspectable failure path.
 
@@ -32,7 +32,19 @@ Retries are intentionally bounded. Infinite retry loops can hide outages, increa
 3. Assignment updates are guarded with `where status = 'requested'`.
 4. If another worker already assigned the ride, the duplicate worker exits without creating another assignment.
 
-This protects the PostgreSQL state transition when the same logical ride request is delivered more than once. It does not by itself recover work abandoned by a crashed consumer: the current readers request only new stream entries and do not claim pending entries. A future version would add pending-entry recovery and a transactional outbox so assignment persistence and event publication can be coordinated reliably.
+This protects the PostgreSQL state transition when the same logical ride request reaches the handler more than once. It does not by itself recover work abandoned in a consumer group's pending-entry list: the current readers request only new stream entries and do not claim pending entries.
+
+## Transactional Outbox
+
+Both state-changing workflow steps use a PostgreSQL outbox:
+
+1. `rider-service` commits the new ride and its `ride_requested` event in one transaction.
+2. `dispatch-service` commits the assignment and both downstream `ride_assigned` deliveries in one transaction.
+3. A relay scoped to each service selects unpublished rows with `FOR UPDATE SKIP LOCKED`, publishes them to Redis Streams, and records `published_at`.
+
+Delivery is intentionally at-least-once. If Redis accepts an event and the relay crashes before PostgreSQL records the publication, the same envelope may be published again. The envelope ID remains stable across attempts, and the authoritative assignment transition is idempotent. This avoids the state/event dual-write gap without claiming exactly-once delivery across PostgreSQL and Redis.
+
+Relay progress is monotonic within a batch. When one event cannot be published, the relay stops at that event, commits the publication marks for the events it already delivered, and records the failure after the commit releases the row locks. The relay-progress integration test creates a real Redis `WRONGTYPE` failure and verifies that earlier events are not republished on later polling cycles.
 
 ## Dead-Letter Stream
 
@@ -57,7 +69,7 @@ If dead-letter publication succeeds, the original stream message is acknowledged
 
 The CI-required routing-outage integration test verifies this path across real components rather than mocks. It stops `routing-service`, creates a ride through `rider-service`, lets the running dispatch consumer exhaust bounded retries, reads the matching entry from the real Redis dead-letter stream, and confirms in PostgreSQL that the ride remains `requested` with no assignment row.
 
-The test validates this routing failure path only. Redis outages, PostgreSQL outages, dispatch crash recovery, and dead-letter replay remain outside the current automated integration coverage.
+The routing failure test validates that path specifically. A separate Redis-outage test proves that ride state and an unpublished event commit while Redis is stopped, then verifies automatic relay and assignment after Redis restarts. PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, and dead-letter replay remain outside current automated coverage.
 
 ## Failure Modes
 
@@ -72,9 +84,9 @@ If Redis is unavailable:
 - Readiness checks for Redis-dependent services fail.
 - Event publishers increment dependency error metrics and log structured errors.
 - Stream consumers increment stream consume error metrics.
-- Ride creation may persist in PostgreSQL but return a warning if event publication fails.
-
-In a production system, the next step would be an outbox table so ride creation and later event publishing remain recoverable when Redis is down.
+- Ride creation commits both the ride and its outbox event, still returns `202`, and requires no client retry.
+- The relay retains the unpublished row, records failed attempts, and publishes it after Redis recovers.
+- Dispatch state changes use the same pattern, so an assignment cannot commit without durable publication intent.
 
 ### PostgreSQL Unavailable
 
@@ -96,6 +108,8 @@ Reliability-related metrics include:
 - `metroride_assignment_failures_total`
 - `metroride_stream_consume_errors_total`
 - `metroride_dependency_errors_total`
+- `metroride_outbox_events_published_total`
+- `metroride_outbox_publish_failures_total`
 - `metroride_dispatch_latency_seconds`
 
 These metrics are designed for alerting on dependency health, dispatch failure rate, and stream processing reliability.

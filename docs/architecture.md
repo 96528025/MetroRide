@@ -92,7 +92,7 @@ MetroRide includes foundational production hooks:
 - Structured logs include service names and workflow identifiers for cross-service debugging.
 - Docker Compose health checks gate Redis and PostgreSQL readiness before dependent services start.
 
-Dispatch currently uses bounded retries, an idempotent PostgreSQL state transition, and `events.dead_letter` for retry-exhausted failures. The routing-outage integration test automatically validates that path. Next resilience steps include dead-letter replay tooling, a transactional outbox, circuit breakers around routing calls, and stream lag alerting.
+Dispatch uses bounded retries, an idempotent PostgreSQL state transition, a transactional outbox, and `events.dead_letter` for retry-exhausted failures. Automated outage tests validate both routing dead-letter behavior and Redis recovery without event loss. Next resilience steps include dead-letter replay tooling, abandoned pending-message claiming, circuit breakers around routing calls, and stream lag alerting.
 
 ## Scalability Considerations
 

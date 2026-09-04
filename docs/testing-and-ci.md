@@ -1,6 +1,6 @@
 # MetroRide Testing and CI
 
-MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, and a real routing-outage dead-letter path.
+MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, outbox relay progress, and a real routing-outage dead-letter path.
 
 ## CI Pipeline
 
@@ -23,12 +23,13 @@ layers.
 8. Start the stack with `docker compose up -d`.
 9. Run `bash scripts/smoke-test.sh`.
 10. Run integration tests with `go test -tags=integration ./tests/integration`.
-11. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
-12. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
+11. Stop Redis, accept a ride durably, restart Redis, and verify automatic outbox recovery.
+12. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
+13. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
     PostgreSQL ride state.
-13. Print focused dispatch, routing, and Redis logs if the failure-path test
-    fails, plus full Compose logs for any CI failure.
-14. Shut down the stack with `docker compose down -v`, even when an earlier
+14. Print focused service and dependency logs if an outage test fails, plus
+    full Compose logs for any CI failure.
+15. Shut down the stack with `docker compose down -v`, even when an earlier
     step fails.
 
 Nothing is published and nothing is deployed unless this job passes.
@@ -56,7 +57,13 @@ delivery run is never interrupted mid-publish.
 go test ./...
 ```
 
-This command compiles all Go packages and would run any untagged package tests. The current repository has no untagged `*_test.go` files, so behavioral evidence comes from the tagged integration tests and smoke scripts below. This gate does not require Docker Compose or external services.
+This command compiles all Go packages and runs the routing unit tests for nearest-driver correctness, unavailable-driver filtering, and deterministic tie handling. It does not require Docker Compose or external services.
+
+The routing benchmark is opt-in so ordinary test runs remain fast:
+
+```bash
+go test -run '^$' -bench BenchmarkSelectNearestDriver10000 -benchmem ./services/routing-service/cmd
+```
 
 ### Smoke Test
 
@@ -109,8 +116,11 @@ Integration tests require the Docker Compose stack to be running. They validate 
 - Happy path ride assignment.
 - Duplicate `ride_requested` event handling.
 - Idempotency: a duplicated event must not create a second assignment for the same ride.
+- Outbox relay progress: a batch containing one undeliverable event must still commit the events it already published.
 
 The tests use the public rider API, Redis Streams, and PostgreSQL state to verify distributed behavior.
+
+The relay-progress test runs its own relay under a unique `source_service`, points one event at a Redis key containing the wrong data type, waits for repeated attempts on that event, and verifies the healthy stream still contains each earlier event exactly once.
 
 ### Routing-Outage Failure Integration Test
 
@@ -124,13 +134,21 @@ The Go test:
 
 1. Confirms routing is unavailable.
 2. Records the current end of `events.dead_letter` so old failures cannot satisfy the test.
-3. Creates a ride through the public rider API, which persists the ride in PostgreSQL and publishes a real `ride_requested` event to Redis Streams.
+3. Creates a ride through the public rider API, which persists the ride and its outbox entry before a relay publishes the real `ride_requested` event to Redis Streams.
 4. Lets the running dispatch consumer exhaust its production bounded-retry path.
 5. Polls only new dead-letter records and matches the exact ride and original event ID.
 6. Validates the dead-letter event type, dispatch source, routing error context, and failure timestamp.
 7. Confirms the ride remains `requested`, has no driver, and has zero rows in `ride_assignments`.
 
 The test uses a 30-second context deadline and Redis blocking reads with short polling intervals. It does not rely on a fixed delay or a mock transport.
+
+### Redis-Outage Outbox Recovery Test
+
+```bash
+bash scripts/outbox-recovery-test.sh
+```
+
+The script stops the real Redis container, creates a ride through the public API, and confirms PostgreSQL contains exactly one unpublished `ride_requested` outbox row. It then restarts Redis and waits until the relay has published every event for that ride and dispatch has assigned it. This verifies that the accepted request recovers without a client retry.
 
 ## Running Everything Locally
 
@@ -143,6 +161,7 @@ docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
 go test -tags=integration ./tests/integration
+bash scripts/outbox-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
 ```
@@ -154,13 +173,13 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover Redis outages, PostgreSQL outages, dispatch crash recovery, dead-letter replay, every malformed event, or every partial-failure window.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, outbox relay progress across a partially failing batch, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 
 - Add service-level unit tests for retry and readiness helpers.
 - Add dead-letter replay tests.
-- Add stream lag assertions.
+- Add stream lag assertions and pending-entry claiming tests.
 - Add contract tests for event envelopes.
 - Add GitHub Actions matrix testing across Go versions.
 - Add Kubernetes failure-path validation (dependency outage inside the cluster).
