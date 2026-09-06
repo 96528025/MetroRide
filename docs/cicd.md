@@ -259,8 +259,8 @@ delivery run is never interrupted part-way through publishing.
 
 ## Running it locally
 
-Everything CI does can be reproduced locally with Docker, Go 1.22, curl, KinD,
-kubectl, Helm and Bash 4+ installed (the scripts use `mapfile`; macOS ships
+Everything CI does can be reproduced locally with Docker with Compose, Go 1.22,
+curl, KinD, kubectl, Helm and Bash 4+ installed (the scripts use `mapfile`; macOS ships
 Bash 3.2):
 
 ```bash
@@ -275,6 +275,7 @@ docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
 go test -count=1 -tags=integration ./tests/integration
+bash scripts/outbox-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
 
