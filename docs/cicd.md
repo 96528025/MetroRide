@@ -45,8 +45,9 @@ can never reach it.
 
 ## Pull requests
 
-Pull requests are untrusted code. They **never publish images** and never need
-registry access at all.
+Pull requests are untrusted code. They **never publish images**, never log in to
+GHCR, and never move MetroRide service images through a registry. Public base
+images, the KinD node image, PostgreSQL and Redis are still pulled.
 
 1. `backend` runs the full existing validation suite (see below).
 2. `deploy-validation.yml` runs with `image_source: pr`:
@@ -58,9 +59,9 @@ registry access at all.
    6. Collect diagnostics if anything failed.
    7. Delete the cluster in an `if: always()` step.
 
-Because the images are side-loaded and the pull policy is `IfNotPresent`, the
-kubelet never contacts a registry. Pull-request validation therefore does not
-depend on GHCR availability, package visibility, or image pull secrets.
+Because the service images are side-loaded and the pull policy is `IfNotPresent`,
+the kubelet never pulls a MetroRide image. Pull-request validation therefore does
+not depend on GHCR availability, package visibility, or image pull secrets.
 
 The job is granted `contents: read` only.
 

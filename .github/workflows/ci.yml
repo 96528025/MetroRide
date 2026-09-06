@@ -141,7 +141,8 @@ jobs:
     name: Deploy validation (pull request)
     needs: backend
     if: github.event_name == 'pull_request'
-    # No package access: the pull-request path never touches a registry.
+    # No package access: the pull-request path never logs in to GHCR or moves
+    # MetroRide service images through a registry (public base images are still pulled).
     permissions:
       contents: read
     uses: ./.github/workflows/deploy-validation.yml
