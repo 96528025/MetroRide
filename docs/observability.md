@@ -35,7 +35,7 @@ Portfolio-friendly metric aliases often used in discussion:
 
 - `dispatch_latency_seconds`: assignment latency from stream consumption to assignment emission.
 - `routing_duration_ms`: route computation duration, usually derived from routing histogram data.
-- `ride_assignments_total`: future counter for successful assignments.
+- `ride_assignments_total`: discussion shorthand for the existing `metroride_rides_assigned_total` counter.
 
 ## Grafana Dashboards
 
@@ -97,7 +97,6 @@ Recommended production alerts:
 
 - Add OpenTelemetry tracing across REST calls and Redis event processing.
 - Add stream lag metrics per consumer group.
-- Add successful assignment counter: `metroride_ride_assignments_total`.
 - Add dead-letter stream metrics.
 - Add RED metrics for every REST endpoint: rate, errors, duration.
 - Add resource dashboards for CPU, memory, goroutines, and database pool utilization.

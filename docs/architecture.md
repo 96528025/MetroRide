@@ -47,14 +47,15 @@ Core streams:
 - `events.ride.assignments`
 - `events.ride.notifications`
 - `events.traffic.updates`
+- `events.dead_letter`
 
 Core events:
 
 - `ride_requested`
 - `driver_location_updated`
 - `ride_assigned`
-- `ride_completed`
 - `traffic_updated`
+- `dead_lettered`
 
 The shared event envelope includes event ID, type, source, correlation ID, timestamp, and payload. This keeps service contracts stable and gives the project a migration path to Kafka without changing domain payloads.
 

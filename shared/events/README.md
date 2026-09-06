@@ -9,5 +9,6 @@ Primary streams:
 - `events.ride.assignments`
 - `events.ride.notifications`
 - `events.traffic.updates`
+- `events.dead_letter`
 
 Kafka can be introduced behind the same envelope contract by replacing the publisher and consumer adapters.
