@@ -14,3 +14,5 @@ Streams (see `shared/pkg/events/events.go`):
 `ride_completed` and `notification_created` exist as constants and are not published by any service.
 
 The optional `kafka` Compose profile already carries driver locations on Kafka, using a separate flat `DriverLocationEvent` (`shared/pkg/kafka/events.go`) rather than this envelope. Moving the Redis streams to Kafka would mean choosing between that flat shape and the envelope; the envelope itself is transport-neutral.
+
+`services/fare-service` (Java) runs under the optional `fare` Compose profile, consumes `events.ride.assignments` through the consumer group `fare-service` and records each envelope ID once; it decodes the same `event` field and envelope JSON the Go services publish.

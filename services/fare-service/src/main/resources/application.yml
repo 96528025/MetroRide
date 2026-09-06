@@ -1,0 +1,59 @@
+# Everything that comes from a MetroRide environment variable is intentionally absent
+# from this file: server.port/server.address, spring.datasource.url/username/password,
+# spring.data.redis.host/port, metroride.consumer.group/name and
+# spring.lifecycle.timeout-per-shutdown-phase are derived from FARE_SERVICE_ADDR,
+# POSTGRES_DSN, REDIS_ADDR, CONSUMER_GROUP, CONSUMER_NAME and SHUTDOWN_TIMEOUT_SECONDS
+# by MetroRideEnvironmentPostProcessor, so the service reads exactly the environment the
+# Go services read. Defining any of them here would shadow the environment.
+
+spring:
+  application:
+    name: fare-service
+  main:
+    banner-mode: off
+  datasource:
+    hikari:
+      maximum-pool-size: 5
+      connection-timeout: 2000   # ms; reliability.PostgresTimeout in the Go services is 2s
+      validation-timeout: 1500   # ms; reliability.ReadinessTimeout in the Go services is 1.5s
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema. Hibernate only checks that the entity mapping matches it.
+      ddl-auto: validate
+  flyway:
+    # fare-service owns the `fare` schema outright: Flyway creates it, keeps its history table
+    # in it, and never has to baseline the init.sql-managed `public` schema shared with Go.
+    schemas: fare
+    locations: classpath:db/migration
+  data:
+    redis:
+      timeout: 2s           # reliability.RedisTimeout in the Go services is 2s
+      connect-timeout: 2s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+metroride:
+  consumer:
+    stream: events.ride.assignments
+    batch-size: 10
+    block-timeout: 1s      # must stay below spring.data.redis.timeout
+    error-backoff: 1s
+
+logging:
+  structured:
+    format:
+      console: logstash
+    json:
+      add:
+        service: fare-service

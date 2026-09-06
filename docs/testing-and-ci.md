@@ -37,6 +37,16 @@ layers.
 
 Nothing is published and nothing is deployed unless this job passes.
 
+### fare-service job (every event)
+
+An independent job for the Java service. It sets up Temurin 21, restores the
+Maven cache, and runs `./mvnw -B verify` in `services/fare-service`: the unit
+tests through surefire, then the Testcontainers integration test through failsafe
+against real `postgres:16-alpine` and `redis:7-alpine` containers on the runner.
+The `backend` job does not build or start fare-service: it sits behind the
+optional `fare` Compose profile and is not yet part of the smoke test, the
+published image set, or the Helm chart.
+
 ### Deployment-validation job (every event)
 
 After validation, the release is installed on a throwaway KinD cluster and the

@@ -150,6 +150,25 @@ services:
       redis:
         condition: service_healthy
 
+  fare-service:
+    profiles: ["fare"]
+    build:
+      context: services/fare-service
+      dockerfile: Dockerfile
+    environment:
+      FARE_SERVICE_ADDR: ":8087"
+      POSTGRES_DSN: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
+      REDIS_ADDR: redis:6379
+      CONSUMER_GROUP: fare-service
+      CONSUMER_NAME: fare-service-1
+    ports:
+      - "8087:8087"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   analytics-service:
     profiles: ["kafka"]
     build:
