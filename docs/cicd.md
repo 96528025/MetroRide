@@ -45,8 +45,9 @@ can never reach it.
 
 ## Pull requests
 
-Pull requests are untrusted code. They **never publish images** and never need
-registry access at all.
+Pull requests are untrusted code. They **never publish images**, never log in to
+GHCR, and never move MetroRide service images through a registry. Public base
+images, the KinD node image, PostgreSQL and Redis are still pulled.
 
 1. `backend` runs the full existing validation suite (see below).
 2. `deploy-validation.yml` runs with `image_source: pr`:
@@ -58,9 +59,9 @@ registry access at all.
    6. Collect diagnostics if anything failed.
    7. Delete the cluster in an `if: always()` step.
 
-Because the images are side-loaded and the pull policy is `IfNotPresent`, the
-kubelet never contacts a registry. Pull-request validation therefore does not
-depend on GHCR availability, package visibility, or image pull secrets.
+Because the service images are side-loaded and the pull policy is `IfNotPresent`,
+the kubelet never pulls a MetroRide image. Pull-request validation therefore does
+not depend on GHCR availability, package visibility, or image pull secrets.
 
 The job is granted `contents: read` only.
 
@@ -245,7 +246,7 @@ if it fails.
 | Job | Permissions | Why |
 | --- | --- | --- |
 | `backend` | `contents: read` (workflow default) | Only needs the source. |
-| `deploy-validation-pull-request` | `contents: read` | Builds locally; never touches a registry. |
+| `deploy-validation-pull-request` | `contents: read` | Builds service images locally; never logs in to GHCR or moves service images through a registry (public base images are still pulled). |
 | `publish-images` | `contents: read`, `packages: write` | The only job that writes packages. |
 | `deploy-validation-release` | `contents: read`, `packages: read` | Pulls published images back onto the runner. |
 
@@ -258,8 +259,9 @@ delivery run is never interrupted part-way through publishing.
 
 ## Running it locally
 
-Everything CI does can be reproduced locally with Docker, KinD, kubectl and
-Helm installed:
+Everything CI does can be reproduced locally with Docker with Compose, Go 1.22,
+curl, KinD, kubectl, Helm and Bash 4+ installed (the scripts use `mapfile`; macOS ships
+Bash 3.2):
 
 ```bash
 # 1. Static and package validation
@@ -273,6 +275,7 @@ docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
 go test -count=1 -tags=integration ./tests/integration
+bash scripts/outbox-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
 
