@@ -40,21 +40,24 @@ Separating these responsibilities makes the architecture easier to scale and rea
 
 Redis Streams provide the first event transport. Services publish typed event envelopes to named streams and consumers process those streams through consumer groups.
 
-Core streams:
+Streams (constants in `shared/pkg/events/events.go`):
 
 - `events.ride.requests`
 - `events.driver.locations`
 - `events.ride.assignments`
 - `events.ride.notifications`
 - `events.traffic.updates`
+- `events.dead_letter`
 
-Core events:
+Event types that are emitted today:
 
-- `ride_requested`
-- `driver_location_updated`
-- `ride_assigned`
-- `ride_completed`
-- `traffic_updated`
+- `ride_requested` (rider-service, via the outbox)
+- `driver_location_updated` (driver-service, direct `XADD`)
+- `ride_assigned` (dispatch-service, via the outbox, to both the assignments and notifications streams)
+- `traffic_updated` (traffic-service, direct `XADD`)
+- `dead_lettered` (dispatch-service, after retries are exhausted)
+
+`ride_completed` and `notification_created` are defined as constants but nothing publishes them yet.
 
 The shared event envelope includes event ID, type, source, correlation ID, timestamp, and payload. This keeps service contracts stable and gives the project a migration path to Kafka without changing domain payloads.
 
