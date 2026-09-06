@@ -6,14 +6,15 @@
 # which is what `image_source` selects:
 #
 #   pr    - the six service images are built here from the checked-out commit.
-#           Nothing is published to or pulled from any registry.
+#           No service image is published to or pulled from a registry and no
+#           GHCR login happens; public base and dependency images are still pulled.
 #   ghcr  - the six SHA-tagged images were already published to GHCR by the
 #           publish-images job; they are pulled back onto this runner with the
 #           workflow's GITHUB_TOKEN and deployed as-is.
 #
 # In both cases the images are side-loaded into KinD with
-# `kind load docker-image`, so the cluster itself never talks to a registry and
-# no imagePullSecret exists. The cluster lives only inside this runner and is
+# `kind load docker-image`, so the cluster itself never pulls a MetroRide image
+# and no imagePullSecret exists. The cluster lives only inside this runner and is
 # deleted unconditionally; nothing is created outside it.
 name: Deploy validation
 

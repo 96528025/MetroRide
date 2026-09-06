@@ -246,7 +246,7 @@ if it fails.
 | Job | Permissions | Why |
 | --- | --- | --- |
 | `backend` | `contents: read` (workflow default) | Only needs the source. |
-| `deploy-validation-pull-request` | `contents: read` | Builds locally; never touches a registry. |
+| `deploy-validation-pull-request` | `contents: read` | Builds service images locally; never logs in to GHCR or moves service images through a registry (public base images are still pulled). |
 | `publish-images` | `contents: read`, `packages: write` | The only job that writes packages. |
 | `deploy-validation-release` | `contents: read`, `packages: read` | Pulls published images back onto the runner. |
 
@@ -259,8 +259,9 @@ delivery run is never interrupted part-way through publishing.
 
 ## Running it locally
 
-Everything CI does can be reproduced locally with Docker, KinD, kubectl and
-Helm installed:
+Everything CI does can be reproduced locally with Docker, Go 1.22, curl, KinD,
+kubectl, Helm and Bash 4+ installed (the scripts use `mapfile`; macOS ships
+Bash 3.2):
 
 ```bash
 # 1. Static and package validation
