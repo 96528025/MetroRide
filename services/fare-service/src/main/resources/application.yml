@@ -44,6 +44,12 @@ management:
       show-details: always
 
 metroride:
+  postgres:
+    # Transaction timeout for every consumer write, the counterpart of the 2s
+    # reliability.WithPostgresTimeout context the Go services put around each
+    # PostgreSQL call. Hikari's connection-timeout above only bounds obtaining a
+    # connection from the pool; this bounds the SQL that runs on it.
+    timeout-seconds: 2
   consumer:
     stream: events.ride.assignments
     batch-size: 10

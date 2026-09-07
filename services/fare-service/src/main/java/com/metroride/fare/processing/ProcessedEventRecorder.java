@@ -34,8 +34,15 @@ public class ProcessedEventRecorder {
      * Runs in its own transaction. The caller acknowledges the stream entry only after this
      * method returns, i.e. after the transaction has committed; if the process dies in between,
      * the redelivered entry lands on the conflict clause and is acknowledged as a duplicate.
+     *
+     * <p>The transaction is bounded by {@code metroride.postgres.timeout-seconds}. Hibernate
+     * passes the remaining transaction time to every JDBC statement as its query timeout, so a
+     * statement stuck waiting for a row lock is cancelled by the driver, the transaction rolls
+     * back, and the caller sees a {@code DataAccessException}: the entry stays pending and the
+     * consumer moves on instead of stalling on one event. Work added here later shares the same
+     * budget.
      */
-    @Transactional
+    @Transactional(timeoutString = "${metroride.postgres.timeout-seconds}")
     public Outcome record(String stream, Envelope envelope) {
         int inserted = repository.insertIfAbsent(envelope.id(), stream, envelope.type(), clock.instant());
         return inserted == 1 ? Outcome.RECORDED : Outcome.DUPLICATE;

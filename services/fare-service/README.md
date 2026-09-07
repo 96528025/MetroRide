@@ -29,8 +29,11 @@ For each stream entry:
 3. After the transaction commits, `XACK` the entry.
 
 A redelivered envelope hits the conflict clause, is counted as a duplicate, and is
-acknowledged. A decode failure or a failed transaction is logged and counted, and the
-entry is left un-acknowledged in the group's pending list. Nothing claims pending
+acknowledged. The transaction is limited to `metroride.postgres.timeout-seconds` (2s,
+the Go services' PostgreSQL deadline), so a write stuck on a row lock is cancelled rather
+than stalling the single consumer thread. A decode failure or a failed or timed-out
+transaction is logged and counted, and the entry is left un-acknowledged in the group's
+pending list. Nothing claims pending
 entries yet; see the `TODO(pending-entry recovery)` note in `RideAssignmentConsumer`.
 
 ### Configuration
