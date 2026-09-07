@@ -1,0 +1,334 @@
+package com.metroride.fare.processing;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+import com.metroride.fare.IntegrationTestSupport;
+import com.metroride.fare.config.ConsumerProperties;
+import com.metroride.fare.events.Envelope;
+import com.metroride.fare.events.EnvelopeCodec;
+import com.metroride.fare.processing.ProcessedEventRecorder.Outcome;
+import com.metroride.fare.processing.ProcessedEventRecorder.Result;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.data.redis.connection.stream.RecordId;
+import org.springframework.data.redis.connection.stream.StreamRecords;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+/**
+ * The quote-and-hold path against real PostgreSQL and Redis: a {@code ride_assigned} envelope
+ * produces one processed event, one {@code quote_hold} journal entry and two postings that cancel
+ * out; a redelivery adds nothing; two concurrent deliveries add nothing either; and a failure
+ * inside the transaction leaves neither the event row nor the journal entry behind.
+ *
+ * <p>Containers and context come from {@link IntegrationTestSupport}.
+ */
+class QuoteLedgerIT extends IntegrationTestSupport {
+
+    private static final Duration TIMEOUT = Duration.ofSeconds(15);
+
+    @Autowired
+    StringRedisTemplate redisTemplate;
+
+    @Autowired
+    JdbcTemplate jdbc;
+
+    @Autowired
+    ConsumerProperties consumer;
+
+    @Autowired
+    ProcessedEventRecorder recorder;
+
+    @Autowired
+    EnvelopeCodec codec;
+
+    @Autowired
+    MeterRegistry meterRegistry;
+
+    @Autowired
+    TestRestTemplate http;
+
+    @Test
+    void assignmentWritesOneBalancedQuoteHoldAndRedeliveryAddsNothing() {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        String envelope = goEnvelope(eventId, rideId, 1.8612, 223);
+        double quotesBefore = quoteCount();
+
+        publish(envelope);
+
+        await().atMost(TIMEOUT).untilAsserted(() -> {
+            assertThat(processedRows(eventId)).isEqualTo(1);
+            assertThat(journalRows(eventId)).isEqualTo(1);
+            assertThat(quoteCount()).isEqualTo(quotesBefore + 1);
+        });
+        List<Map<String, Object>> postings = postings(rideId);
+        assertThat(postings).hasSize(2);
+        assertThat(postings).extracting(row -> row.get("account")).containsExactly("rider_receivable", "fare_hold");
+        // 2.50 + 1.20 * 1.8612 + 0.30 * 223 / 60 = 5.84844 -> 5.85
+        assertThat(postings).extracting(row -> (BigDecimal) row.get("amount"))
+                .containsExactly(new BigDecimal("5.85"), new BigDecimal("-5.85"));
+        assertThat(sumOfPostings(rideId)).isEqualByComparingTo(BigDecimal.ZERO);
+        Map<String, Object> journal = jdbc.queryForMap(
+                "select ride_id, kind from fare.journal_entries where source_event_id = ?", eventId);
+        assertThat(journal.get("ride_id")).isEqualTo(rideId);
+        assertThat(journal.get("kind")).isEqualTo("quote_hold");
+
+        double duplicatesBefore = duplicateCount();
+        RecordId second = publish(envelope);
+
+        await().atMost(TIMEOUT).untilAsserted(() -> {
+            assertThat(lastDeliveredId()).isEqualTo(second.getValue());
+            assertThat(duplicateCount()).isEqualTo(duplicatesBefore + 1);
+            assertThat(pendingEntries()).isZero();
+        });
+        assertThat(processedRows(eventId)).isEqualTo(1);
+        assertThat(journalRows(eventId)).isEqualTo(1);
+        assertThat(postings(rideId)).hasSize(2);
+        assertThat(quoteCount()).isEqualTo(quotesBefore + 1);
+    }
+
+    @Test
+    void ledgerEndpointReturnsTheRidesEntriesInTheGoStyle() {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+
+        ResponseEntity<String> missing = http.getForEntity("/v1/rides/" + rideId + "/ledger", String.class);
+        assertThat(missing.getStatusCode().value()).isEqualTo(404);
+        assertThat(missing.getBody()).isEqualTo("{\"error\":\"ledger not found\"}");
+
+        publish(goEnvelope(eventId, rideId, 0, 600));
+        await().atMost(TIMEOUT).untilAsserted(() -> assertThat(journalRows(eventId)).isEqualTo(1));
+
+        ResponseEntity<String> found = http.getForEntity("/v1/rides/" + rideId + "/ledger", String.class);
+        assertThat(found.getStatusCode().value()).isEqualTo(200);
+        assertThat(found.getHeaders().getContentType().toString()).startsWith("application/json");
+        // 2.50 + 0.30 * 600 / 60 = 5.50
+        assertThat(found.getBody())
+                .startsWith("{\"ride_id\":\"" + rideId + "\",\"entries\":[{\"id\":")
+                .contains("\"kind\":\"quote_hold\",\"source_event_id\":\"" + eventId + "\",\"created_at\":\"")
+                .endsWith("\"postings\":[{\"account\":\"rider_receivable\",\"amount\":\"5.50\"},"
+                        + "{\"account\":\"fare_hold\",\"amount\":\"-5.50\"}]}]}");
+    }
+
+    @Test
+    void envelopesOfOtherTypesAreRecordedWithoutALedgerEntry() {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        double quotesBefore = quoteCount();
+
+        RecordId id = publish("{\"id\":\"" + eventId + "\",\"type\":\"ride_completed\",\"source\":\"dispatch-service\","
+                + "\"correlation_id\":\"" + rideId + "\",\"occurred_at\":\"2026-09-07T10:00:00Z\",\"payload\":{}}");
+
+        await().atMost(TIMEOUT).untilAsserted(() -> {
+            assertThat(processedRows(eventId)).isEqualTo(1);
+            assertThat(lastDeliveredId()).isEqualTo(id.getValue());
+            assertThat(pendingEntries()).isZero();
+        });
+        assertThat(journalRows(eventId)).isZero();
+        assertThat(quoteCount()).isEqualTo(quotesBefore);
+    }
+
+    /**
+     * Two threads call {@code record()} for the same envelope at the same moment. What keeps the
+     * ledger to one entry is the primary key of {@code fare.processed_events}: PostgreSQL blocks
+     * the second {@code INSERT ... ON CONFLICT DO NOTHING} until the first transaction commits,
+     * then resolves it as a conflict, so the second call returns DUPLICATE and never reaches the
+     * journal insert. The unique constraint on {@code journal_entries.source_event_id} is not what
+     * stops it; it would only fire for a writer that skipped the idempotency insert.
+     */
+    @Test
+    void concurrentDeliveriesOfOneEventWriteOneJournalEntry() throws Exception {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        Envelope envelope = codec.decode("test", Map.of(EnvelopeCodec.EVENT_FIELD, goEnvelope(eventId, rideId, 3.0, 300)));
+        CountDownLatch start = new CountDownLatch(1);
+        Callable<Result> call = () -> {
+            start.await(5, TimeUnit.SECONDS);
+            return recorder.record(consumer.stream(), envelope);
+        };
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            List<Future<Result>> futures = List.of(pool.submit(call), pool.submit(call));
+            start.countDown();
+            List<Outcome> outcomes = new ArrayList<>();
+            for (Future<Result> future : futures) {
+                outcomes.add(future.get(10, TimeUnit.SECONDS).outcome());
+            }
+            assertThat(outcomes).containsExactlyInAnyOrder(Outcome.RECORDED, Outcome.DUPLICATE);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(processedRows(eventId)).isEqualTo(1);
+        assertThat(journalRows(eventId)).isEqualTo(1);
+        assertThat(postings(rideId)).hasSize(2);
+        assertThat(sumOfPostings(rideId)).isEqualByComparingTo(BigDecimal.ZERO);
+    }
+
+    /**
+     * The event row and the journal entry are one transaction. Another session holds an exclusive
+     * lock on {@code fare.journal_entries}, so the consumer's event insert succeeds, its journal
+     * insert waits, and the 2s transaction timeout cancels it. Afterwards neither the event row nor
+     * the journal entry exists, and the entry stays pending. As in
+     * {@code RideAssignmentConsumerIT}, nothing claims the abandoned entry, so the test acknowledges
+     * it to leave the group clean.
+     */
+    @Test
+    void aFailedJournalInsertRollsBackTheEventRowToo() throws Exception {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        RecordId blocked = null;
+        try (Connection lockHolder = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
+            lockHolder.setAutoCommit(false);
+            try (Statement lock = lockHolder.createStatement()) {
+                lock.execute("lock table fare.journal_entries in access exclusive mode");
+            }
+            double postgresErrorsBefore = postgresErrorCount();
+            double quotesBefore = quoteCount();
+            long pendingBefore = pendingEntries();
+
+            blocked = publish(goEnvelope(eventId, rideId, 1.0, 60));
+
+            await().atMost(Duration.ofSeconds(8)).untilAsserted(() -> {
+                assertThat(postgresErrorCount()).isEqualTo(postgresErrorsBefore + 1);
+                assertThat(pendingEntries()).isEqualTo(pendingBefore + 1);
+            });
+            lockHolder.rollback();
+
+            assertThat(processedRows(eventId)).isZero();
+            assertThat(journalRows(eventId)).isZero();
+            assertThat(postings(rideId)).isEmpty();
+            assertThat(quoteCount()).isEqualTo(quotesBefore);
+        } finally {
+            if (blocked != null) {
+                redisTemplate.opsForStream().acknowledge(consumer.stream(), consumer.group(), blocked);
+            }
+        }
+    }
+
+    /**
+     * A payload the calculator rejects is a quote failure: the transaction rolls back, the event
+     * is not recorded, the failure is counted, and the entry stays pending like a decode failure.
+     */
+    @Test
+    void aRejectedPayloadRecordsNothingAndCountsAQuoteFailure() {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        double failuresBefore = quoteFailureCount("calculation");
+        long pendingBefore = pendingEntries();
+
+        RecordId poison = publish(goEnvelope(eventId, rideId, -1.0, 60));
+        try {
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                assertThat(quoteFailureCount("calculation")).isEqualTo(failuresBefore + 1);
+                assertThat(pendingEntries()).isEqualTo(pendingBefore + 1);
+            });
+            assertThat(processedRows(eventId)).isZero();
+            assertThat(journalRows(eventId)).isZero();
+        } finally {
+            redisTemplate.opsForStream().acknowledge(consumer.stream(), consumer.group(), poison);
+        }
+    }
+
+    @Test
+    void metricsExposeTheQuoteSeries() {
+        ResponseEntity<String> metrics = http.getForEntity("/metrics", String.class);
+        assertThat(metrics.getBody())
+                .contains("metroride_fare_quotes_total{")
+                .contains("metroride_fare_quote_failures_total{")
+                .contains("reason=\"payload\"")
+                .contains("reason=\"calculation\"");
+    }
+
+    private RecordId publish(String envelopeJson) {
+        return redisTemplate.opsForStream().add(StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, envelopeJson))
+                .withStreamKey(consumer.stream()));
+    }
+
+    private int processedRows(String eventId) {
+        return count("select count(*) from fare.processed_events where event_id = ?", eventId);
+    }
+
+    private int journalRows(String eventId) {
+        return count("select count(*) from fare.journal_entries where source_event_id = ?", eventId);
+    }
+
+    private int count(String sql, String arg) {
+        Integer count = jdbc.queryForObject(sql, Integer.class, arg);
+        return count == null ? 0 : count;
+    }
+
+    private List<Map<String, Object>> postings(String rideId) {
+        return jdbc.queryForList("""
+                select p.account, p.amount from fare.postings p
+                join fare.journal_entries j on j.id = p.journal_entry_id
+                where j.ride_id = ? order by p.id
+                """, rideId);
+    }
+
+    private BigDecimal sumOfPostings(String rideId) {
+        return jdbc.queryForObject("""
+                select coalesce(sum(p.amount), 0) from fare.postings p
+                join fare.journal_entries j on j.id = p.journal_entry_id
+                where j.ride_id = ?
+                """, BigDecimal.class, rideId);
+    }
+
+    private long pendingEntries() {
+        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+    }
+
+    private String lastDeliveredId() {
+        return redisTemplate.opsForStream().groups(consumer.stream()).stream()
+                .filter(group -> group.groupName().equals(consumer.group()))
+                .findFirst()
+                .orElseThrow()
+                .lastDeliveredId();
+    }
+
+    private double postgresErrorCount() {
+        return meterRegistry.get("metroride.dependency.errors").tag("dependency", "postgres").counter().count();
+    }
+
+    private double duplicateCount() {
+        return meterRegistry.get("metroride.fare.events.processed").tag("outcome", "duplicate").counter().count();
+    }
+
+    private double quoteCount() {
+        return meterRegistry.get("metroride.fare.quotes").tag("kind", "quote_hold").counter().count();
+    }
+
+    private double quoteFailureCount(String reason) {
+        return meterRegistry.get("metroride.fare.quote.failures").tag("reason", reason).counter().count();
+    }
+
+    /** Same shape as {@code events.Publish} writes: one field named {@code event} holding the envelope JSON. */
+    private static String goEnvelope(String eventId, String rideId, double distanceKm, int etaSeconds) {
+        return "{\"id\":\"" + eventId + "\",\"type\":\"ride_assigned\",\"source\":\"dispatch-service\","
+                + "\"correlation_id\":\"" + rideId + "\",\"occurred_at\":\"2026-09-05T21:12:34.293710969Z\","
+                + "\"payload\":{\"ride_id\":\"" + rideId + "\",\"rider_id\":\"rider-42\",\"driver_id\":\"driver-2\","
+                + "\"distance_km\":" + distanceKm + ",\"eta_seconds\":" + etaSeconds + ",\"assignment_id\":\"" + UUID.randomUUID() + "\"}}";
+    }
+}

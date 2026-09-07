@@ -5,8 +5,11 @@ import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
 import com.metroride.fare.events.EnvelopeDecodeException;
+import com.metroride.fare.ledger.JournalEntry;
+import com.metroride.fare.pricing.FareQuoteException;
 import com.metroride.fare.processing.ProcessedEventRecorder;
 import com.metroride.fare.processing.ProcessedEventRecorder.Outcome;
+import com.metroride.fare.processing.ProcessedEventRecorder.Result;
 import io.lettuce.core.Consumer;
 import io.lettuce.core.RedisBusyException;
 import io.lettuce.core.RedisClient;
@@ -19,7 +22,9 @@ import io.lettuce.core.api.sync.RedisCommands;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -43,16 +48,17 @@ import org.springframework.transaction.TransactionException;
  * <ol>
  *   <li>{@code XGROUP CREATE ... 0 MKSTREAM} at startup; an existing group is fine.</li>
  *   <li>Loop: {@code XREADGROUP GROUP g c COUNT n BLOCK t STREAMS stream >}.</li>
- *   <li>Per entry: decode the envelope, record it in one PostgreSQL transaction, then {@code XACK}.</li>
+ *   <li>Per entry: decode the envelope, record it (and for {@code ride_assigned}, quote the fare
+ *       and append the ledger entry) in one PostgreSQL transaction, then {@code XACK}.</li>
  * </ol>
  *
  * <p>The loop runs on its own single thread so it never competes with request handling, and
  * uses a dedicated Lettuce connection so the blocking read never stalls the shared connection the
  * readiness check and the rest of the application use.
  *
- * <p>Failure handling is intentionally minimal in this skeleton. An entry that cannot be decoded
- * or whose transaction fails is logged, counted, and left un-acknowledged in the group's pending
- * entry list; the loop moves on to the next entry.
+ * <p>Failure handling is intentionally minimal. An entry that cannot be decoded, whose payload
+ * cannot be quoted, or whose transaction fails is logged, counted, and left un-acknowledged in the
+ * group's pending entry list; the loop moves on to the next entry.
  *
  * <p>TODO(pending-entry recovery): nothing re-reads that pending entry list. This service reads
  * only new entries ({@code >}), so an entry left pending by a crash between commit and XACK, a
@@ -78,6 +84,8 @@ public class RideAssignmentConsumer implements SmartLifecycle {
 
     private final Counter recordedEvents;
     private final Counter duplicateEvents;
+    private final Counter quoteHolds;
+    private final Map<FareQuoteException.Reason, Counter> quoteFailures = new EnumMap<>(FareQuoteException.Reason.class);
     private final Counter consumeErrors;
     private final Counter redisErrors;
     private final Counter postgresErrors;
@@ -107,6 +115,12 @@ public class RideAssignmentConsumer implements SmartLifecycle {
                 "service", service, "stream", properties.stream(), "outcome", "recorded");
         this.duplicateEvents = meterRegistry.counter("metroride.fare.events.processed",
                 "service", service, "stream", properties.stream(), "outcome", "duplicate");
+        this.quoteHolds = meterRegistry.counter("metroride.fare.quotes",
+                "service", service, "kind", "quote_hold");
+        for (FareQuoteException.Reason reason : FareQuoteException.Reason.values()) {
+            quoteFailures.put(reason, meterRegistry.counter("metroride.fare.quote.failures",
+                    "service", service, "reason", reason.label()));
+        }
         this.consumeErrors = meterRegistry.counter("metroride.stream.consume.errors",
                 "service", service, "stream", properties.stream());
         this.redisErrors = meterRegistry.counter("metroride.dependency.errors",
@@ -250,9 +264,22 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             return;
         }
 
-        Outcome outcome;
+        Result result;
         try {
-            outcome = recorder.record(properties.stream(), envelope);
+            result = recorder.record(properties.stream(), envelope);
+        } catch (FareQuoteException e) {
+            // The transaction rolled back, so the event is not recorded either. Like a decode
+            // failure, this is a poison entry: it stays pending until the pending-entry recovery
+            // and dead-letter policy above exists.
+            quoteFailures.get(e.reason()).increment();
+            log.atError()
+                    .addKeyValue("message_id", message.getId())
+                    .addKeyValue("event_id", envelope.id())
+                    .addKeyValue("ride_id", envelope.correlationId())
+                    .addKeyValue("reason", e.reason().label())
+                    .setCause(e)
+                    .log("quote fare failed; entry left pending");
+            return;
         } catch (DataAccessException | TransactionException e) {
             postgresErrors.increment();
             log.atError()
@@ -264,19 +291,27 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             return;
         }
 
+        Outcome outcome = result.outcome();
         if (outcome == Outcome.RECORDED) {
             recordedEvents.increment();
         } else {
             duplicateEvents.increment();
         }
-        log.atInfo()
+        // Counted here, after the commit, so a rolled-back transaction never counts as a quote.
+        result.quoteHold().ifPresent(hold -> quoteHolds.increment());
+        var entry = log.atInfo()
                 .addKeyValue("message_id", message.getId())
                 .addKeyValue("event_id", envelope.id())
                 .addKeyValue("event_type", envelope.type())
                 .addKeyValue("source", envelope.source())
                 .addKeyValue("ride_id", envelope.correlationId())
-                .addKeyValue("outcome", outcome.name().toLowerCase())
-                .log(outcome == Outcome.RECORDED ? "event recorded" : "duplicate event skipped");
+                .addKeyValue("outcome", outcome.name().toLowerCase());
+        if (result.quoteHold().isPresent()) {
+            JournalEntry hold = result.quoteHold().get();
+            entry = entry.addKeyValue("journal_kind", hold.kind().code())
+                    .addKeyValue("quote", hold.postings().get(0).amount().toString());
+        }
+        entry.log(outcome == Outcome.RECORDED ? "event recorded" : "duplicate event skipped");
 
         // Acknowledge only after the transaction above has committed. A failed ack is logged and
         // the entry stays pending; redelivery would hit the conflict clause and ack as a duplicate.

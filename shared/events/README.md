@@ -15,4 +15,4 @@ Streams (see `shared/pkg/events/events.go`):
 
 The optional `kafka` Compose profile already carries driver locations on Kafka, using a separate flat `DriverLocationEvent` (`shared/pkg/kafka/events.go`) rather than this envelope. Moving the Redis streams to Kafka would mean choosing between that flat shape and the envelope; the envelope itself is transport-neutral.
 
-`services/fare-service` (Java) runs under the optional `fare` Compose profile, consumes `events.ride.assignments` through the consumer group `fare-service` and records each envelope ID once; it decodes the same `event` field and envelope JSON the Go services publish.
+`services/fare-service` (Java) runs under the optional `fare` Compose profile, consumes `events.ride.assignments` through the consumer group `fare-service`, records each envelope ID once and, for `ride_assigned`, reads `distance_km` and `eta_seconds` from the payload to quote and hold the fare; it decodes the same `event` field and envelope JSON the Go services publish. It is the first consumer that reads the `RideAssigned` payload fields rather than only the envelope.
