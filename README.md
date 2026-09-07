@@ -139,3 +139,7 @@ The Helm chart (`infrastructure/helm/metro-ride`) packages the six core services
 ## Documentation
 
 [Architecture](docs/architecture.md) · [System design](docs/system-design.md) · [Architecture decisions](docs/architecture-decisions.md) · [API](docs/api.md) · [Reliability](docs/reliability.md) · [Observability](docs/observability.md) · [Testing and CI](docs/testing-and-ci.md) · [CI/CD pipeline](docs/cicd.md) · [Performance](docs/performance.md) · [Kafka extension](docs/kafka-lightweight-extension.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
