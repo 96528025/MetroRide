@@ -167,7 +167,7 @@ The script proves that a ride request committed to PostgreSQL survives a `SIGKIL
 
 Stopping Redis first makes the kill window deterministic instead of racing a relay that polls every 250 ms. Redis is stopped rather than removed because the dispatch consumer group lives in Redis and is only recreated at dispatch-service startup, and `dispatch-service` keeps running throughout because it exits at startup when Redis is unreachable. The recovery wait is bounded by `PROCESS_KILL_RECOVERY_TIMEOUT_SECONDS` (default 90): failed rows are rescheduled with a backoff capped at 30 seconds, and the row fails a few times while Redis is stopped, so publication after restart can legitimately lag by up to about 30 seconds.
 
-This covers the relay boundary only. A `dispatch-service` restart while a consumed request is still unacknowledged is not tested: consumers read with `>` and never reclaim pending entries, so that entry would stay pending by design (see [reliability.md](reliability.md)).
+This covers one relay crash window: termination after the PostgreSQL commit and before any publication. The other window, termination after Redis has accepted the event but before the transaction recording `published_at` commits, is the one that produces the documented at-least-once duplicate and is not tested. A `dispatch-service` restart while a consumed request is still unacknowledged is not tested either: consumers read with `>` and never reclaim pending entries, so that entry would stay pending by design (see [reliability.md](reliability.md)).
 
 ## Running Everything Locally
 
@@ -193,7 +193,7 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, a relay crash after Redis has accepted an event but before `published_at` is recorded (the at-least-once duplicate window), a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 

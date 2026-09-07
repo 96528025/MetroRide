@@ -11,15 +11,19 @@
 # and is only recreated at dispatch-service startup, so wiping Redis state
 # would leave the consumer loop failing with NOGROUP. dispatch-service stays
 # running throughout because it exits at startup when Redis is unreachable.
-# This test covers the relay boundary only; a consumer killed mid-message is
-# a documented gap (pending entries are never reclaimed).
+# This test covers one relay crash window only: termination after the
+# PostgreSQL commit and before any publication. Termination after Redis has
+# accepted the event but before the transaction recording published_at
+# commits (the window that produces the documented at-least-once duplicate)
+# is not exercised, and neither is a consumer killed mid-message (pending
+# entries are never reclaimed).
 set -euo pipefail
 
 BASE_HOST="${BASE_HOST:-localhost}"
 # The relay reschedules failed rows with a backoff capped at 30 s, and the row
 # fails a few times while Redis is stopped, so publication after restart can
-# legitimately lag by up to ~30 s plus the 250 ms poll. 90 s also covers the
-# container restart itself.
+# legitimately lag by up to ~30 s plus the 250 ms poll. The deadline starts
+# before the restart, so the container start-up counts against the 90 s too.
 TIMEOUT_SECONDS="${PROCESS_KILL_RECOVERY_TIMEOUT_SECONDS:-90}"
 RIDE_REQUEST='{"rider_id":"process-kill-recovery","pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}'
 response_file=""
@@ -30,7 +34,20 @@ extract_json_string() {
 }
 
 psql_scalar() {
-  docker compose exec -T postgres psql -U metroride -d metroride -Atqc "$1"
+  # Bounded like every other blocking call: connect within 2 s and abort the
+  # statement after 2 s instead of hanging past the recovery deadline.
+  docker compose exec -T -e PGCONNECT_TIMEOUT=2 -e PGOPTIONS='-c statement_timeout=2000' \
+    postgres psql -U metroride -d metroride -Atqc "$1"
+}
+
+# Seconds left before ${deadline}, never below 1, so every blocking call in the
+# recovery phase is capped by the time that is actually left.
+remaining_seconds() {
+  local remaining=$((deadline - SECONDS))
+  if (( remaining < 1 )); then
+    remaining=1
+  fi
+  printf '%s' "${remaining}"
 }
 
 restore_services() {
@@ -103,34 +120,37 @@ done
 echo "ok: rider-service exited without a graceful shutdown"
 
 echo "restarting Redis and rider-service and waiting for automatic relay recovery..."
+deadline=$((SECONDS + TIMEOUT_SECONDS))
 docker compose up -d redis rider-service >/dev/null
 
-deadline=$((SECONDS + TIMEOUT_SECONDS))
+# Each loop checks the deadline before it blocks and caps the call by the time
+# left, so a hung request can neither stall the run nor be accepted late.
 while true; do
-  readiness_status="$(curl -fsS --max-time 2 "http://${BASE_HOST}:8080/readyz" 2>/dev/null | extract_json_string status || true)"
+  if (( SECONDS >= deadline )); then
+    echo "failed: rider-service did not report ready within ${TIMEOUT_SECONDS}s after restart" >&2
+    exit 1
+  fi
+  readiness_status="$(curl -fsS --max-time "$(remaining_seconds)" "http://${BASE_HOST}:8080/readyz" 2>/dev/null | extract_json_string status || true)"
   if [[ "${readiness_status}" == "ready" ]]; then
     break
-  fi
-  if (( SECONDS >= deadline )); then
-    echo "failed: rider-service did not report ready within timeout after restart" >&2
-    exit 1
   fi
   sleep 1
 done
 echo "ok: rider-service is ready again"
 
 ride=""
+unpublished=""
 while true; do
-  ride="$(curl -fsS "http://${BASE_HOST}:8080/v1/rides/${ride_id}")"
+  if (( SECONDS >= deadline )); then
+    echo "failed: restarted relay did not recover within ${TIMEOUT_SECONDS}s; ride=${ride}; unpublished=${unpublished}" >&2
+    exit 1
+  fi
+  ride="$(curl -fsS --max-time "$(remaining_seconds)" "http://${BASE_HOST}:8080/v1/rides/${ride_id}" || true)"
   ride_status="$(printf '%s' "${ride}" | extract_json_string status)"
   unpublished="$(psql_scalar \
-    "select count(*) from event_outbox where aggregate_id = '${ride_id}' and published_at is null")"
+    "select count(*) from event_outbox where aggregate_id = '${ride_id}' and published_at is null" || true)"
   if [[ "${ride_status}" == "assigned" && "${unpublished}" == "0" ]]; then
     break
-  fi
-  if (( SECONDS >= deadline )); then
-    echo "failed: restarted relay did not recover within timeout; ride=${ride}; unpublished=${unpublished}" >&2
-    exit 1
   fi
   sleep 1
 done
