@@ -267,15 +267,16 @@ Bash 3.2):
 # 1. Static and package validation
 gofmt -l .                     # must print nothing
 go vet ./...
-go test ./...
+go test -race ./...
 
 # 2. Docker Compose stack (the same suite CI's backend job runs)
 docker compose config
 docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
-go test -count=1 -tags=integration ./tests/integration
+go test -race -count=1 -tags=integration ./tests/integration
 bash scripts/outbox-recovery-test.sh
+bash scripts/process-kill-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
 

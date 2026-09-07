@@ -1,6 +1,6 @@
 # MetroRide Testing and CI
 
-MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, outbox relay progress, and a real routing-outage dead-letter path.
+MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, process-kill recovery of a committed outbox row, outbox relay progress, and a real routing-outage dead-letter path.
 
 ## CI Pipeline
 
@@ -17,19 +17,22 @@ layers.
    `gofmt` output and reports the offending files; it never rewrites files
    during CI.
 4. Run `go vet ./...`.
-5. Run package tests with `go test ./...`.
+5. Run package tests with `go test -race ./...`.
 6. Validate Docker Compose with `docker compose config`.
 7. Build all service images with `docker compose build`.
 8. Start the stack with `docker compose up -d`.
 9. Run `bash scripts/smoke-test.sh`.
-10. Run integration tests without the Go test cache using `go test -count=1 -tags=integration ./tests/integration`.
+10. Run integration tests without the Go test cache using `go test -race -count=1 -tags=integration ./tests/integration`.
 11. Stop Redis, accept a ride durably, restart Redis, and verify automatic outbox recovery.
-12. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
-13. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
+12. Stop Redis, accept a ride durably, kill `rider-service` with SIGKILL while its
+    outbox row is unpublished, restart both, and verify the restarted relay
+    publishes the row exactly once and dispatch assigns the ride.
+13. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
+14. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
     PostgreSQL ride state.
-14. Print focused service and dependency logs if an outage test fails, plus
+15. Print focused service and dependency logs if an outage test fails, plus
     full Compose logs for any CI failure.
-15. Shut down the stack with `docker compose down -v`, even when an earlier
+16. Shut down the stack with `docker compose down -v`, even when an earlier
     step fails.
 
 Nothing is published and nothing is deployed unless this job passes.
@@ -54,10 +57,12 @@ delivery run is never interrupted mid-publish.
 ### Package Build/Test Gate
 
 ```bash
-go test ./...
+go test -race ./...
 ```
 
-This command compiles all 15 Go packages and runs 33 untagged unit tests across eight packages. They cover event-envelope encoding and decoding, configuration defaults and overrides, common HTTP and readiness behavior, retry and timeout helpers, the dispatch-to-routing request contract and failure paths, the API algorithm label, nearest-driver correctness, retry-delay capping, and the rider service's PostgreSQL-only readiness contract. The tests do not require Docker Compose or external services.
+This command compiles all 15 Go packages and runs 33 untagged unit tests across eight packages under the Go race detector. They cover event-envelope encoding and decoding, configuration defaults and overrides, common HTTP and readiness behavior, retry and timeout helpers, the dispatch-to-routing request contract and failure paths, the API algorithm label, nearest-driver correctness, retry-delay capping, and the rider service's PostgreSQL-only readiness contract. The tests do not require Docker Compose or external services.
+
+The race detector is a guard for future concurrent code, not evidence about the current system: none of the unit tests exercise concurrent code paths today (no goroutines, no `t.Parallel`; the only `sync` import is `sync/atomic`), so it is expected to report nothing. In the integration run it instruments the in-process relay used by the relay-progress test and the pgx and go-redis client internals, while the six services under test run uninstrumented in their containers. It therefore says nothing about relay or consumer concurrency in the running services.
 
 Seven packages still have no unit-test files: the analytics, driver, notification, and traffic service entry points, plus the Kafka, logging, and metrics helpers. The repository therefore makes no comprehensive unit-coverage claim.
 
@@ -110,7 +115,7 @@ message. There are no fixed sleeps used as synchronisation.
 ### Integration Tests
 
 ```bash
-go test -count=1 -tags=integration ./tests/integration
+go test -race -count=1 -tags=integration ./tests/integration
 ```
 
 Integration tests require the Docker Compose stack to be running. They validate the backend workflow through real service boundaries:
@@ -152,18 +157,31 @@ bash scripts/outbox-recovery-test.sh
 
 The script stops the real Redis container, verifies that `rider-service` remains ready, creates a ride through the public API with an exact `HTTP 202`, and confirms PostgreSQL contains exactly one unpublished `ride_requested` outbox row. It then restarts Redis and waits until the relay has published every event for that ride and dispatch has assigned it. This verifies that deployment readiness preserves traffic to the durable write path and that the accepted request recovers without a client retry.
 
+### Process-Kill Outbox Recovery Test
+
+```bash
+bash scripts/process-kill-recovery-test.sh
+```
+
+The script proves that a ride request committed to PostgreSQL survives a `SIGKILL` of the process that owns its outbox relay. It stops Redis so publication cannot happen, creates a ride through the public API with an exact `HTTP 202`, confirms exactly one unpublished `ride_requested` outbox row, and then kills `rider-service` with `SIGKILL` and asserts the container is no longer running. It restarts Redis and `rider-service` together (rider-service's `depends_on` lists only PostgreSQL, so both are named explicitly), waits for `rider-service` readiness, and then waits until the ride is `assigned` and no unpublished row remains for it. Finally it reads `events.ride.requests` with `XRANGE` and requires the event ID to appear exactly once, because the kill happened before any publication and so leaves no window for the documented at-least-once duplicate.
+
+Stopping Redis first makes the kill window deterministic instead of racing a relay that polls every 250 ms. Redis is stopped rather than removed because the dispatch consumer group lives in Redis and is only recreated at dispatch-service startup, and `dispatch-service` keeps running throughout because it exits at startup when Redis is unreachable. The recovery wait is bounded by `PROCESS_KILL_RECOVERY_TIMEOUT_SECONDS` (default 90): failed rows are rescheduled with a backoff capped at 30 seconds, and the row fails a few times while Redis is stopped, so publication after restart can legitimately lag by up to about 30 seconds.
+
+This covers one relay crash window: termination after the PostgreSQL commit and before any publication. The other window, termination after Redis has accepted the event but before the transaction recording `published_at` commits, is the one that produces the documented at-least-once duplicate and is not tested. A `dispatch-service` restart while a consumed request is still unacknowledged is not tested either: consumers read with `>` and never reclaim pending entries, so that entry would stay pending by design (see [reliability.md](reliability.md)).
+
 ## Running Everything Locally
 
 ```bash
 gofmt -l .                     # must print nothing
 go vet ./...
-go test ./...
+go test -race ./...
 docker compose config
 docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
-go test -count=1 -tags=integration ./tests/integration
+go test -race -count=1 -tags=integration ./tests/integration
 bash scripts/outbox-recovery-test.sh
+bash scripts/process-kill-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
 ```
@@ -175,7 +193,7 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, process termination at every relay boundary, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, a relay crash after Redis has accepted an event but before `published_at` is recorded (the at-least-once duplicate window), a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 
@@ -185,4 +203,3 @@ The automated suite covers the happy path, duplicate-event idempotency, Redis ou
 - Add Redis-backed publish/consume contract tests for event envelopes.
 - Add GitHub Actions matrix testing across Go versions.
 - Add Kubernetes failure-path validation (dependency outage inside the cluster).
-- Add race detector runs for selected packages.
