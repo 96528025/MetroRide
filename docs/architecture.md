@@ -2,7 +2,7 @@
 
 MetroRide is a portfolio-scale distributed ride dispatch project focused on backend systems design. It models a real-time workflow where rider requests, driver locations, routing decisions, traffic updates, and notifications are owned by separate services and coordinated through asynchronous events.
 
-The default Docker Compose profile runs six core application service roles and 10 total Compose components after PostgreSQL, Redis, Prometheus, and Grafana are included. The optional `kafka` profile adds a seventh role, `analytics-service`, plus a second driver-service runtime instance, Kafka, and the one-shot Kafka init job, for 14 profile-expanded Compose components. Runtime instances and infrastructure containers are not counted as new application service roles.
+The default Docker Compose profile runs six core application service roles and 10 total Compose components after PostgreSQL, Redis, Prometheus, and Grafana are included. The optional `kafka` profile adds a seventh role, `analytics-service`, plus a second driver-service runtime instance, Kafka, and the one-shot Kafka init job, for 14 profile-expanded Compose components. The optional `fare` profile adds one more role, the Java `fare-service`, as a single Compose component. Runtime instances and infrastructure containers are not counted as new application service roles.
 
 ## Design Goals
 
@@ -34,6 +34,7 @@ Separating these responsibilities makes the architecture easier to scale and rea
 | `routing-service` | Default | Driver proximity and ETA calculation | In-memory driver cache hydrated from events |
 | `traffic-service` | Default | Regional congestion simulation | In-memory traffic model, Redis Stream output |
 | `notification-service` | Default | Simulated rider/driver notification handling | Consumer group offsets |
+| `fare-service` | Optional `fare` profile | Consumes `events.ride.assignments` and records each envelope ID once (Java) | PostgreSQL `fare.processed_events`, consumer group offsets |
 | `analytics-service` | Optional `kafka` profile | Driver-location telemetry analytics | In-memory view hydrated from a Kafka consumer group |
 
 ## Event-Driven Architecture
@@ -72,6 +73,7 @@ The shared event envelope includes event ID, type, source, correlation ID, times
 7. `dispatch-service` commits the assignment, status update, and pending assignment and notification outbox events together.
 8. Its relay publishes both pending events to their Redis Streams asynchronously.
 9. `notification-service` consumes notification events and logs simulated delivery.
+10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and records its envelope ID once in `fare.processed_events`; a redelivery is acknowledged without a second row.
 
 ## Why Redis Streams?
 

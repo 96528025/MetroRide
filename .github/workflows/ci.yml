@@ -101,6 +101,32 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  fare-service:
+    name: fare-service validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: services/fare-service
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: services/fare-service/pom.xml
+
+      # `verify` runs the unit tests (surefire) and then the Testcontainers-backed
+      # integration tests (failsafe) against real PostgreSQL and Redis containers on
+      # the runner's Docker daemon.
+      - name: Build and test fare-service
+        run: ./mvnw -B --no-transfer-progress verify
+
   publish-images:
     name: Publish ${{ matrix.service }} to GHCR
     needs: backend

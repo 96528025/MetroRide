@@ -33,13 +33,15 @@ flowchart LR
     DB -->|relay| RN[events.ride.notifications]
     RN -->|consumer group| Notify[notification-service]
     Dispatch -.->|after 3 failed attempts| DLQ[events.dead_letter]
+    RA -->|consumer group| Fare[fare-service]
+    Fare -->|processed event ids, one row per envelope| DB
 ```
 
 `POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`.
 
 ### Services
 
-Six core services form the default Docker Compose profile, the Helm chart, and the published image set. A seventh, `analytics-service`, exists only behind the optional `kafka` Compose profile.
+Six core services form the default Docker Compose profile, the Helm chart, and the published image set. A seventh, `analytics-service`, exists only behind the optional `kafka` Compose profile. `fare-service` (Java) sits behind the optional `fare` profile; it is validated by its own CI job (Maven unit tests plus Testcontainers integration tests against real PostgreSQL and Redis) and is not yet part of the smoke test, the published image set, or the Helm chart.
 
 | Service | Port | Does | Depends on |
 | --- | --- | --- | --- |
@@ -49,6 +51,7 @@ Six core services form the default Docker Compose profile, the Helm chart, and t
 | `routing-service` | 8083 | Keeps an in-memory driver view; returns nearest available driver (`haversine-nearest`, O(n) scan, ETA at 32 km/h with a 60 s floor) | Redis |
 | `traffic-service` | 8084 | Publishes simulated congestion every 10 s (not yet consumed) | Redis |
 | `notification-service` | 8085 | Consumes assignment notifications; logs them and counts them | Redis |
+| `fare-service` | 8087 | Consumes `events.ride.assignments`; records each envelope ID once in the `fare` PostgreSQL schema (Java 21, Spring Boot); optional `fare` Compose profile | PostgreSQL, Redis |
 | `analytics-service` | 8086 | Optional Kafka consumer; latest location per driver at `GET /v1/analytics/drivers` | Kafka |
 
 ### Streams
