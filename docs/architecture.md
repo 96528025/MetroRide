@@ -55,7 +55,7 @@ Event types that are emitted today:
 - `driver_location_updated` (driver-service, direct `XADD`)
 - `ride_assigned` (dispatch-service, via the outbox, to both the assignments and notifications streams)
 - `traffic_updated` (traffic-service, direct `XADD`)
-- `dead_lettered` (dispatch-service, after retries are exhausted)
+- `dead_lettered` (dispatch-service, after retries are exhausted; direct `XADD`, not via the outbox, so it is lost if Redis is down at that moment)
 
 `ride_completed` and `notification_created` are defined as constants but nothing publishes them yet.
 

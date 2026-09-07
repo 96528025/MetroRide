@@ -18,7 +18,7 @@ Every service exposes metrics at:
 GET /metrics
 ```
 
-Current project metrics (14; names are fixed by the Go registrations linked in the Owner column):
+Current project metrics (13; names are fixed by the Go registrations linked in the Owner column):
 
 | Metric | Type | Owner | Purpose |
 | --- | --- | --- | --- |
@@ -27,9 +27,9 @@ Current project metrics (14; names are fixed by the Go registrations linked in t
 | `metroride_dispatch_latency_seconds` | Histogram | `dispatch-service` | Assignment workflow latency |
 | `metroride_assignment_failures_total` | Counter | `dispatch-service` | Failed dispatch attempts |
 | `metroride_stream_consume_errors_total` | Counter | [shared](../shared/pkg/metrics/metrics.go) | Redis Stream consume failures, labelled by service and stream |
-| `metroride_dependency_errors_total` | Counter | shared | Redis, PostgreSQL, and routing dependency failures, labelled by service and dependency |
+| `metroride_dependency_errors_total` | Counter | shared | Redis, PostgreSQL, routing and Kafka dependency failures, labelled by service and dependency |
 | `metroride_outbox_events_published_total` | Counter | [outbox relay](../shared/pkg/outbox/outbox.go) in `rider-service` and `dispatch-service` | Outbox rows published to Redis, labelled by service and stream |
-| `metroride_outbox_publish_failures_total` | Counter | outbox relay | Outbox publish attempts that failed and were rescheduled |
+| `metroride_outbox_publish_failures_total` | Counter | outbox relay | Outbox publish attempts that failed and were rescheduled, labelled by service and stream |
 | `metroride_routing_computation_seconds` | Histogram | [`routing-service`](../services/routing-service/cmd/main.go) | Nearest-driver computation latency |
 | `metroride_active_drivers` | Gauge | `routing-service` | Available drivers in routing state |
 | `metroride_kafka_driver_location_events_total` | Counter | [`analytics-service`](../services/analytics-service/cmd/main.go) (`kafka` profile only) | Driver-location events consumed from Kafka |
@@ -64,7 +64,7 @@ GET /healthz
 GET /readyz
 ```
 
-`/healthz` is a liveness check and always returns `200` while the process serves HTTP. `/readyz` runs the service's named dependency checks under a 1.5-second deadline and returns `503` with the failing check names when any fails:
+`/healthz` is a liveness check and always returns `200` while the process serves HTTP. `/readyz` runs the service's named dependency checks one after another, each under its own 1.5-second deadline (dispatch's `routing_service` check instead uses a 3-second HTTP client), and returns `503` with the failing check names when any fails:
 
 | Service | Readiness checks |
 | --- | --- |
@@ -76,7 +76,7 @@ GET /readyz
 | `notification-service` | `redis`, `notification_stream` |
 | `analytics-service` | `kafka` |
 
-The Helm chart templates and the raw manifests in `infrastructure/k8s` wire `/healthz` and `/readyz` into the pod liveness and readiness probes.
+The Helm chart wires `/healthz` and `/readyz` into liveness and readiness probes for all six core services. The raw manifests in `infrastructure/k8s` only probe `rider-service` (both) and `dispatch-service` (readiness only).
 
 ## Structured Logging
 
@@ -104,6 +104,6 @@ Recommended production alerts:
 
 - Add OpenTelemetry tracing across REST calls and Redis event processing.
 - Add stream lag metrics per consumer group.
-- Add a dead-letter counter; today dead letters are visible only in the `events.dead_letter` stream and in `metroride_assignment_failures_total`.
+- Add a dead-letter counter. `metroride_assignment_failures_total` counts messages that exhausted their assignment retries and is incremented before the dead-letter publish is attempted, so the `events.dead_letter` stream is the only record of what was actually dead-lettered.
 - Add RED metrics for every REST endpoint: rate, errors, duration.
 - Add resource dashboards for CPU, memory, goroutines, and database pool utilization.
