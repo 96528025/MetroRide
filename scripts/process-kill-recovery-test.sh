@@ -34,10 +34,13 @@ extract_json_string() {
 }
 
 psql_scalar() {
-  # Bounded like every other blocking call: connect within 2 s and abort the
-  # statement after 2 s instead of hanging past the recovery deadline.
-  docker compose exec -T -e PGCONNECT_TIMEOUT=2 -e PGOPTIONS='-c statement_timeout=2000' \
-    postgres psql -U metroride -d metroride -Atqc "$1"
+  # Bounded like every other blocking call: connect and finish the statement
+  # within the given number of seconds (default 2) instead of hanging.
+  local sql="$1"
+  local timeout_seconds="${2:-2}"
+  docker compose exec -T -e "PGCONNECT_TIMEOUT=${timeout_seconds}" \
+    -e "PGOPTIONS=-c statement_timeout=$((timeout_seconds * 1000))" \
+    postgres psql -U metroride -d metroride -Atqc "${sql}"
 }
 
 # Seconds left before ${deadline}, never below 1, so every blocking call in the
@@ -123,16 +126,17 @@ echo "restarting Redis and rider-service and waiting for automatic relay recover
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 docker compose up -d redis rider-service >/dev/null
 
-# Each loop checks the deadline before it blocks and caps the call by the time
-# left, so a hung request can neither stall the run nor be accepted late.
+# Every blocking call is capped by the time left, and a result only counts if
+# it arrived before the deadline: the deadline is checked after each call and
+# before the result is accepted, so a slow answer cannot turn into a pass.
 while true; do
+  readiness_status="$(curl -fsS --max-time "$(remaining_seconds)" "http://${BASE_HOST}:8080/readyz" 2>/dev/null | extract_json_string status || true)"
+  if [[ "${readiness_status}" == "ready" ]] && (( SECONDS < deadline )); then
+    break
+  fi
   if (( SECONDS >= deadline )); then
     echo "failed: rider-service did not report ready within ${TIMEOUT_SECONDS}s after restart" >&2
     exit 1
-  fi
-  readiness_status="$(curl -fsS --max-time "$(remaining_seconds)" "http://${BASE_HOST}:8080/readyz" 2>/dev/null | extract_json_string status || true)"
-  if [[ "${readiness_status}" == "ready" ]]; then
-    break
   fi
   sleep 1
 done
@@ -141,16 +145,17 @@ echo "ok: rider-service is ready again"
 ride=""
 unpublished=""
 while true; do
-  if (( SECONDS >= deadline )); then
-    echo "failed: restarted relay did not recover within ${TIMEOUT_SECONDS}s; ride=${ride}; unpublished=${unpublished}" >&2
-    exit 1
-  fi
   ride="$(curl -fsS --max-time "$(remaining_seconds)" "http://${BASE_HOST}:8080/v1/rides/${ride_id}" || true)"
   ride_status="$(printf '%s' "${ride}" | extract_json_string status)"
   unpublished="$(psql_scalar \
-    "select count(*) from event_outbox where aggregate_id = '${ride_id}' and published_at is null" || true)"
-  if [[ "${ride_status}" == "assigned" && "${unpublished}" == "0" ]]; then
+    "select count(*) from event_outbox where aggregate_id = '${ride_id}' and published_at is null" \
+    "$(remaining_seconds)" || true)"
+  if [[ "${ride_status}" == "assigned" && "${unpublished}" == "0" ]] && (( SECONDS < deadline )); then
     break
+  fi
+  if (( SECONDS >= deadline )); then
+    echo "failed: restarted relay did not recover within ${TIMEOUT_SECONDS}s; ride=${ride}; unpublished=${unpublished}" >&2
+    exit 1
   fi
   sleep 1
 done
