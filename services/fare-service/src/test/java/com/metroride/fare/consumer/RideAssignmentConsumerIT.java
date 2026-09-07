@@ -127,13 +127,15 @@ class RideAssignmentConsumerIT {
             blocked = publish(goEnvelope(blockedId, UUID.randomUUID().toString()));
             RecordId next = publish(goEnvelope(nextId, UUID.randomUUID().toString()));
 
+            // The row commits before the XACK is sent, so the pending count belongs inside the
+            // wait: read too early it still includes the entry that is about to be acknowledged.
             await().atMost(Duration.ofSeconds(8)).untilAsserted(() -> {
                 assertThat(processedRows(nextId)).isEqualTo(1);
                 assertThat(lastDeliveredId()).isEqualTo(next.getValue());
                 assertThat(postgresErrorCount()).isEqualTo(postgresErrorsBefore + 1);
+                assertThat(pendingEntries()).isEqualTo(pendingBefore + 1);
             });
             assertThat(processedRows(blockedId)).isZero();
-            assertThat(pendingEntries()).isEqualTo(pendingBefore + 1);
             lockHolder.rollback();
         } finally {
             if (blocked != null) {
