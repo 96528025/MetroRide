@@ -104,13 +104,14 @@ ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 
 ## Verification
 
-`go test ./...` compiles all 15 Go packages and runs 33 unit tests across 8 of them (event envelopes, config, HTTP/readiness helpers, retry and timeout helpers, the dispatch-to-routing client, nearest-driver selection and tie-breaking, outbox backoff, rider readiness). The other 7 packages have no unit tests. Running-stack tests need the Compose stack up:
+`go test -race ./...` compiles all 15 Go packages and runs 33 unit tests across 8 of them (event envelopes, config, HTTP/readiness helpers, retry and timeout helpers, the dispatch-to-routing client, nearest-driver selection and tie-breaking, outbox backoff, rider readiness). The other 7 packages have no unit tests. The race detector is a guard for future concurrent code: none of the unit tests exercise concurrent paths today, and the services under test run uninstrumented in containers, so it says nothing about relay or consumer concurrency. Running-stack tests need the Compose stack up:
 
 | Check | Command | Asserts |
 | --- | --- | --- |
 | Smoke | `bash scripts/smoke-test.sh` | `/healthz` and `/readyz` on all six services, selected metrics, HTTP 202 on create, ride reaches `assigned` with a driver |
-| Integration (3 tests) | `go test -count=1 -tags=integration ./tests/integration` | happy path; duplicate `ride_requested` keeps one assignment and the same driver; outbox relay makes progress past 25 real Redis `WRONGTYPE` failures without replaying delivered rows |
+| Integration (3 tests) | `go test -race -count=1 -tags=integration ./tests/integration` | happy path; duplicate `ride_requested` keeps one assignment and the same driver; outbox relay makes progress past 25 real Redis `WRONGTYPE` failures without replaying delivered rows |
 | Redis outage | `bash scripts/outbox-recovery-test.sh` | rider stays ready, ride accepted with 202, one unpublished outbox row in PostgreSQL, automatic relay and assignment after Redis restarts |
+| Process kill | `bash scripts/process-kill-recovery-test.sh` | with Redis stopped, ride accepted with 202 and one unpublished outbox row; rider-service killed with SIGKILL; after `docker compose up -d redis rider-service` the restarted relay publishes that row exactly once and dispatch assigns the ride, with no client retry |
 | Routing outage (1 test) | `bash scripts/failure-integration-test.sh` | dead-letter entry matches the ride and original event ID; ride stays `requested` with zero assignment rows |
 | Kubernetes (needs Docker, kind, kubectl, Helm and Bash 4+ for `mapfile`; macOS ships Bash 3.2) | `bash scripts/build-images.sh && bash scripts/kind-up.sh && bash scripts/kind-load-images.sh && bash scripts/kind-deploy.sh && bash scripts/kind-smoke-test.sh` | same smoke test through `kubectl port-forward`, then `rides`/`ride_assignments` checked with `psql` and the notification counter checked over HTTP; `bash scripts/kind-down.sh` deletes the cluster |
 
@@ -120,7 +121,7 @@ Opt-in benchmark for the 10,000-driver selection scan: `go test -run '^$' -bench
 
 One GitHub Actions workflow (`.github/workflows/ci.yml`) plus a reusable deployment job (`deploy-validation.yml`). Triggers: pull requests, pushes to `main`, `v*` tags, manual dispatch.
 
-1. **`backend`** (every event): `gofmt -l`, `go vet`, `go test ./...`, `docker compose config`, build and start the stack, then the smoke, integration, Redis-outage and routing-outage checks above; Compose logs on failure; `docker compose down -v` always.
+1. **`backend`** (every event): `gofmt -l`, `go vet`, `go test -race ./...`, `docker compose config`, build and start the stack, then the smoke, integration, Redis-outage, process-kill and routing-outage checks above; Compose logs on failure; `docker compose down -v` always.
 2. **Pull requests**: build the six images in the runner, create a single-node KinD cluster (`kindest/node:v1.34.0`; kind, kubectl and Helm versions pinned), side-load the images with `kind load docker-image`, `helm upgrade --install --wait`, run the Kubernetes smoke test, collect diagnostics on failure, delete the cluster unconditionally. The job has `contents: read` only, never logs in to GHCR, and neither pushes nor pulls MetroRide service images; base images, the KinD node image, PostgreSQL and Redis are still pulled from public registries.
 3. **`main`, tags, manual runs**: a six-way matrix publishes `ghcr.io/96528025/metroride-<service>:<full-commit-sha>` (plus the `v*` tag when present; never `latest`), then the same KinD job pulls those exact images back, logs out of GHCR before the cluster exists, and runs the identical deployment and smoke test.
 

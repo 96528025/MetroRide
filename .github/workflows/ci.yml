@@ -49,7 +49,7 @@ jobs:
         run: go vet ./...
 
       - name: Run Go tests
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Validate Docker Compose config
         run: docker compose config
@@ -64,7 +64,7 @@ jobs:
         run: bash scripts/smoke-test.sh
 
       - name: Run integration tests
-        run: go test -count=1 -tags=integration ./tests/integration
+        run: go test -race -count=1 -tags=integration ./tests/integration
 
       - name: Run Redis outage transactional outbox recovery test
         id: outbox-recovery
@@ -73,6 +73,15 @@ jobs:
 
       - name: Print outbox recovery logs on failure
         if: failure() && steps.outbox-recovery.outcome == 'failure'
+        run: docker compose logs --no-color rider-service dispatch-service redis postgres
+
+      - name: Run process-kill transactional outbox recovery test
+        id: process-kill-recovery
+        timeout-minutes: 2
+        run: bash scripts/process-kill-recovery-test.sh
+
+      - name: Print process-kill recovery logs on failure
+        if: failure() && steps.process-kill-recovery.outcome == 'failure'
         run: docker compose logs --no-color rider-service dispatch-service redis postgres
 
       - name: Run routing outage dead-letter integration test
