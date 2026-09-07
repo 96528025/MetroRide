@@ -6,7 +6,7 @@ MetroRide is a portfolio-scale local distributed-systems project that demonstrat
 
 Ride dispatch is a real-time coordination problem. A rider creates a request, drivers continuously publish location updates, a dispatch system chooses an available driver, routing estimates distance and ETA, and notifications are emitted after assignment. The system must coordinate these steps without tightly coupling every service through synchronous calls.
 
-MetroRide models this workflow with six default core Go application services, Redis Streams, PostgreSQL, Docker Compose, Kubernetes manifests, Helm scaffolding, Prometheus, and Grafana. An optional Kafka profile adds `analytics-service` as a seventh application role for driver-location telemetry; its extra driver producer is another instance of the existing driver-service role.
+MetroRide models this workflow with six default core Go application services, Redis Streams, PostgreSQL, Docker Compose, a Helm chart that CI installs on an ephemeral KinD cluster, raw Kubernetes manifests kept as scaffolding, Prometheus, and Grafana. An optional Kafka profile adds `analytics-service` as a seventh application role for driver-location telemetry; its extra driver producer is another instance of the existing driver-service role.
 
 ## System Goals
 
