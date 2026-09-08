@@ -51,7 +51,7 @@ Six core services form the default Docker Compose profile, the Helm chart, and t
 | `routing-service` | 8083 | Keeps an in-memory driver view; returns nearest available driver (`haversine-nearest`, O(n) scan, ETA at 32 km/h with a 60 s floor) | Redis |
 | `traffic-service` | 8084 | Publishes simulated congestion every 10 s (not yet consumed) | Redis |
 | `notification-service` | 8085 | Consumes assignment notifications; logs them and counts them | Redis |
-| `fare-service` | 8087 | Consumes `events.ride.assignments`; records each envelope ID once in the `fare` PostgreSQL schema (Java 21, Spring Boot); optional `fare` Compose profile | PostgreSQL, Redis |
+| `fare-service` | 8087 | Consumes `events.ride.assignments`; records each envelope ID once, quotes the fare from distance and ETA, and holds it as a balanced `quote_hold` entry in a double-entry ledger in the `fare` PostgreSQL schema; `GET /v1/rides/{ride_id}/ledger` (Java 21, Spring Boot); optional `fare` Compose profile | PostgreSQL, Redis |
 | `analytics-service` | 8086 | Optional Kafka consumer; latest location per driver at `GET /v1/analytics/drivers` | Kafka |
 
 ### Streams

@@ -3,9 +3,9 @@ package com.metroride.fare.consumer;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import com.metroride.fare.IntegrationTestSupport;
 import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.events.EnvelopeCodec;
-import com.redis.testcontainers.RedisContainer;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -15,42 +15,20 @@ import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamRecords;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 /**
- * End-to-end check of the skeleton against real PostgreSQL and Redis containers (the same images
- * docker-compose.yml uses): Flyway migrates the {@code fare} schema, the consumer group is created,
- * an envelope published the way the Go outbox relay publishes it is recorded once and acknowledged,
- * and a second delivery of the same envelope is skipped and acknowledged too.
- *
- * <p>{@code @AutoConfigureObservability} is required by every {@code @SpringBootTest} in this
- * service: Spring Boot switches metrics export off in tests, and {@code MetricsController} needs the
- * Prometheus registry that export provides.
+ * End-to-end check of the consumer path against real PostgreSQL and Redis containers (see
+ * {@link IntegrationTestSupport}): Flyway migrates the {@code fare} schema, the consumer group is
+ * created, an envelope published the way the Go outbox relay publishes it is recorded once and
+ * acknowledged, and a second delivery of the same envelope is skipped and acknowledged too.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@AutoConfigureObservability
-@Testcontainers
-class RideAssignmentConsumerIT {
-
-    @Container
-    @ServiceConnection
-    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16-alpine"));
-
-    @Container
-    @ServiceConnection
-    static final RedisContainer redis = new RedisContainer(DockerImageName.parse("redis:7-alpine"));
+class RideAssignmentConsumerIT extends IntegrationTestSupport {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(15);
 
@@ -112,7 +90,7 @@ class RideAssignmentConsumerIT {
         String nextId = UUID.randomUUID().toString();
         RecordId blocked = null;
         try (Connection lockHolder = DriverManager.getConnection(
-                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
             lockHolder.setAutoCommit(false);
             try (PreparedStatement insert = lockHolder.prepareStatement(
                     "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {

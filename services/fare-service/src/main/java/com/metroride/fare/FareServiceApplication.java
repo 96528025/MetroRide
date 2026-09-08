@@ -1,20 +1,21 @@
 package com.metroride.fare;
 
 import com.metroride.fare.config.ConsumerProperties;
+import com.metroride.fare.pricing.FareProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 /**
- * fare-service consumes {@code events.ride.assignments} from Redis Streams and records
- * every envelope it sees exactly once in its own PostgreSQL schema.
+ * fare-service consumes {@code events.ride.assignments} from Redis Streams, records every
+ * envelope it sees exactly once in its own PostgreSQL schema, and for each first-seen
+ * {@code ride_assigned} quotes the fare and holds it in a double-entry ledger.
  *
- * <p>That is the whole service for now. Fare calculation, the ledger, settlement on
- * {@code ride_completed}, and publication of {@code events.ride.fares} are deliberately
- * absent; see {@code services/fare-service/README.md} for the boundary.
+ * <p>Settlement on {@code ride_completed} and publication of {@code events.ride.fares} are
+ * deliberately absent; see {@code services/fare-service/README.md} for the boundary.
  */
 @SpringBootApplication
-@EnableConfigurationProperties(ConsumerProperties.class)
+@EnableConfigurationProperties({ConsumerProperties.class, FareProperties.class})
 public class FareServiceApplication {
 
     /** Value of the {@code service} label on every metric, matching the Go services' label. */

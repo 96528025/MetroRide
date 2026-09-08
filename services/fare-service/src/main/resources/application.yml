@@ -50,6 +50,15 @@ metroride:
     # PostgreSQL call. Hikari's connection-timeout above only bounds obtaining a
     # connection from the pool; this bounds the SQL that runs on it.
     timeout-seconds: 2
+  fare:
+    # Rate card for the quote written on ride_assigned:
+    #   quote = base-fare + per-km * distance_km + per-minute * eta_seconds / 60
+    # Exact decimals bound to FareProperties; rounding to cents happens once, in Money.
+    base-fare: 2.50
+    per-km: 1.20
+    per-minute: 0.30
+    # Driver's share of a settled fare. Bound and validated now; read once settlement exists.
+    driver-share: 0.80
   consumer:
     stream: events.ride.assignments
     batch-size: 10

@@ -34,7 +34,7 @@ Separating these responsibilities makes the architecture easier to scale and rea
 | `routing-service` | Default | Driver proximity and ETA calculation | In-memory driver cache hydrated from events |
 | `traffic-service` | Default | Regional congestion simulation | In-memory traffic model, Redis Stream output |
 | `notification-service` | Default | Simulated rider/driver notification handling | Consumer group offsets |
-| `fare-service` | Optional `fare` profile | Consumes `events.ride.assignments` and records each envelope ID once (Java) | PostgreSQL `fare.processed_events`, consumer group offsets |
+| `fare-service` | Optional `fare` profile | Consumes `events.ride.assignments`, records each envelope ID once, quotes the fare and holds it in a double-entry ledger (Java) | PostgreSQL `fare.processed_events`, `fare.journal_entries`, `fare.postings`, consumer group offsets |
 | `analytics-service` | Optional `kafka` profile | Driver-location telemetry analytics | In-memory view hydrated from a Kafka consumer group |
 
 ## Event-Driven Architecture
@@ -73,7 +73,7 @@ The shared event envelope includes event ID, type, source, correlation ID, times
 7. `dispatch-service` commits the assignment, status update, and pending assignment and notification outbox events together.
 8. Its relay publishes both pending events to their Redis Streams asynchronously.
 9. `notification-service` consumes notification events and logs simulated delivery.
-10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and records its envelope ID once in `fare.processed_events`; a redelivery is acknowledged without a second row.
+10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and, in one transaction, records its envelope ID in `fare.processed_events`, quotes the fare from `distance_km` and `eta_seconds`, and appends a `quote_hold` journal entry with two postings that sum to zero; a redelivery is acknowledged without a second row or a second entry. Nothing settles the hold yet because no service publishes `ride_completed`.
 
 ## Why Redis Streams?
 
