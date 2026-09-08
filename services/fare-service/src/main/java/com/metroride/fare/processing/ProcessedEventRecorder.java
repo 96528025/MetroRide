@@ -88,7 +88,7 @@ public class ProcessedEventRecorder {
      * <p>Two deliveries of the same envelope that arrive at once are serialised by the primary key
      * of {@code fare.processed_events}: the second insert waits for the first transaction to
      * commit, then hits the conflict clause and returns {@link Outcome#DUPLICATE} without ever
-     * reaching the ledger. The unique constraint on {@code journal_entries.source_event_id} is a
+     * reaching the ledger. The unique key on {@code journal_entries (source_event_id, kind)} is a
      * backstop for writers that bypass this method, not the mechanism relied on here.
      *
      * @throws FareQuoteException when a {@code ride_assigned} payload cannot be quoted; the

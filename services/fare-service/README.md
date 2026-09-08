@@ -47,9 +47,10 @@ list. Nothing claims pending entries yet; see the `TODO(pending-entry recovery)`
 
 Two deliveries of the same envelope that arrive at the same moment are serialised by the primary
 key of `fare.processed_events`: the second insert waits for the first transaction to commit, then
-lands on the conflict clause and returns without touching the ledger. The unique constraint on
-`journal_entries.source_event_id` is a backstop for a writer that bypasses the recorder, not the
-mechanism the service relies on.
+lands on the conflict clause and returns without touching the ledger. The unique key on
+`journal_entries (source_event_id, kind)` is a backstop for a writer that bypasses the recorder,
+not the mechanism the service relies on. It is a compound key, not `source_event_id` alone,
+because one completion event will later produce both a `hold_reversal` and a `settlement`.
 
 ### Fare and ledger
 
@@ -81,7 +82,8 @@ enforced in the `JournalEntry` constructor and nowhere else. There is no databas
 purpose: with a single writer, making the illegal state unrepresentable in the application is
 enough, and a trigger would duplicate the rule in a second language with its own tests. A
 trigger is defense in depth to add when a second writer appears. Reads go through the same
-constructor, so a row set that no longer balances is refused rather than served.
+constructor (the query is a left join, so an entry that lost its postings is not hidden), so a
+row set that no longer balances or has no postings is refused rather than served.
 
 ### Ledger endpoint
 

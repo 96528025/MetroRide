@@ -12,7 +12,7 @@ import java.util.List;
  *
  * @param rideId        the ride whose ledger this entry belongs to
  * @param kind          why the entry exists
- * @param sourceEventId the envelope ID that produced it, unique per entry
+ * @param sourceEventId the envelope ID that produced it; unique together with {@code kind}
  * @param postings      at least one posting, summing to zero
  */
 public record JournalEntry(String rideId, JournalKind kind, String sourceEventId, List<Posting> postings) {

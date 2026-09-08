@@ -26,10 +26,12 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class LedgerRepository {
 
+    // Left join on purpose: an entry without postings must surface and be rejected by the
+    // JournalEntry constructor, not vanish from the result as an inner join would make it.
     private static final String SELECT_BY_RIDE = """
             select j.id, j.ride_id, j.kind, j.source_event_id, j.created_at, p.id as posting_id, p.account, p.amount
             from fare.journal_entries j
-            join fare.postings p on p.journal_entry_id = j.id
+            left join fare.postings p on p.journal_entry_id = j.id
             where j.ride_id = :rideId
             order by j.id, p.id
             """;
@@ -90,8 +92,11 @@ public class LedgerRepository {
                         rs.getObject("created_at", java.time.OffsetDateTime.class).toInstant());
                 byId.put(id, rows);
             }
-            BigDecimal amount = rs.getBigDecimal("amount");
-            rows.postings.add(new Posting(Account.fromCode(rs.getString("account")), Money.of(amount)));
+            String account = rs.getString("account");
+            if (account != null) {
+                BigDecimal amount = rs.getBigDecimal("amount");
+                rows.postings.add(new Posting(Account.fromCode(account), Money.of(amount)));
+            }
         }
         List<StoredJournalEntry> result = new ArrayList<>(byId.size());
         byId.forEach((id, rows) -> result.add(new StoredJournalEntry(id, rows.createdAt, new JournalEntry(

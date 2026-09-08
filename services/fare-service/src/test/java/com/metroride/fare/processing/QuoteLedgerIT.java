@@ -1,18 +1,21 @@
 package com.metroride.fare.processing;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 import com.metroride.fare.IntegrationTestSupport;
 import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
+import com.metroride.fare.ledger.LedgerRepository;
 import com.metroride.fare.processing.ProcessedEventRecorder.Outcome;
 import com.metroride.fare.processing.ProcessedEventRecorder.Result;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -28,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamRecords;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -60,6 +64,9 @@ class QuoteLedgerIT extends IntegrationTestSupport {
 
     @Autowired
     EnvelopeCodec codec;
+
+    @Autowired
+    LedgerRepository ledger;
 
     @Autowired
     MeterRegistry meterRegistry;
@@ -153,8 +160,12 @@ class QuoteLedgerIT extends IntegrationTestSupport {
      * ledger to one entry is the primary key of {@code fare.processed_events}: PostgreSQL blocks
      * the second {@code INSERT ... ON CONFLICT DO NOTHING} until the first transaction commits,
      * then resolves it as a conflict, so the second call returns DUPLICATE and never reaches the
-     * journal insert. The unique constraint on {@code journal_entries.source_event_id} is not what
+     * journal insert. The unique key on {@code journal_entries (source_event_id, kind)} is not what
      * stops it; it would only fire for a writer that skipped the idempotency insert.
+     *
+     * <p>This test shows the outcome under real concurrency; it cannot force the two transactions
+     * to overlap at the conflict point. {@link #aRecordBlockedByAnUncommittedEventRowReturnsDuplicate}
+     * pins the mechanism itself.
      */
     @Test
     void concurrentDeliveriesOfOneEventWriteOneJournalEntry() throws Exception {
@@ -184,6 +195,69 @@ class QuoteLedgerIT extends IntegrationTestSupport {
         assertThat(journalRows(eventId)).isEqualTo(1);
         assertThat(postings(rideId)).hasSize(2);
         assertThat(sumOfPostings(rideId)).isEqualByComparingTo(BigDecimal.ZERO);
+    }
+
+    /**
+     * The mechanism behind the previous test, made deterministic: another session has inserted the
+     * event row and not committed. {@code record()} for the same event must block on that row (it
+     * is still running well after it would otherwise have finished), and once the other session
+     * commits it must return DUPLICATE and write no journal entry. The holder commits within the 2s
+     * transaction timeout, so the wait is a lock wait, not a cancellation.
+     */
+    @Test
+    void aRecordBlockedByAnUncommittedEventRowReturnsDuplicate() throws Exception {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        Envelope envelope = codec.decode("test", Map.of(EnvelopeCodec.EVENT_FIELD, goEnvelope(eventId, rideId, 3.0, 300)));
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try (Connection holder = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
+            holder.setAutoCommit(false);
+            try (PreparedStatement insert = holder.prepareStatement(
+                    "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
+                insert.setString(1, eventId);
+                insert.setString(2, consumer.stream());
+                insert.setString(3, "ride_assigned");
+                insert.executeUpdate();
+            }
+
+            Future<Result> blocked = pool.submit(() -> recorder.record(consumer.stream(), envelope));
+            assertThatThrownBy(() -> blocked.get(500, TimeUnit.MILLISECONDS))
+                    .as("record() must wait on the uncommitted event row")
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+            assertThat(journalRows(eventId)).isZero();
+
+            holder.commit();
+
+            assertThat(blocked.get(5, TimeUnit.SECONDS).outcome()).isEqualTo(Outcome.DUPLICATE);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertThat(processedRows(eventId)).isEqualTo(1);
+        assertThat(journalRows(eventId)).isZero();
+        assertThat(postings(rideId)).isEmpty();
+    }
+
+    /**
+     * Reads must not hide a journal entry that has no postings: the left join surfaces it and the
+     * {@code JournalEntry} constructor refuses it, so the endpoint fails instead of answering 404.
+     */
+    @Test
+    void anEntryWithoutPostingsIsRefusedOnReadNotHidden() {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        jdbc.update("insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())",
+                eventId, consumer.stream(), "ride_assigned");
+        jdbc.update("insert into fare.journal_entries (ride_id, kind, source_event_id, created_at) values (?, ?, ?, now())",
+                rideId, "quote_hold", eventId);
+
+        // The constructor's IllegalArgumentException, translated by @Repository into Spring's
+        // data-access hierarchy.
+        assertThatThrownBy(() -> ledger.findByRideId(rideId))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .hasMessageContaining("at least one posting");
+        ResponseEntity<String> response = http.getForEntity("/v1/rides/" + rideId + "/ledger", String.class);
+        assertThat(response.getStatusCode().value()).isEqualTo(500);
     }
 
     /**
