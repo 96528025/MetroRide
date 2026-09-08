@@ -42,7 +42,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * The quote-and-hold path against real PostgreSQL and Redis: a {@code ride_assigned} envelope
  * produces one processed event, one {@code quote_hold} journal entry and two postings that cancel
  * out; a redelivery adds nothing; two concurrent deliveries add nothing either; and a failure
- * inside the transaction leaves neither the event row nor the journal entry behind.
+ * inside the transaction leaves neither the event row nor the journal entry behind until the
+ * reclaimed delivery writes both.
  *
  * <p>Containers and context come from {@link IntegrationTestSupport}.
  */
@@ -264,15 +265,18 @@ class QuoteLedgerIT extends IntegrationTestSupport {
      * The event row and the journal entry are one transaction. Another session holds an exclusive
      * lock on {@code fare.journal_entries}, so the consumer's event insert succeeds, its journal
      * insert waits, and the 2s transaction timeout cancels it. Afterwards neither the event row nor
-     * the journal entry exists, and the entry stays pending. As in
-     * {@code RideAssignmentConsumerIT}, nothing claims the abandoned entry, so the test acknowledges
-     * it to leave the group clean.
+     * the journal entry exists, and the entry stays pending. Once the lock is released the reclaim
+     * pass delivers the entry again and both rows are written by that delivery; nothing is
+     * acknowledged by hand. The poison counterpart (a payload that can never be quoted) is in
+     * {@code PendingEntryRecoveryIT}.
      */
     @Test
-    void aFailedJournalInsertRollsBackTheEventRowToo() throws Exception {
+    void aFailedJournalInsertRollsBackTheEventRowTooAndIsReclaimed() throws Exception {
         String eventId = UUID.randomUUID().toString();
         String rideId = UUID.randomUUID().toString();
-        RecordId blocked = null;
+        double quotesBefore = quoteCount();
+        double reclaimedBefore = reclaimedCount();
+        long pendingBefore = pendingEntries();
         try (Connection lockHolder = DriverManager.getConnection(
                 POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
             lockHolder.setAutoCommit(false);
@@ -280,10 +284,8 @@ class QuoteLedgerIT extends IntegrationTestSupport {
                 lock.execute("lock table fare.journal_entries in access exclusive mode");
             }
             double postgresErrorsBefore = postgresErrorCount();
-            double quotesBefore = quoteCount();
-            long pendingBefore = pendingEntries();
 
-            blocked = publish(goEnvelope(eventId, rideId, 1.0, 60));
+            publish(goEnvelope(eventId, rideId, 1.0, 60));
 
             await().atMost(Duration.ofSeconds(8)).untilAsserted(() -> {
                 assertThat(postgresErrorCount()).isEqualTo(postgresErrorsBefore + 1);
@@ -295,35 +297,17 @@ class QuoteLedgerIT extends IntegrationTestSupport {
             assertThat(journalRows(eventId)).isZero();
             assertThat(postings(rideId)).isEmpty();
             assertThat(quoteCount()).isEqualTo(quotesBefore);
-        } finally {
-            if (blocked != null) {
-                redisTemplate.opsForStream().acknowledge(consumer.stream(), consumer.group(), blocked);
-            }
         }
-    }
 
-    /**
-     * A payload the calculator rejects is a quote failure: the transaction rolls back, the event
-     * is not recorded, the failure is counted, and the entry stays pending like a decode failure.
-     */
-    @Test
-    void aRejectedPayloadRecordsNothingAndCountsAQuoteFailure() {
-        String eventId = UUID.randomUUID().toString();
-        String rideId = UUID.randomUUID().toString();
-        double failuresBefore = quoteFailureCount("calculation");
-        long pendingBefore = pendingEntries();
-
-        RecordId poison = publish(goEnvelope(eventId, rideId, -1.0, 60));
-        try {
-            await().atMost(TIMEOUT).untilAsserted(() -> {
-                assertThat(quoteFailureCount("calculation")).isEqualTo(failuresBefore + 1);
-                assertThat(pendingEntries()).isEqualTo(pendingBefore + 1);
-            });
-            assertThat(processedRows(eventId)).isZero();
-            assertThat(journalRows(eventId)).isZero();
-        } finally {
-            redisTemplate.opsForStream().acknowledge(consumer.stream(), consumer.group(), poison);
-        }
+        await().atMost(consumer.reclaimInterval().plus(consumer.reclaimMinIdle()).plusSeconds(3)).untilAsserted(() -> {
+            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 1);
+            assertThat(processedRows(eventId)).isEqualTo(1);
+            assertThat(journalRows(eventId)).isEqualTo(1);
+            assertThat(pendingEntries()).isEqualTo(pendingBefore);
+        });
+        assertThat(postings(rideId)).hasSize(2);
+        assertThat(sumOfPostings(rideId)).isEqualByComparingTo(BigDecimal.ZERO);
+        assertThat(quoteCount()).isEqualTo(quotesBefore + 1);
     }
 
     @Test
@@ -394,8 +378,8 @@ class QuoteLedgerIT extends IntegrationTestSupport {
         return meterRegistry.get("metroride.fare.quotes").tag("kind", "quote_hold").counter().count();
     }
 
-    private double quoteFailureCount(String reason) {
-        return meterRegistry.get("metroride.fare.quote.failures").tag("reason", reason).counter().count();
+    private double reclaimedCount() {
+        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
     }
 
     /** Same shape as {@code events.Publish} writes: one field named {@code event} holding the envelope JSON. */

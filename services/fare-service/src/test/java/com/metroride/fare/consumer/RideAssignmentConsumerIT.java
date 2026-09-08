@@ -16,6 +16,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamRecords;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -26,7 +27,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * End-to-end check of the consumer path against real PostgreSQL and Redis containers (see
  * {@link IntegrationTestSupport}): Flyway migrates the {@code fare} schema, the consumer group is
  * created, an envelope published the way the Go outbox relay publishes it is recorded once and
- * acknowledged, and a second delivery of the same envelope is skipped and acknowledged too.
+ * acknowledged, a second delivery of the same envelope is skipped and acknowledged too, and an
+ * entry whose write was cancelled is reclaimed and recorded once the obstacle is gone.
  */
 class RideAssignmentConsumerIT extends IntegrationTestSupport {
 
@@ -78,17 +80,21 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
     }
 
     /**
-     * A write that cannot complete must not stall the single consumer thread. Another transaction
-     * holds an uncommitted row with the same event ID, so the consumer's insert waits for that
-     * lock; the transaction timeout has to cancel the wait, leave that entry pending, and let the
-     * next entry through. Nothing claims the abandoned entry afterwards (documented TODO), so the
-     * test acknowledges it itself to leave the group clean for the other tests.
+     * A write that cannot complete must not stall the single consumer thread, and must not lose
+     * the entry either. Another transaction holds an uncommitted row with the same event ID, so
+     * the consumer's insert waits for that lock; the transaction timeout has to cancel the wait,
+     * leave that entry pending, and let the next entry through. Once the lock is released the
+     * reclaim pass has to deliver the entry again, within {@code reclaim-interval} plus
+     * {@code reclaim-min-idle} of its first delivery, and this time it is recorded and acknowledged.
+     * Nobody acknowledges anything by hand.
      */
     @Test
-    void leavesALockWaitingEventPendingAndKeepsConsumingOthers() throws Exception {
+    void aLockWaitingEventIsLeftPendingThenReclaimedOnceTheLockIsReleased() throws Exception {
         String blockedId = UUID.randomUUID().toString();
         String nextId = UUID.randomUUID().toString();
-        RecordId blocked = null;
+        double reclaimedBefore = reclaimedCount();
+        long pendingBefore = pendingEntries();
+        RecordId blocked;
         try (Connection lockHolder = DriverManager.getConnection(
                 POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
             lockHolder.setAutoCommit(false);
@@ -100,7 +106,6 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
                 insert.executeUpdate();
             }
             double postgresErrorsBefore = postgresErrorCount();
-            long pendingBefore = pendingEntries();
 
             blocked = publish(goEnvelope(blockedId, UUID.randomUUID().toString()));
             RecordId next = publish(goEnvelope(nextId, UUID.randomUUID().toString()));
@@ -114,13 +119,19 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
                 assertThat(pendingEntries()).isEqualTo(pendingBefore + 1);
             });
             assertThat(processedRows(blockedId)).isZero();
+            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore);
             lockHolder.rollback();
-        } finally {
-            if (blocked != null) {
-                redisTemplate.opsForStream().acknowledge(consumer.stream(), consumer.group(), blocked);
-            }
         }
-        assertThat(processedRows(blockedId)).isZero();
+
+        // The entry becomes claimable reclaim-min-idle after its first delivery and the next pass
+        // runs at most reclaim-interval later; the slack covers container latency, not the design.
+        await().atMost(consumer.reclaimInterval().plus(consumer.reclaimMinIdle()).plusSeconds(3)).untilAsserted(() -> {
+            assertThat(processedRows(blockedId)).isEqualTo(1);
+            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 1);
+            assertThat(pendingEntries()).isEqualTo(pendingBefore);
+        });
+        assertThat(isPending(blocked)).isFalse();
+        assertThat(lastDeliveredId()).as("XAUTOCLAIM does not move the group's cursor").isNotEqualTo(blocked.getValue());
     }
 
     @Test
@@ -138,6 +149,11 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
         assertThat(metrics.getHeaders().getContentType().toString()).startsWith("text/plain");
         assertThat(metrics.getBody())
                 .contains("metroride_fare_events_processed_total")
+                .contains("metroride_fare_events_reclaimed_total{")
+                .contains("metroride_fare_dead_letters_total{")
+                .contains("reason=\"poison\"")
+                .contains("reason=\"retry_budget_exhausted\"")
+                .contains("metroride_fare_dead_letter_publish_failures_total{")
                 .contains("metroride_stream_consume_errors_total")
                 .contains("metroride_dependency_errors_total");
     }
@@ -165,8 +181,18 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
                 .lastDeliveredId();
     }
 
+    private boolean isPending(RecordId id) {
+        return !redisTemplate.opsForStream()
+                .pending(consumer.stream(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
+                .isEmpty();
+    }
+
     private double postgresErrorCount() {
         return meterRegistry.get("metroride.dependency.errors").tag("dependency", "postgres").counter().count();
+    }
+
+    private double reclaimedCount() {
+        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
     }
 
     private double duplicateCount() {

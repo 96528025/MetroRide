@@ -61,9 +61,28 @@ metroride:
     driver-share: 0.80
   consumer:
     stream: events.ride.assignments
-    batch-size: 10
+    batch-size: 10         # COUNT for XREADGROUP and for XAUTOCLAIM
     block-timeout: 1s      # must stay below spring.data.redis.timeout
     error-backoff: 1s
+    # Pending-entry recovery. Every reclaim-interval, before its next XREADGROUP, the
+    # consumer thread runs one XAUTOCLAIM and pushes up to batch-size entries that have
+    # been pending for at least reclaim-min-idle through the normal handler. An entry
+    # whose handling failed for a retryable reason therefore comes back within
+    # reclaim-interval + reclaim-min-idle of its last delivery. It keeps coming back
+    # until its age (now minus the timestamp in its stream ID) exceeds retry-budget;
+    # then it is dead-lettered.
+    #
+    # The events this service consumes are published by outbox relays that poll every
+    # 250ms and back off up to 30s after a failed publish (shared/pkg/outbox). Two
+    # events of one ride that travel through two relays can arrive up to that 30s
+    # apart in either order, so a retryable failure that only needs the other event to
+    # land first must survive at least that long. The budget is four times that.
+    reclaim-interval: 5s
+    # Longer than metroride.postgres.timeout-seconds, which bounds one handling attempt:
+    # a second replica of this service can then only claim an entry whose owner has
+    # actually stopped working on it, never one still inside its transaction.
+    reclaim-min-idle: 5s
+    retry-budget: 120s
 
 logging:
   structured:

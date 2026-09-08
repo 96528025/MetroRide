@@ -35,6 +35,7 @@ flowchart LR
     Dispatch -.->|after 3 failed attempts| DLQ[events.dead_letter]
     RA -->|consumer group| Fare[fare-service]
     Fare -->|processed event ids, one row per envelope| DB
+    Fare -.->|poison entry, or retries older than 120 s| DLQ
 ```
 
 `POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`.
