@@ -3,10 +3,9 @@ package com.metroride.fare.consumer;
 import com.metroride.fare.FareServiceApplication;
 import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.events.Envelope;
+import com.metroride.fare.consumer.FailureHandler.Disposition;
 import com.metroride.fare.events.EnvelopeCodec;
-import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.ledger.JournalEntry;
-import com.metroride.fare.pricing.FareQuoteException;
 import com.metroride.fare.processing.ProcessedEventRecorder;
 import com.metroride.fare.processing.ProcessedEventRecorder.Outcome;
 import com.metroride.fare.processing.ProcessedEventRecorder.Result;
@@ -28,10 +27,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -42,13 +40,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.spi.LoggingEventBuilder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.SmartLifecycle;
-import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.TransactionException;
 
 /**
  * Consumer-group reader for {@code events.ride.assignments}, structured like {@code consume()} in
@@ -58,18 +53,19 @@ import org.springframework.transaction.TransactionException;
  * <ol>
  *   <li>{@code XGROUP CREATE ... 0 MKSTREAM} at startup; an existing group is fine.</li>
  *   <li>Loop: every {@code reclaim-interval}, one
- *       {@code XAUTOCLAIM stream group consumer min-idle 0-0 COUNT n}; every claimed entry goes
- *       through {@link #handle} like a new one. Then
+ *       {@code XAUTOCLAIM stream group consumer min-idle <cursor> COUNT n}, where the cursor is
+ *       what the previous pass returned ({@code 0-0} to start over), so a long pending list is
+ *       walked in turn instead of its head being claimed again and again. Every claimed entry
+ *       goes through {@link #handle} like a new one. Then
  *       {@code XREADGROUP GROUP g c COUNT n BLOCK t STREAMS stream >}.</li>
  *   <li>Per entry: decode the envelope, record it (and for {@code ride_assigned}, quote the fare
  *       and append the ledger entry) in one PostgreSQL transaction, then {@code XACK}.</li>
- *   <li>Per failed entry: {@link FailureClass#of classify} the failure. A poison entry is
- *       dead-lettered at once. A retryable one is left pending for the next reclaim pass unless
- *       its {@link StreamEntryAge age} already exceeds {@code retry-budget}, in which case it is
- *       dead-lettered too. Dead-lettering is {@code XADD} to {@code events.dead_letter} first and
- *       {@code XACK} of the original entry only after Redis confirmed the {@code XADD}; when the
- *       {@code XADD} fails the entry stays pending and the next reclaim pass tries again, so a
- *       dead letter can be published twice. {@code original_event_id} is the key to deduplicate on.</li>
+ *   <li>Per failed entry: {@link FailureHandler} classifies the failure and disposes of the entry.
+ *       Poison is dead-lettered at once; retryable is left pending until its
+ *       {@code max-deliveries}-th delivery fails, then dead-lettered too; fatal leaves the entry
+ *       pending and halts this consumer ({@link ConsumerHalt}). Dead-lettering is {@code XADD}
+ *       first and {@code XACK} only after Redis confirmed it, so a dead letter can be published
+ *       twice; {@code original_event_id} is the key to deduplicate on.</li>
  * </ol>
  *
  * <p>Everything above runs on one thread over one dedicated Lettuce connection: the blocking read
@@ -78,22 +74,29 @@ import org.springframework.transaction.TransactionException;
  * concurrency model. The reclaim pass is in this class rather than on a scheduler for that reason.
  *
  * <p>Reclaim, acknowledgement and dead-lettering take the stream from the message itself
- * ({@link StreamMessage#getStream()}), so a second stream offset in the read can be added without
- * touching any of the three.
+ * ({@link StreamMessage#getStream()}), and the reclaim cursor is kept per stream, so a second
+ * stream offset in the read can be added without touching any of the three.
  */
 @Component
 public class RideAssignmentConsumer implements SmartLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(RideAssignmentConsumer.class);
 
-    /** Start of the {@code XAUTOCLAIM} scan: the whole pending entry list, every pass. */
-    private static final String RECLAIM_FROM_START = "0-0";
+    /** {@code XAUTOCLAIM} cursor meaning "from the head of the pending entry list"; also what it returns once a scan is complete. */
+    static final String RECLAIM_FROM_START = "0-0";
+
+    /** Delivery count Redis assigns to an entry on its first {@code XREADGROUP} delivery. */
+    private static final long FIRST_DELIVERY = 1;
+
+    /** Delivery count reported when the {@code XPENDING} lookup for a reclaimed entry failed. */
+    private static final long UNKNOWN_DELIVERY_COUNT = -1;
 
     private final ConsumerProperties properties;
     private final LettuceConnectionFactory connectionFactory;
     private final EnvelopeCodec codec;
     private final ProcessedEventRecorder recorder;
-    private final DeadLetterPublisher deadLetters;
+    private final FailureHandler failures;
+    private final ConsumerHalt halt;
     private final Clock clock;
     private final MeterRegistry meterRegistry;
     private final Duration shutdownTimeout;
@@ -101,10 +104,14 @@ public class RideAssignmentConsumer implements SmartLifecycle {
     private final Counter recordedEvents;
     private final Counter duplicateEvents;
     private final Counter quoteHolds;
-    private final Map<FareQuoteException.Reason, Counter> quoteFailures = new EnumMap<>(FareQuoteException.Reason.class);
     private final Counter consumeErrors;
     private final Counter redisErrors;
-    private final Counter postgresErrors;
+
+    /**
+     * Where the next {@code XAUTOCLAIM} of each stream starts. Written by the consumer thread only;
+     * concurrent so a test can read it.
+     */
+    private final Map<String, String> reclaimCursors = new ConcurrentHashMap<>();
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private ExecutorService executor;
@@ -116,7 +123,8 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             LettuceConnectionFactory connectionFactory,
             EnvelopeCodec codec,
             ProcessedEventRecorder recorder,
-            DeadLetterPublisher deadLetters,
+            FailureHandler failures,
+            ConsumerHalt halt,
             Clock clock,
             MeterRegistry meterRegistry,
             @Value("${spring.lifecycle.timeout-per-shutdown-phase}") Duration shutdownTimeout) {
@@ -124,7 +132,8 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         this.connectionFactory = connectionFactory;
         this.codec = codec;
         this.recorder = recorder;
-        this.deadLetters = deadLetters;
+        this.failures = failures;
+        this.halt = halt;
         this.clock = clock;
         this.meterRegistry = meterRegistry;
         this.shutdownTimeout = shutdownTimeout;
@@ -138,37 +147,17 @@ public class RideAssignmentConsumer implements SmartLifecycle {
                 "service", service, "stream", properties.stream(), "outcome", "duplicate");
         this.quoteHolds = meterRegistry.counter("metroride.fare.quotes",
                 "service", service, "kind", "quote_hold");
-        for (FareQuoteException.Reason reason : FareQuoteException.Reason.values()) {
-            quoteFailures.put(reason, meterRegistry.counter("metroride.fare.quote.failures",
-                    "service", service, "reason", reason.label()));
-        }
         this.consumeErrors = meterRegistry.counter("metroride.stream.consume.errors",
                 "service", service, "stream", properties.stream());
         this.redisErrors = meterRegistry.counter("metroride.dependency.errors",
                 "service", service, "dependency", "redis");
-        this.postgresErrors = meterRegistry.counter("metroride.dependency.errors",
-                "service", service, "dependency", "postgres");
-        // The per-stream series below are looked up by the message's own stream when they are
-        // incremented; registering them here for the configured stream only pins them at zero.
+        // Looked up by the message's own stream when incremented; registering it here for the
+        // configured stream only pins it at zero on /metrics.
         reclaimedEntries(properties.stream());
-        for (DeadLetterReason reason : DeadLetterReason.values()) {
-            deadLettered(properties.stream(), reason);
-        }
-        deadLetterPublishFailures(properties.stream());
     }
 
     private Counter reclaimedEntries(String stream) {
         return meterRegistry.counter("metroride.fare.events.reclaimed",
-                "service", FareServiceApplication.SERVICE_NAME, "stream", stream);
-    }
-
-    private Counter deadLettered(String stream, DeadLetterReason reason) {
-        return meterRegistry.counter("metroride.fare.dead_letters",
-                "service", FareServiceApplication.SERVICE_NAME, "stream", stream, "reason", reason.label());
-    }
-
-    private Counter deadLetterPublishFailures(String stream) {
-        return meterRegistry.counter("metroride.fare.dead_letter.publish.failures",
                 "service", FareServiceApplication.SERVICE_NAME, "stream", stream);
     }
 
@@ -185,6 +174,11 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             throw new IllegalStateException("metroride.consumer.block-timeout (" + properties.blockTimeout()
                     + ") must be shorter than spring.data.redis.timeout (" + commandTimeoutMillis
                     + "ms) or every blocking read would time out");
+        }
+        if (properties.maxDeliveries() < 2) {
+            running.set(false);
+            throw new IllegalStateException("metroride.consumer.max-deliveries (" + properties.maxDeliveries()
+                    + ") must be at least 2, or a retryable failure would be dead-lettered on its first delivery");
         }
 
         // Standalone Redis only, which is all the Go services support as well.
@@ -204,7 +198,7 @@ public class RideAssignmentConsumer implements SmartLifecycle {
                 .addKeyValue("consumer", properties.name())
                 .addKeyValue("reclaim_interval", properties.reclaimInterval().toString())
                 .addKeyValue("reclaim_min_idle", properties.reclaimMinIdle().toString())
-                .addKeyValue("retry_budget", properties.retryBudget().toString())
+                .addKeyValue("max_deliveries", properties.maxDeliveries())
                 .log("stream consumer started");
     }
 
@@ -262,10 +256,13 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         // is retried before any new entry is touched.
         Instant nextReclaim = clock.instant();
 
-        while (running.get()) {
+        while (running.get() && !halt.isHalted()) {
             if (!clock.instant().isBefore(nextReclaim)) {
                 reclaim(commands, consumer, newEntries.getName());
                 nextReclaim = clock.instant().plus(properties.reclaimInterval());
+                if (halt.isHalted()) {
+                    break;
+                }
             }
             List<StreamMessage<String, String>> messages;
             try {
@@ -291,34 +288,46 @@ public class RideAssignmentConsumer implements SmartLifecycle {
                 }
                 continue;
             }
-            // The whole batch is handled even if stop() was called meanwhile; see stop().
+            // The whole batch is handled even if stop() was called meanwhile; see stop(). A halt
+            // is different: the rest of the batch stays pending for the next start to reclaim.
             for (StreamMessage<String, String> message : messages) {
-                handleGuarded(commands, message);
+                if (!handleGuarded(commands, message, FIRST_DELIVERY)) {
+                    break;
+                }
             }
+        }
+        if (halt.isHalted()) {
+            log.atError().addKeyValue("reason", halt.reason().orElse(""))
+                    .log("stream consumer halted; pending entries wait for a restart");
         }
         log.info("stream consumer loop exited");
     }
 
     /**
      * One {@code XAUTOCLAIM} over the group's pending entry list for {@code stream}, then the
-     * claimed entries through the normal handler. Claiming resets an entry's idle time, so an
-     * entry that fails again waits another {@code reclaim-min-idle} before the next pass sees it.
-     * A pass claims at most {@code batch-size} entries; a longer backlog drains one batch per
-     * interval.
+     * claimed entries through the normal handler. The scan starts at the cursor the previous pass
+     * returned and the cursor is saved whatever the pass claimed, even nothing: Redis scans at most
+     * ten times {@code COUNT} entries per call and returns {@code 0-0} only when it reached the end
+     * of the list, so restarting at the head each time would claim the same failing entries
+     * forever and never reach the ones behind them. Claiming resets an entry's idle time, so an
+     * entry that fails again waits another {@code reclaim-min-idle} before a pass can take it.
      */
     private void reclaim(RedisCommands<String, String> commands, Consumer<String> consumer, String stream) {
+        String cursor = reclaimCursors.getOrDefault(stream, RECLAIM_FROM_START);
         List<StreamMessage<String, String>> claimed;
         try {
-            claimed = commands.xautoclaim(stream, XAutoClaimArgs.Builder
-                    .xautoclaim(consumer, properties.reclaimMinIdle(), RECLAIM_FROM_START)
-                    .count(properties.batchSize()))
-                    .getMessages();
+            var result = commands.xautoclaim(stream, XAutoClaimArgs.Builder
+                    .xautoclaim(consumer, properties.reclaimMinIdle(), cursor)
+                    .count(properties.batchSize()));
+            reclaimCursors.put(stream, result.getId() == null ? RECLAIM_FROM_START : result.getId());
+            claimed = result.getMessages();
         } catch (RedisException e) {
             if (!running.get()) {
                 return;
             }
             redisErrors.increment();
-            log.atError().addKeyValue("stream", stream).setCause(e).log("reclaim pending entries failed");
+            log.atError().addKeyValue("stream", stream).addKeyValue("cursor", cursor).setCause(e)
+                    .log("reclaim pending entries failed");
             return;
         }
         if (claimed.isEmpty()) {
@@ -334,21 +343,30 @@ public class RideAssignmentConsumer implements SmartLifecycle {
                         .log("pending entry no longer in stream; dropped by XAUTOCLAIM");
                 continue;
             }
+            long deliveryCount = deliveryCounts.getOrDefault(message.getId(), UNKNOWN_DELIVERY_COUNT);
             reclaimedEntries(stream).increment();
             log.atInfo()
                     .addKeyValue("stream", stream)
                     .addKeyValue("message_id", message.getId())
-                    .addKeyValue("age_seconds", ageSeconds(message.getId(), now))
-                    .addKeyValue("delivery_count", deliveryCounts.getOrDefault(message.getId(), -1L))
+                    .addKeyValue("age_seconds", FailureHandler.ageSeconds(message.getId(), now))
+                    .addKeyValue("delivery_count", deliveryCount)
                     .log("pending entry reclaimed");
-            handleGuarded(commands, message);
+            if (!handleGuarded(commands, message, deliveryCount)) {
+                return;
+            }
         }
+    }
+
+    /** Where the next reclaim pass of {@code stream} starts; for tests. */
+    String reclaimCursor(String stream) {
+        return reclaimCursors.getOrDefault(stream, RECLAIM_FROM_START);
     }
 
     /**
      * {@code XAUTOCLAIM} returns the entries but not their delivery counts, so one {@code XPENDING}
-     * over the claimed ID range fetches them. They are logged, never used for a decision, so a
-     * failed or partial lookup only costs the log field (reported as {@code -1}).
+     * over the claimed ID range fetches them. The count decides when a retryable entry has had its
+     * {@code max-deliveries}; an entry whose count could not be fetched is reported as {@code -1}
+     * and is left pending on failure rather than dead-lettered on a guess.
      */
     private Map<String, Long> deliveryCounts(
             RedisCommands<String, String> commands,
@@ -367,9 +385,10 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         }
     }
 
-    private void handleGuarded(RedisCommands<String, String> commands, StreamMessage<String, String> message) {
+    /** @return whether the loop may go on; {@code false} once the consumer has halted */
+    private boolean handleGuarded(RedisCommands<String, String> commands, StreamMessage<String, String> message, long deliveryCount) {
         try {
-            handle(commands, message);
+            return handle(commands, message, deliveryCount);
         } catch (RuntimeException e) {
             // handle() classifies every failure of the work itself. Anything that escapes comes from
             // the failure handling (a bug), and must not end this thread silently while isRunning()
@@ -377,18 +396,18 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             consumeErrors.increment();
             log.atError().addKeyValue("message_id", message.getId()).setCause(e)
                     .log("unexpected failure handling ride assignment event; entry left pending");
+            return true;
         }
     }
 
-    private void handle(RedisCommands<String, String> commands, StreamMessage<String, String> message) {
+    private boolean handle(RedisCommands<String, String> commands, StreamMessage<String, String> message, long deliveryCount) {
         Envelope envelope = null;
         Result result;
         try {
             envelope = codec.decode(message.getId(), message.getBody());
             result = recorder.record(message.getStream(), envelope);
         } catch (RuntimeException e) {
-            onFailure(commands, message, envelope, e);
-            return;
+            return failures.onFailure(commands, message, envelope, e, deliveryCount) != Disposition.HALT;
         }
 
         Outcome outcome = result.outcome();
@@ -416,112 +435,8 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         // Acknowledge only after the transaction above has committed. A failed ack is logged and
         // the entry stays pending; its reclaimed delivery hits the conflict clause and acks as a
         // duplicate.
-        acknowledge(commands, message);
-    }
-
-    /**
-     * The transaction has rolled back (or never started), so nothing of this entry is recorded.
-     * {@code envelope} is {@code null} when decoding is what failed.
-     */
-    private void onFailure(
-            RedisCommands<String, String> commands,
-            StreamMessage<String, String> message,
-            Envelope envelope,
-            RuntimeException failure) {
-        count(failure);
-        FailureClass failureClass = FailureClass.of(failure);
-        LoggingEventBuilder entry = log.atError()
-                .addKeyValue("message_id", message.getId())
-                .addKeyValue("failure_class", failureClass.name().toLowerCase())
-                .setCause(failure);
-        if (envelope != null) {
-            entry = entry.addKeyValue("event_id", envelope.id())
-                    .addKeyValue("event_type", envelope.type())
-                    .addKeyValue("ride_id", envelope.correlationId());
-        }
-        switch (failureClass) {
-            case POISON -> {
-                entry.log("handle event failed; dead-lettering poison entry");
-                deadLetter(commands, message, envelope, failure, DeadLetterReason.POISON);
-            }
-            case RETRYABLE -> {
-                Instant now = clock.instant();
-                Optional<Duration> age = StreamEntryAge.of(message.getId(), now);
-                boolean exhausted = age.map(a -> a.compareTo(properties.retryBudget()) > 0).orElse(false);
-                entry = entry.addKeyValue("age_seconds", ageSeconds(message.getId(), now))
-                        .addKeyValue("retry_budget", properties.retryBudget().toString());
-                if (exhausted) {
-                    entry.log("handle event failed; retry budget exhausted, dead-lettering entry");
-                    deadLetter(commands, message, envelope, failure, DeadLetterReason.RETRY_BUDGET_EXHAUSTED);
-                } else {
-                    entry.log("handle event failed; entry left pending for the next reclaim pass");
-                }
-            }
-        }
-    }
-
-    private void count(RuntimeException failure) {
-        if (failure instanceof FareQuoteException quote) {
-            quoteFailures.get(quote.reason()).increment();
-        } else if (failure instanceof DataAccessException || failure instanceof TransactionException) {
-            postgresErrors.increment();
-        } else {
-            // EnvelopeDecodeException, and anything unforeseen.
-            consumeErrors.increment();
-        }
-    }
-
-    /**
-     * Dead letter first, acknowledge second. If the {@code XADD} is not confirmed the entry stays
-     * pending and is dead-lettered again on a later pass; if the {@code XACK} fails after a
-     * confirmed {@code XADD} the same happens and the dead letter is duplicated. Both are preferable
-     * to acknowledging an entry whose dead letter never landed.
-     */
-    private void deadLetter(
-            RedisCommands<String, String> commands,
-            StreamMessage<String, String> message,
-            Envelope envelope,
-            RuntimeException cause,
-            DeadLetterReason reason) {
-        String stream = message.getStream();
-        String originalEventId = envelope == null ? message.getId() : envelope.id();
-        if (!deadLetters.publish(commands, message, envelope, cause)) {
-            deadLetterPublishFailures(stream).increment();
-            redisErrors.increment();
-            log.atError()
-                    .addKeyValue("stream", stream)
-                    .addKeyValue("message_id", message.getId())
-                    .addKeyValue("original_event_id", originalEventId)
-                    .addKeyValue("reason", reason.label())
-                    .log("dead letter not published; entry left pending for the next reclaim pass");
-            return;
-        }
-        deadLettered(stream, reason).increment();
-        log.atWarn()
-                .addKeyValue("stream", stream)
-                .addKeyValue("message_id", message.getId())
-                .addKeyValue("original_event_id", originalEventId)
-                .addKeyValue("reason", reason.label())
-                .log("entry dead-lettered");
-        acknowledge(commands, message);
-    }
-
-    private void acknowledge(RedisCommands<String, String> commands, StreamMessage<String, String> message) {
-        try {
-            commands.xack(message.getStream(), properties.group(), message.getId());
-        } catch (RedisException e) {
-            redisErrors.increment();
-            log.atError()
-                    .addKeyValue("stream", message.getStream())
-                    .addKeyValue("message_id", message.getId())
-                    .setCause(e)
-                    .log("ack ride assignment event failed; entry left pending");
-        }
-    }
-
-    /** Whole seconds for the log; {@code -1} when the ID carries no timestamp. */
-    private static long ageSeconds(String messageId, Instant now) {
-        return StreamEntryAge.of(messageId, now).map(Duration::toSeconds).orElse(-1L);
+        failures.acknowledge(commands, message);
+        return true;
     }
 
     private boolean pause(Duration duration) {

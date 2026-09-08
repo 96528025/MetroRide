@@ -1,5 +1,6 @@
 package com.metroride.fare.web;
 
+import com.metroride.fare.consumer.ConsumerHalt;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import javax.sql.DataSource;
@@ -24,11 +25,13 @@ import org.springframework.web.bind.annotation.RestController;
  * <pre>
  *   GET /healthz  200 {"status":"ok"}
  *   GET /readyz   200 {"status":"ready"}
- *                 503 {"status":"not_ready","failures":{"postgres":"...","redis":"..."}}
+ *                 503 {"status":"not_ready","failures":{"postgres":"...","redis":"...","consumer":"..."}}
  * </pre>
  *
  * Readiness really talks to both dependencies; the checks are the actuator indicators, wired
- * explicitly so the names match the Go services' {@code postgres} and {@code redis} keys.
+ * explicitly so the names match the Go services' {@code postgres} and {@code redis} keys. The
+ * third key, {@code consumer}, has no Go counterpart: it fails once the stream consumer has halted
+ * on a fatal failure (see {@link ConsumerHalt}), with the reason as the message.
  */
 @RestController
 public class HealthController {
@@ -38,10 +41,12 @@ public class HealthController {
     private final Map<String, HealthIndicator> readinessChecks;
 
     @Autowired
-    public HealthController(DataSource dataSource, RedisConnectionFactory redisConnectionFactory) {
+    public HealthController(
+            DataSource dataSource, RedisConnectionFactory redisConnectionFactory, ConsumerHalt consumerHalt) {
         Map<String, HealthIndicator> checks = new LinkedHashMap<>();
         checks.put("postgres", new DataSourceHealthIndicator(dataSource));
         checks.put("redis", new RedisHealthIndicator(redisConnectionFactory));
+        checks.put("consumer", consumerHalt);
         this.readinessChecks = checks;
     }
 

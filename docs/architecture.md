@@ -56,7 +56,7 @@ Event types that are emitted today:
 - `driver_location_updated` (driver-service, direct `XADD`)
 - `ride_assigned` (dispatch-service, via the outbox, to both the assignments and notifications streams)
 - `traffic_updated` (traffic-service, direct `XADD`)
-- `dead_lettered` (dispatch-service, after retries are exhausted; direct `XADD`, not via the outbox, retried three times; if all publish attempts fail, no dead-letter record is persisted and the source message remains unacknowledged in the consumer group's pending list. Also fare-service, for an entry it cannot decode or quote, or one whose PostgreSQL write kept failing for longer than its 120s retry budget; same envelope and payload shape, one `XADD` attempt per delivery, and the source entry is reclaimed and tried again if that `XADD` fails)
+- `dead_lettered` (dispatch-service, after retries are exhausted; direct `XADD`, not via the outbox, retried three times; if all publish attempts fail, no dead-letter record is persisted and the source message remains unacknowledged in the consumer group's pending list. Also fare-service, for an entry it cannot decode or quote, or one whose PostgreSQL write failed on 25 deliveries; same envelope and payload shape, one `XADD` attempt per delivery, and the source entry is reclaimed and tried again if that `XADD` fails)
 
 `ride_completed` and `notification_created` are defined as constants but nothing publishes them yet.
 
@@ -91,13 +91,13 @@ Kafka is the natural next transport when the system requires stronger partitioni
 
 MetroRide includes foundational production hooks:
 
-- Consumer groups keep unacknowledged dispatch or notification work pending rather than dropping it; the current workers do not yet reclaim abandoned pending entries.
+- Consumer groups keep unacknowledged dispatch or notification work pending rather than dropping it; the Go workers do not yet reclaim abandoned pending entries. `fare-service` reclaims its own with `XAUTOCLAIM` (see `docs/reliability.md`).
 - PostgreSQL is the authoritative store for ride status and assignment state.
 - Services expose `/healthz` and `/readyz` for orchestration and load balancer integration.
 - Structured logs include service names and workflow identifiers for cross-service debugging.
 - Docker Compose health checks gate Redis and PostgreSQL readiness before dependent services start.
 
-Dispatch uses bounded retries, an idempotent PostgreSQL state transition, a transactional outbox, and `events.dead_letter` for retry-exhausted failures. Automated outage tests validate both routing dead-letter behavior and Redis recovery without event loss. Next resilience steps include dead-letter replay tooling, abandoned pending-message claiming, circuit breakers around routing calls, and stream lag alerting.
+Dispatch uses bounded retries, an idempotent PostgreSQL state transition, a transactional outbox, and `events.dead_letter` for retry-exhausted failures. Automated outage tests validate both routing dead-letter behavior and Redis recovery without event loss. Next resilience steps include dead-letter replay tooling, abandoned pending-message claiming in the Go consumers (`fare-service` already claims its own), circuit breakers around routing calls, and stream lag alerting.
 
 ## Scalability Considerations
 

@@ -21,8 +21,9 @@ list or written to `events.dead_letter`; see "Failure handling and pending-entry
 | Ledger storage | `ledger/LedgerRepository` | Insert-only `JdbcClient` access to `fare.journal_entries` and `fare.postings`; reads rebuild entries through the constructor |
 | Idempotency record | `processing/ProcessedEvent`, `ProcessedEventRepository`, `ProcessedEventRecorder` | `insert ... on conflict (event_id) do nothing`, then the quote and ledger entry, in one transaction |
 | Consumer loop | `consumer/RideAssignmentConsumer` | `XGROUP CREATE ... 0 MKSTREAM` on start, then on one dedicated thread and connection: `XAUTOCLAIM` every `reclaim-interval`, `XREADGROUP ... >`, `XACK` after commit or after a confirmed dead letter |
-| Failure classes | `consumer/FailureClass` | Pure mapping from the exception `handle()` saw to `RETRYABLE` or `POISON`; the only place that decision is made |
-| Entry age | `consumer/StreamEntryAge` | Age of an entry from the millisecond timestamp in its stream ID; the input to the retry budget |
+| Failure classes | `consumer/FailureClass` | Pure mapping from the exception `handle()` saw to `RETRYABLE`, `POISON` or `FATAL`; the only place that decision is made |
+| Failure handling | `consumer/FailureHandler`, `consumer/ConsumerHalt` | Leaves the entry pending, dead-letters it, or halts the consumer; owns the one `XACK` in the service; the halt fails `/readyz` |
+| Entry age | `consumer/StreamEntryAge` | Age of an entry from the millisecond timestamp in its stream ID; logged, never decided on |
 | Dead letters | `consumer/DeadLetterPublisher`, `events/DeadLetter` | `XADD` to `events.dead_letter` in the shape `publishDeadLetter` in dispatch-service writes; `DeadLetter` mirrors `events.DeadLetter` in `events.go` |
 | Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables are checked by the integration tests |
 | Endpoints | `web/HealthController`, `web/MetricsController`, `web/LedgerController` | `/healthz`, `/readyz`, `/metrics` with the same paths and JSON as `shared/pkg/httpx/httpx.go`; `GET /v1/rides/{ride_id}/ledger` |
@@ -55,41 +56,54 @@ because one completion event will later produce both a `hold_reversal` and a `se
 
 ### Failure handling and pending-entry recovery
 
-Every failure of step 1 or 2 is mapped by `FailureClass.of` to one of two classes:
+Every failure of step 1 or 2 is mapped by `FailureClass.of` to one of three classes:
 
 | Class | Exceptions | What happens to the entry |
 | --- | --- | --- |
-| `POISON` | `EnvelopeDecodeException` (the entry is not an envelope), `FareQuoteException` (the payload cannot be quoted), anything not listed below | Dead-lettered immediately, then acknowledged |
-| `RETRYABLE` | `DataAccessException`, `TransactionException` (every PostgreSQL failure: cancelled lock wait, lost connection, failed commit) | Left in the pending list and delivered again by the reclaim pass; dead-lettered once its age exceeds `retry-budget` |
+| `POISON` | `EnvelopeDecodeException` (the entry is not an envelope), `FareQuoteException` (the payload cannot be quoted) | Dead-lettered immediately, then acknowledged |
+| `FATAL` | `InvalidDataAccessResourceUsageException` (bad SQL, wrong column type), `InvalidDataAccessApiUsageException` (a repository was misused, or a constructor threw inside one), `DataIntegrityViolationException` (a constraint the writer cannot reach unless the schema or the data is already wrong) | Left pending; the consumer halts and `/readyz` fails with the reason until the deployment is fixed and the service restarted |
+| `RETRYABLE` | Every other `DataAccessException` (cancelled lock wait, lost connection, deadlock), every `TransactionException`, and anything unforeseen | Left pending and delivered again by the reclaim pass; dead-lettered when its `max-deliveries`-th delivery fails |
 
-Exceptions of any other type are programming errors (all PostgreSQL access goes through Spring's
-exception translation, so nothing transient arrives under another type) and are treated as poison
-so they surface at once instead of after two minutes of identical failures.
+Spring's own transient/non-transient split is not used because it files a refused connection under
+non-transient. An unforeseen exception is retried rather than dead-lettered on sight: it is most
+likely a bug, but a bounded number of deliveries costs little and keeps the work for a fix to
+recover. A fatal failure is neither retried nor dead-lettered because it is not the entry's: every
+entry would fail the same way, and dead-lettering them one by one would empty the stream into
+`events.dead_letter` after a bad deploy.
 
-**Reclaim pass.** The consumer thread runs `XAUTOCLAIM <stream> <group> <consumer> <min-idle> 0-0
-COUNT <batch-size>` before its next `XREADGROUP` whenever `reclaim-interval` has elapsed, and the
-first time before it reads anything. Every claimed entry goes through the same `handle()` as a new
-one, on the same thread, so the recorder's single-writer model is unchanged and no scheduler or
-second thread exists. Claiming resets the entry's idle time, so an entry that fails again waits
-another `reclaim-min-idle` before the next pass sees it: a retryable failure is retried within
-`reclaim-interval + reclaim-min-idle` of its previous delivery, 10s with the defaults. A pass
-claims at most `batch-size` entries; a longer backlog drains one batch per interval. The delivery
-count of a reclaimed entry is fetched with one `XPENDING` over the claimed range and logged
-(`delivery_count`, next to `message_id` and `age_seconds`); it takes part in no decision.
+**Reclaim pass.** The consumer thread runs `XAUTOCLAIM <stream> <group> <consumer> <min-idle>
+<cursor> COUNT <batch-size>` before its next `XREADGROUP` whenever `reclaim-interval` has elapsed,
+and the first time before it reads anything. Every claimed entry goes through the same `handle()`
+as a new one, on the same thread, so the recorder's single-writer model is unchanged and no
+scheduler or second thread exists. The cursor is the ID Redis returned from the previous pass,
+saved even when that pass claimed nothing; `0-0` means the previous scan reached the end of the
+pending list and this one starts over. Redis scans at most ten times `COUNT` entries per call, so a
+pass that always restarted at the head would claim the same failing entries every time and never
+reach the ones behind them; with the cursor a long pending list is walked in turn. Claiming resets
+an entry's idle time, so an entry that fails again waits another `reclaim-min-idle` before a pass
+can take it: while the pending list is short, a retryable failure is retried within
+`reclaim-interval + reclaim-min-idle` of its previous delivery, 10s with the defaults. The
+delivery count of a reclaimed entry is fetched with one `XPENDING` over the claimed range; the age
+from the stream ID is logged next to it (`message_id`, `age_seconds`, `delivery_count`).
 
-**Retry budget by age, not by count.** An entry's age is now minus the millisecond timestamp in
-its stream ID, which records the producer's `XADD`. A retryable failure of an entry older than
-`retry-budget` (120s) is dead-lettered; a younger one is left pending. The budget is time because
-the failure it exists for is a matter of time: the assignment and the completion of one ride will
-arrive on two streams from two outbox relays that poll every 250ms and back off up to 30s after a
-failed publish (`shared/pkg/outbox`), so a completion can precede its assignment by up to that long
-under normal operation, and "no hold for this ride yet" is then a retryable failure that clears
-itself when the assignment lands. A delivery-count cap cannot express that: with a fixed reclaim
-interval, a cap of N means "give up after about N × 10s" only while nothing else is pending, and
-an early-arriving completion would be dead-lettered before its assignment had even been published.
-120s is four times the relay's maximum backoff. The age counts from `XADD`, not from first delivery
-(Redis keeps no first-delivery time), so entries that failed throughout a PostgreSQL outage longer
-than the budget end up in the dead-letter stream and are replayed by hand.
+**Delivery cap, not age.** A retryable failure on an entry's `max-deliveries`-th delivery
+(25) dead-letters it. Redis keeps the delivery count in the pending entry list, so it survives a
+restart of this service, and it only redelivers an entry idle for at least `reclaim-min-idle`, so
+25 deliveries guarantee at least 24 × 5s = 120s of retrying counted from the first delivery,
+however old the entry already was when the service first saw it and however long the service was
+down before that. Under load the window is longer, never shorter. The guarantee is what the next
+failure mode needs: the assignment and the completion of one ride will arrive on two streams from
+two outbox relays that poll every 250ms and back off up to 30s after a failed publish
+(`shared/pkg/outbox`), so a completion can precede its assignment by up to that long under normal
+operation, and "no hold for this ride yet" is then a retryable failure that clears itself when the
+assignment lands. 120s is four times the relay's maximum backoff. The age of the entry, now minus
+the timestamp in its stream ID, is deliberately not the input: it counts time the service may have
+spent stopped, so after a restart it would dead-letter the whole backlog on its first hiccup, which
+is precisely the backlog a restart exists to work through. Age is kept in the logs for diagnosis.
+
+A PostgreSQL outage longer than the window still ends with entries in `events.dead_letter`
+(deliveries accumulate while the database is away), replayed by hand. Pausing the consumer while
+the database is unreachable is a possible later step; it is not attempted here.
 
 **Dead letter first, acknowledge second.** A dead letter is one `XADD` to `events.dead_letter` on
 the consumer's connection; only after Redis confirms it is the original entry `XACK`ed. If the
@@ -97,7 +111,8 @@ the consumer's connection; only after Redis confirms it is the original entry `X
 fails after a confirmed `XADD` the same happens. Both produce a duplicate dead letter, which is
 accepted: acknowledging an entry whose dead letter never landed would lose the record entirely,
 while a duplicate can be dropped by whoever reads the stream. `payload.original_event_id` is the
-key to deduplicate on.
+key to deduplicate on. The success path and the dead-letter path share the single `XACK` in
+`FailureHandler.acknowledge`.
 
 The dead letter is the envelope dispatch-service writes, field for field: a new UUID as `id`,
 `type` `dead_lettered`, `source` `fare-service`, `correlation_id` the ride ID, `occurred_at` in UTC,
@@ -105,6 +120,12 @@ and a payload with `original_event_id`, `original_event_type`, `ride_id` (omitte
 `error`, `service` (`fare-service`) and `failed_at` (RFC 3339 with fractional seconds). An entry that
 is not a decodable envelope is dead-lettered under its stream message ID with type `decode_failed`.
 The contract is pinned by `DeadLetterPublisherTest` against the tag names in `events.go`.
+
+**Halt.** On a fatal failure the consumer thread logs the entry and the exception, records the
+reason in `ConsumerHalt`, and leaves its loop; the rest of the batch and everything else pending
+stay in the pending list. `/readyz` answers 503 with `{"consumer": "<reason>"}` and
+`metroride_fare_consumer_halted` reads 1. Nothing clears a halt at runtime: fix the deployment and
+restart, and the first reclaim pass of the new process picks the entries up.
 
 What is true after this:
 
@@ -182,7 +203,7 @@ batch size and block timeout:
 | --- | --- | --- |
 | `reclaim-interval` | `5s` | How often the consumer thread runs one `XAUTOCLAIM` before its next read |
 | `reclaim-min-idle` | `5s` | How long an entry must have gone without a delivery before that `XAUTOCLAIM` takes it; longer than `metroride.postgres.timeout-seconds` |
-| `retry-budget` | `120s` | How old an entry may be, by its stream ID, and still be retried after a retryable failure; four times the outbox relay's 30s maximum backoff |
+| `max-deliveries` | `25` | A retryable failure on this delivery dead-letters the entry; with `reclaim-min-idle` 5s this guarantees at least 120s of retrying since the first delivery, four times the outbox relay's 30s maximum backoff |
 
 The rate card lives in `application.yml` under `metroride.fare`, not in the environment:
 
@@ -201,8 +222,9 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | `metroride_fare_quotes_total` | `service`, `kind=quote_hold` | Journal entries written, counted after the commit |
 | `metroride_fare_quote_failures_total` | `service`, `reason=payload\|calculation` | `ride_assigned` envelopes whose payload did not decode or whose figures the calculator rejected; the transaction rolled back and the entry is dead-lettered as poison |
 | `metroride_fare_events_reclaimed_total` | `service`, `stream` | Pending entries delivered again by the reclaim pass |
-| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|retry_budget_exhausted` | Entries written to `events.dead_letter` and acknowledged; counted after Redis confirmed the `XADD` |
+| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|retry_budget_exhausted` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK` |
 | `metroride_fare_dead_letter_publish_failures_total` | `service`, `stream` | Dead-letter `XADD`s Redis did not confirm; the entry stayed pending |
+| `metroride_fare_consumer_halted` | `service` | Gauge, 1 once the consumer has stopped on a fatal failure |
 | `metroride_stream_consume_errors_total` | `service`, `stream` | Failed reads and undecodable entries (same name as the Go shared counter) |
 | `metroride_dependency_errors_total` | `service`, `dependency=postgres\|redis` | Failed dependency calls (same name as the Go shared counter) |
 
@@ -233,24 +255,33 @@ a redelivery adds nothing; two threads recording the same event concurrently pro
 a journal insert blocked until the timeout rolls back the event row with it and the reclaimed
 delivery writes both once the lock is gone; the ledger endpoint returns the Go-style JSON.
 
-Pending-entry recovery has its own tests. `FailureClassTest`, `StreamEntryAgeTest` and
-`DeadLetterPublisherTest` are unit tests: one case per branch of the class mapping, the age from
-a stream ID (with and without the `-<seq>` suffix, from the future, and IDs with no timestamp),
-and the dead-letter JSON checked name by name against the tags in `events.go`.
-`PendingEntryRecoveryIT` sends a `ride_assigned` with a negative distance and an entry whose
-`event` field is not JSON, and asserts the dead letter's content, the acknowledgement, the empty
-pending list and the untouched tables. The lock-wait tests in `RideAssignmentConsumerIT` and
-`QuoteLedgerIT` assert that the entry is reclaimed and recorded within
-`reclaim-interval + reclaim-min-idle` of the lock being released; nothing acknowledges by hand any
-more. `RetryBudgetIT` holds the lock for good with the budget shrunk to 3s (its own Spring context
-on the same containers, reading its own stream so it does not compete with the other tests'
-consumer) and asserts the entry is dead-lettered with `reason=retry_budget_exhausted` and
-acknowledged.
+Pending-entry recovery has its own tests. Unit: `FailureClassTest` (one case per branch of the
+class mapping, including the subclasses the consumer really sees), `StreamEntryAgeTest` (the age
+from a stream ID, with and without the `-<seq>` suffix, from the future, and IDs with no
+timestamp), `DeadLetterPublisherTest` (the dead-letter JSON checked name by name against the tags
+in `events.go`), and `FailureHandlerTest`, which proves the guarantees against a mocked Redis
+because no integration test can arrange them: no `XACK` unless the dead-letter `XADD` was
+confirmed, `XACK` only after the `XADD`, a failed `XACK` leaves the entry pending with the dead
+letter already counted, a retryable failure is left pending below the cap and dead-lettered at it,
+and a fatal failure neither acknowledges nor dead-letters and halts the consumer.
 
-Not automated: the dead-letter `XADD` failing while the rest of the consumer keeps working. With
-one connection to one Redis, the only way to make that `XADD` fail is to take Redis away, and then
-the read loop stops too, so there is no state in which the publish-failure branch runs on its own.
-The branch is four lines (count, log, return without acknowledging) and is read, not tested.
+Integration, all on the containers from `IntegrationTestSupport`. `PendingEntryRecoveryIT` sends
+a `ride_assigned` with a negative distance and an entry whose `event` field is not JSON, and
+asserts the dead letter's content, the acknowledgement, the empty pending list and the untouched
+tables. The lock-wait tests in `RideAssignmentConsumerIT` and `QuoteLedgerIT` assert that the
+entry is reclaimed and recorded within `reclaim-interval + reclaim-min-idle` of the lock being
+released; nothing acknowledges by hand any more. Three classes run a consumer of their own (a
+`@TestPropertySource` context on the same containers, each reading its own stream so it never
+competes with the shared context's consumer): `DeliveryCapIT` holds the lock for good with
+`max-deliveries` 3 and asserts the entry is dead-lettered on its third delivery with
+`reason=retry_budget_exhausted` and acknowledged; `OldEntryRecoveryIT` publishes an entry with a
+stream ID from 2001, fails it once, and asserts it is retried and recorded rather than
+dead-lettered for its age; `ReclaimCursorIT` keeps two entries failing with `batch-size` 2 and
+asserts the third, behind them, is still reclaimed and recorded.
+
+Not automated: a fatal failure end to end. Producing one against the real schema means breaking
+the schema for every other test in the JVM; the halt is covered by `FailureHandlerTest` and its
+readiness effect by `HealthControllerTest`.
 
 ## Run in Compose
 
@@ -320,4 +351,6 @@ curl -s localhost:8087/v1/rides/<ride uuid>/ledger                              
 - No consumer of `events.dead_letter` and no replay tool: a dead-lettered entry is inspected
   and replayed by hand (the original entry is still in its stream, acknowledged but not deleted).
 - No deduplication of dead letters; `original_event_id` is the key for whoever adds it.
+- No pause while PostgreSQL is unreachable: deliveries keep accumulating during an outage, so
+  one longer than the retry window ends with entries in the dead-letter stream.
 - No Helm chart entry. Compose is the only runtime for this service so far.

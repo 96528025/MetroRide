@@ -4,7 +4,7 @@ package com.metroride.fare.consumer;
 public enum DeadLetterReason {
     /** The entry was {@link FailureClass#POISON}: dead-lettered on its first failure. */
     POISON("poison"),
-    /** The entry was {@link FailureClass#RETRYABLE} but older than {@code metroride.consumer.retry-budget}. */
+    /** The entry was {@link FailureClass#RETRYABLE} and failed on its {@code max-deliveries}-th delivery. */
     RETRY_BUDGET_EXHAUSTED("retry_budget_exhausted");
 
     private final String label;

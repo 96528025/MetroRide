@@ -35,7 +35,7 @@ flowchart LR
     Dispatch -.->|after 3 failed attempts| DLQ[events.dead_letter]
     RA -->|consumer group| Fare[fare-service]
     Fare -->|processed event ids, one row per envelope| DB
-    Fare -.->|poison entry, or retries older than 120 s| DLQ
+    Fare -.->|poison entry, or 25 failed deliveries| DLQ
 ```
 
 `POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`.
@@ -134,7 +134,7 @@ The Helm chart (`infrastructure/helm/metro-ride`) packages the six core services
 ## Limitations
 
 - Outbox delivery is at-least-once with no attempt ceiling and no outbox dead-letter path; the relay holds row locks while publishing.
-- Stream consumers do not reclaim pending entries after a crash; dead-letter replay tooling does not exist.
+- The Go stream consumers do not reclaim pending entries after a crash; `fare-service` reclaims its own with `XAUTOCLAIM` and dead-letters after 25 failed deliveries. Dead-letter replay tooling does not exist.
 - Routing state is process-local. CI runs one routing replica; the chart's untested defaults set two, which this design does not support without partitioned or shared driver state.
 - Routing seeds three static placeholder drivers at startup in addition to the four simulated ones; availability is never reserved on assignment; traffic events are produced but unused; notifications are a log line and a counter.
 - Distance is Haversine, not road routing. There is a 10,000-driver in-process benchmark and no load test.

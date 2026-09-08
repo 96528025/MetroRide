@@ -28,20 +28,20 @@ import org.springframework.test.context.TestPropertySource;
 /**
  * A retryable failure that never clears: another session keeps the event row locked for the whole
  * test, so every delivery is cancelled by the transaction timeout. The entry must be reclaimed and
- * retried while it is younger than {@code retry-budget}, then dead-lettered with
+ * retried until its {@code max-deliveries}-th delivery fails, then dead-lettered with
  * {@code reason=retry_budget_exhausted} and acknowledged.
  *
- * <p>The budget is shrunk to seconds through {@link TestPropertySource}, which gives this class its
- * own Spring context and therefore its own consumer, on the same containers. That consumer reads
- * its own stream so it never competes with the cached context's consumer for the other tests'
- * entries and their per-context metrics.
+ * <p>The cap is shrunk through {@link TestPropertySource}, which gives this class its own Spring
+ * context and therefore its own consumer, on the same containers. That consumer reads its own
+ * stream so it never competes with the cached context's consumer for the other tests' entries and
+ * their per-context metrics.
  */
 @TestPropertySource(properties = {
-        "metroride.consumer.stream=events.ride.assignments.retry-budget-test",
+        "metroride.consumer.stream=events.ride.assignments.delivery-cap-test",
         "metroride.consumer.reclaim-interval=1s",
         "metroride.consumer.reclaim-min-idle=1s",
-        "metroride.consumer.retry-budget=3s"})
-class RetryBudgetIT extends IntegrationTestSupport {
+        "metroride.consumer.max-deliveries=3"})
+class DeliveryCapIT extends IntegrationTestSupport {
 
     @Autowired
     StringRedisTemplate redisTemplate;
@@ -59,9 +59,9 @@ class RetryBudgetIT extends IntegrationTestSupport {
     MeterRegistry meterRegistry;
 
     @Test
-    void anEntryThatKeepsFailingIsDeadLetteredOnceOlderThanTheBudgetThenAcknowledged() throws Exception {
-        assertThat(consumer.stream()).isEqualTo("events.ride.assignments.retry-budget-test");
-        assertThat(consumer.retryBudget()).isEqualTo(Duration.ofSeconds(3));
+    void anEntryThatKeepsFailingIsDeadLetteredOnItsThirdDeliveryThenAcknowledged() throws Exception {
+        assertThat(consumer.stream()).isEqualTo("events.ride.assignments.delivery-cap-test");
+        assertThat(consumer.maxDeliveries()).isEqualTo(3);
         DeadLetterStream deadLetters = new DeadLetterStream(redisTemplate, mapper);
         String eventId = UUID.randomUUID().toString();
         String rideId = UUID.randomUUID().toString();
@@ -83,14 +83,14 @@ class RetryBudgetIT extends IntegrationTestSupport {
 
             RecordId entry = publish(goEnvelope(eventId, rideId));
 
-            // Each attempt costs the 2s transaction timeout; the first happens at age ~0, at least
-            // one reclaimed attempt lands inside the 3s budget, and the next one after it does not.
+            // Delivery 1 is the read, deliveries 2 and 3 are reclaims; each attempt costs the 2s
+            // transaction timeout and the reclaims wait for 1s of idle time, so about 8s in all.
             await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
                 assertThat(deadLetterCount("retry_budget_exhausted")).isEqualTo(exhaustedBefore + 1);
                 assertThat(isPending(entry)).isFalse();
             });
-            assertThat(reclaimedCount()).isGreaterThanOrEqualTo(reclaimedBefore + 1);
-            assertThat(postgresErrorCount()).isGreaterThanOrEqualTo(postgresErrorsBefore + 2);
+            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 2);
+            assertThat(postgresErrorCount()).isEqualTo(postgresErrorsBefore + 3);
             assertThat(deadLetterCount("poison")).isEqualTo(poisonBefore);
             assertThat(pendingEntries()).isZero();
             assertThat(processedRows(eventId)).isZero();

@@ -28,8 +28,10 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * {@link IntegrationTestSupport}: an entry that can never be handled is written to
  * {@code events.dead_letter} in the Go dead-letter shape and only then acknowledged, so the
  * pending list ends empty and PostgreSQL holds nothing of it. The retryable side is covered by the
- * lock-wait tests in {@code RideAssignmentConsumerIT} and {@code QuoteLedgerIT} (recovery) and by
- * {@link RetryBudgetIT} (budget exhausted).
+ * lock-wait tests in {@code RideAssignmentConsumerIT} and {@code QuoteLedgerIT} (recovery),
+ * {@link OldEntryRecoveryIT} (an old entry is retried, not dead-lettered on sight),
+ * {@link ReclaimCursorIT} (entries behind failing ones are still reclaimed) and
+ * {@link DeliveryCapIT} (delivery cap reached).
  *
  * <p>The failure of the dead-letter {@code XADD} itself is not automated: it needs Redis to refuse
  * one command while still serving the consumer's reads, and with a single connection to a single
