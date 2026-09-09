@@ -90,7 +90,7 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
 
         await().atMost(consumer.reclaimInterval().plus(consumer.reclaimMinIdle()).plusSeconds(3)).untilAsserted(() -> {
             assertThat(processedRows(eventId)).isEqualTo(1);
-            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 1);
+            assertThat(reclaimedCount()).isGreaterThanOrEqualTo(reclaimedBefore + 1);
             assertThat(pendingEntries()).isZero();
         });
         assertThat(deadLetterCount("retry_budget_exhausted") + deadLetterCount("poison")).isEqualTo(deadLettersBefore);

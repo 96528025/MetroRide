@@ -2,6 +2,8 @@ package com.metroride.fare.consumer;
 
 import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.pricing.FareQuoteException;
+import java.sql.SQLException;
+import org.springframework.core.NestedExceptionUtils;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
@@ -43,12 +45,18 @@ public enum FailureClass {
      *   <li>{@link EnvelopeDecodeException} (the entry is not an envelope) and
      *       {@link FareQuoteException} (the payload cannot be quoted) are {@link #POISON}: the
      *       entry's bytes will not change, so a second delivery fails the same way.</li>
+     *   <li>{@link DataIntegrityViolationException} is two things in Spring's hierarchy. When its
+     *       root cause is an SQL "data exception" (SQLSTATE class 22: a NUL character in a text
+     *       value, an invalid byte sequence, a numeric overflow) the entry's own values were
+     *       rejected, so it is {@link #POISON}: PostgreSQL will reject the same bytes on every
+     *       delivery, and the entry must not be able to halt the service. Otherwise (class 23, an
+     *       integrity constraint, or no SQLSTATE at all) it is {@link #FATAL}: a constraint the
+     *       writer cannot violate unless the schema or the data is already wrong; in this service
+     *       the only unique key the recorder could hit implies a committed event row, which the
+     *       idempotency insert would have returned as a duplicate first.</li>
      *   <li>{@link InvalidDataAccessResourceUsageException} (bad SQL grammar, a column of the wrong
-     *       type), {@link InvalidDataAccessApiUsageException} (the code misused a repository or a
-     *       constructor threw inside one) and {@link DataIntegrityViolationException} (a constraint
-     *       the writer cannot violate unless the schema or the data is already wrong: in this
-     *       service the only unique key the recorder could hit implies a committed event row, which
-     *       the idempotency insert would have returned as a duplicate first) are {@link #FATAL}.</li>
+     *       type) and {@link InvalidDataAccessApiUsageException} (the code misused a repository or a
+     *       constructor threw inside one) are {@link #FATAL}.</li>
      *   <li>Every other {@link DataAccessException} (a cancelled lock wait, a lost connection, a
      *       deadlock) and every {@link TransactionException} is {@link #RETRYABLE}: they say
      *       nothing about the entry. Spring's own transient/non-transient split is not used because
@@ -62,11 +70,21 @@ public enum FailureClass {
         if (failure instanceof EnvelopeDecodeException || failure instanceof FareQuoteException) {
             return POISON;
         }
+        if (failure instanceof DataIntegrityViolationException) {
+            return isDataException(failure) ? POISON : FATAL;
+        }
         if (failure instanceof InvalidDataAccessResourceUsageException
-                || failure instanceof InvalidDataAccessApiUsageException
-                || failure instanceof DataIntegrityViolationException) {
+                || failure instanceof InvalidDataAccessApiUsageException) {
             return FATAL;
         }
         return RETRYABLE;
+    }
+
+    /** SQLSTATE class 22 ("data exception") at the root of the chain: the values, not the schema, were refused. */
+    private static boolean isDataException(Throwable failure) {
+        Throwable root = NestedExceptionUtils.getMostSpecificCause(failure);
+        return root instanceof SQLException sql
+                && sql.getSQLState() != null
+                && sql.getSQLState().startsWith("22");
     }
 }

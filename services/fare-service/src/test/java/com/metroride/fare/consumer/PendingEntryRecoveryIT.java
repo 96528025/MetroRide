@@ -17,6 +17,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamRecords;
@@ -55,6 +56,9 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
 
     @Autowired
     MeterRegistry meterRegistry;
+
+    @Autowired
+    TestRestTemplate http;
 
     private DeadLetterStream deadLetters;
 
@@ -140,6 +144,48 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
         assertThat(payload.get("error").asText()).contains("decode event envelope from message " + garbage.getValue());
     }
 
+    /**
+     * A decodable envelope whose values PostgreSQL refuses: a NUL character in the event ID passes
+     * the codec (it is not blank) and is rejected as an SQLSTATE class 22 data exception (by the
+     * server as 22021, or by the driver as 22023), which Spring reports as a
+     * {@code DataIntegrityViolationException}. That must be poison, not fatal: the
+     * entry is dead-lettered and the consumer keeps running, instead of halting on one crafted
+     * entry and halting again on it after every restart.
+     */
+    @Test
+    void aValueTheDatabaseRefusesIsDeadLetteredNotFatal() {
+        // The decoded ID ends in a NUL character; on the wire it is the JSON escape \u0000, since
+        // a raw control character is not valid JSON and would be a decode failure instead.
+        String eventId = "nul-" + UUID.randomUUID() + "\u0000";
+        String rideId = UUID.randomUUID().toString();
+        double poisonBefore = deadLetterCount("poison");
+        double postgresErrorsBefore = postgresErrorCount();
+        double consumeErrorsBefore = consumeErrorCount();
+        long pendingBefore = pendingEntries();
+
+        RecordId entry = publish(goEnvelope(eventId.replace("\u0000", "\\u0000"), rideId, 1.0, 60));
+
+        await().atMost(TIMEOUT).untilAsserted(() -> {
+            assertThat(deadLetterCount("poison")).isEqualTo(poisonBefore + 1);
+            assertThat(pendingEntries()).isEqualTo(pendingBefore);
+        });
+        assertThat(isPending(entry)).isFalse();
+        assertThat(postgresErrorCount()).as("the failure came from PostgreSQL, not the codec").isEqualTo(postgresErrorsBefore + 1);
+        assertThat(consumeErrorCount()).isEqualTo(consumeErrorsBefore);
+        assertThat(meterRegistry.get("metroride.fare.consumer.halted").gauge().value()).isZero();
+        assertThat(http.getForEntity("/readyz", String.class).getStatusCode().value()).isEqualTo(200);
+        JsonNode payload = deadLetters.find(eventId).orElseThrow().get("payload");
+        assertThat(payload.get("original_event_type").asText()).isEqualTo(Envelope.TYPE_RIDE_ASSIGNED);
+        // pgjdbc refuses a NUL in a parameter itself ("Zero bytes may not occur", 22023) unless it
+        // sends the parameter in binary, in which case the server refuses it (0x00 for UTF8, 22021).
+        assertThat(payload.get("error").asText()).containsAnyOf("Zero bytes", "0x00");
+
+        // The consumer is still alive: the next entry is handled normally.
+        String nextId = UUID.randomUUID().toString();
+        publish(goEnvelope(nextId, UUID.randomUUID().toString(), 1.0, 60));
+        await().atMost(TIMEOUT).untilAsserted(() -> assertThat(processedRows(nextId)).isEqualTo(1));
+    }
+
     /** An envelope with an ID but no type is a decode failure too, dead-lettered under the message ID. */
     @Test
     void anEnvelopeWithoutATypeIsADecodeFailure() {
@@ -189,6 +235,10 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
 
     private double reclaimedCount() {
         return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
+    }
+
+    private double postgresErrorCount() {
+        return meterRegistry.get("metroride.dependency.errors").tag("dependency", "postgres").counter().count();
     }
 
     private double quoteFailureCount(String reason) {

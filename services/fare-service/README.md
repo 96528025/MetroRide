@@ -60,12 +60,15 @@ Every failure of step 1 or 2 is mapped by `FailureClass.of` to one of three clas
 
 | Class | Exceptions | What happens to the entry |
 | --- | --- | --- |
-| `POISON` | `EnvelopeDecodeException` (the entry is not an envelope), `FareQuoteException` (the payload cannot be quoted) | Dead-lettered immediately, then acknowledged |
-| `FATAL` | `InvalidDataAccessResourceUsageException` (bad SQL, wrong column type), `InvalidDataAccessApiUsageException` (a repository was misused, or a constructor threw inside one), `DataIntegrityViolationException` (a constraint the writer cannot reach unless the schema or the data is already wrong) | Left pending; the consumer halts and `/readyz` fails with the reason until the deployment is fixed and the service restarted |
+| `POISON` | `EnvelopeDecodeException` (the entry is not an envelope), `FareQuoteException` (the payload cannot be quoted), `DataIntegrityViolationException` whose root SQLSTATE is class 22 (PostgreSQL or the driver refused a value: a NUL character in a text field, an invalid byte sequence, a numeric overflow) | Dead-lettered immediately, then acknowledged |
+| `FATAL` | `InvalidDataAccessResourceUsageException` (bad SQL, wrong column type), `InvalidDataAccessApiUsageException` (a repository was misused, or a constructor threw inside one), any other `DataIntegrityViolationException` (class 23, a constraint the writer cannot reach unless the schema or the data is already wrong) | Left pending; the consumer halts and `/readyz` fails with the reason until the deployment is fixed and the service restarted |
 | `RETRYABLE` | Every other `DataAccessException` (cancelled lock wait, lost connection, deadlock), every `TransactionException`, and anything unforeseen | Left pending and delivered again by the reclaim pass; dead-lettered when its `max-deliveries`-th delivery fails |
 
 Spring's own transient/non-transient split is not used because it files a refused connection under
-non-transient. An unforeseen exception is retried rather than dead-lettered on sight: it is most
+non-transient. `DataIntegrityViolationException` is split by the SQLSTATE at the root of the chain
+because Spring files two different things under it: a value the database refuses (class 22) is the
+entry's fault and will be refused on every delivery, so it must not be able to halt the service;
+a violated constraint (class 23) means the data or the schema is already wrong. An unforeseen exception is retried rather than dead-lettered on sight: it is most
 likely a bug, but a bounded number of deliveries costs little and keeps the work for a fix to
 recover. A fatal failure is neither retried nor dead-lettered because it is not the entry's: every
 entry would fail the same way, and dead-lettering them one by one would empty the stream into
@@ -123,7 +126,7 @@ The contract is pinned by `DeadLetterPublisherTest` against the tag names in `ev
 
 **Halt.** On a fatal failure the consumer thread logs the entry and the exception, records the
 reason in `ConsumerHalt`, and leaves its loop; the rest of the batch and everything else pending
-stay in the pending list. `/readyz` answers 503 with `{"consumer": "<reason>"}` and
+stay in the pending list. `/readyz` answers 503 with `{"status":"not_ready","failures":{"consumer":"<reason>"}}` and
 `metroride_fare_consumer_halted` reads 1. Nothing clears a halt at runtime: fix the deployment and
 restart, and the first reclaim pass of the new process picks the entries up.
 
@@ -133,10 +136,13 @@ What is true after this:
   consumers still read only `>` and do not claim pending entries.
 - Nothing consumes `events.dead_letter`. The stream is the record; replay is manual.
 - A dead letter can appear twice for one entry; see above.
-- `reclaim-min-idle` (5s) is longer than the transaction timeout (2s) that bounds one handling
-  attempt, so a second replica of this service can only claim an entry whose owner has stopped
-  working on it. Within one instance the reclaim pass and the read loop are the same thread and
-  cannot overlap.
+- A second instance of this service can claim an entry its owner has not reached yet: Redis
+  measures idle time from the delivery of the whole `XREADGROUP` batch, and the entries of a
+  batch are handled one after another, up to about 4s each. `reclaim-min-idle` bounds how soon
+  that can happen; it is not a lock. The overlap is safe because the primary key of
+  `fare.processed_events` serialises the two writers (one records, the other sees a duplicate),
+  and a poison entry may then be dead-lettered twice, which is accepted. Within one instance the
+  reclaim pass and the read loop are the same thread and cannot overlap.
 
 ### Fare and ledger
 
@@ -266,9 +272,10 @@ letter already counted, a retryable failure is left pending below the cap and de
 and a fatal failure neither acknowledges nor dead-letters and halts the consumer.
 
 Integration, all on the containers from `IntegrationTestSupport`. `PendingEntryRecoveryIT` sends
-a `ride_assigned` with a negative distance and an entry whose `event` field is not JSON, and
-asserts the dead letter's content, the acknowledgement, the empty pending list and the untouched
-tables. The lock-wait tests in `RideAssignmentConsumerIT` and `QuoteLedgerIT` assert that the
+a `ride_assigned` with a negative distance, an entry whose `event` field is not JSON, and an
+envelope whose event ID contains a NUL character (refused by the driver as SQLSTATE 22023), and
+asserts the dead letter's content, the acknowledgement, the empty pending list, the untouched
+tables, and for the NUL entry that the consumer did not halt. The lock-wait tests in `RideAssignmentConsumerIT` and `QuoteLedgerIT` assert that the
 entry is reclaimed and recorded within `reclaim-interval + reclaim-min-idle` of the lock being
 released; nothing acknowledges by hand any more. Three classes run a consumer of their own (a
 `@TestPropertySource` context on the same containers, each reading its own stream so it never
@@ -333,7 +340,7 @@ start PostgreSQL, watch the reclaim pass record it.
 docker compose stop postgres
 docker compose exec -T redis redis-cli XADD events.ride.assignments '*' event \
   '{"id":"<new uuid>","type":"ride_assigned","source":"dispatch-service","correlation_id":"<ride uuid>","occurred_at":"2026-09-08T12:00:00Z","payload":{"ride_id":"<ride uuid>","rider_id":"rider-42","driver_id":"driver-2","distance_km":1.8612,"eta_seconds":223,"assignment_id":"<uuid>"}}'
-docker compose logs fare-service | grep '"entry left pending"'
+docker compose logs fare-service | grep 'entry left pending'
 docker compose exec -T redis redis-cli XPENDING events.ride.assignments fare-service   # 1
 docker compose start postgres
 sleep 15

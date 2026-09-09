@@ -72,9 +72,13 @@ metroride:
     # therefore comes back within reclaim-interval + reclaim-min-idle of its last
     # delivery while the pending list is short, and in its turn when it is long.
     reclaim-interval: 5s
-    # Longer than metroride.postgres.timeout-seconds, which bounds one handling attempt:
-    # a second replica of this service can then only claim an entry whose owner has
-    # actually stopped working on it, never one still inside its transaction.
+    # Redis measures idle time from the delivery of the whole XREADGROUP batch, and the
+    # entries of a batch are handled one after another (up to about 4s each: 2s to get a
+    # connection, 2s of transaction), so a second instance of this service can claim an
+    # entry its owner has not reached yet. That overlap is safe because the primary key
+    # of fare.processed_events serialises the two writers (one records, the other sees a
+    # duplicate) and a poison entry may then be dead-lettered twice, which is accepted.
+    # min-idle only bounds how soon such a claim can happen; it is not a lock.
     reclaim-min-idle: 5s
     # A retryable failure on an entry's max-deliveries-th delivery dead-letters it. Redis
     # keeps the delivery count in the pending entry list and only redelivers an entry

@@ -300,7 +300,7 @@ class QuoteLedgerIT extends IntegrationTestSupport {
         }
 
         await().atMost(consumer.reclaimInterval().plus(consumer.reclaimMinIdle()).plusSeconds(3)).untilAsserted(() -> {
-            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 1);
+            assertThat(reclaimedCount()).isGreaterThanOrEqualTo(reclaimedBefore + 1);
             assertThat(processedRows(eventId)).isEqualTo(1);
             assertThat(journalRows(eventId)).isEqualTo(1);
             assertThat(pendingEntries()).isEqualTo(pendingBefore);

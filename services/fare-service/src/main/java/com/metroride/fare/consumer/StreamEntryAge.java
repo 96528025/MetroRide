@@ -9,10 +9,10 @@ import java.util.Optional;
  * {@code <milliseconds since the epoch>-<sequence>}, so the ID itself records when the producer's
  * {@code XADD} ran; no extra bookkeeping is needed to know how long an entry has been waiting.
  *
- * <p>This is the input to the retry budget. It is deliberately the time since the entry was
- * added, not the time since its first delivery or the number of deliveries: Redis does not keep
- * the first-delivery time, and the delivery count says nothing about how much wall-clock time an
- * out-of-order event has had to be overtaken by the event it depends on.
+ * <p>The age is logged with every reclaimed and every failed entry and takes part in no decision.
+ * The retry budget is the delivery count ({@code max-deliveries}): age counts time the service may
+ * have spent stopped, so an age budget would give up on exactly the backlog a restart exists to
+ * work through.
  */
 public final class StreamEntryAge {
 
@@ -41,7 +41,7 @@ public final class StreamEntryAge {
 
     /**
      * {@code now} minus the ID's timestamp, never negative, or empty when the ID carries no
-     * timestamp. An entry of unknown age can never exhaust the retry budget; it stays retryable.
+     * timestamp (logged as {@code -1}).
      */
     public static Optional<Duration> of(String messageId, Instant now) {
         return timestampOf(messageId).map(added -> {

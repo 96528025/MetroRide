@@ -125,9 +125,11 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
 
         // The entry becomes claimable reclaim-min-idle after its first delivery and the next pass
         // runs at most reclaim-interval later; the slack covers container latency, not the design.
+        // At least one reclaim: on a slow runner the rollback above can land after the entry was
+        // already claimed once more, which costs a second (failing) reclaim, not correctness.
         await().atMost(consumer.reclaimInterval().plus(consumer.reclaimMinIdle()).plusSeconds(3)).untilAsserted(() -> {
             assertThat(processedRows(blockedId)).isEqualTo(1);
-            assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 1);
+            assertThat(reclaimedCount()).isGreaterThanOrEqualTo(reclaimedBefore + 1);
             assertThat(pendingEntries()).isEqualTo(pendingBefore);
         });
         assertThat(isPending(blocked)).isFalse();
