@@ -119,7 +119,7 @@ class FailureHandlerTest {
         verifyNoInteractions(publisher);
         verifyNoInteractions(commands);
         assertThat(postgresErrors()).isEqualTo(1);
-        assertThat(deadLetters("retry_budget_exhausted")).isZero();
+        assertThat(deadLetters("max_deliveries_reached")).isZero();
     }
 
     @Test
@@ -131,7 +131,7 @@ class FailureHandlerTest {
         assertThat(disposition).isEqualTo(Disposition.DEAD_LETTERED);
         verify(publisher).publish(eq(commands), eq(message()), eq(envelope()), any(QueryTimeoutException.class));
         verify(commands).xack(STREAM, GROUP, MESSAGE_ID);
-        assertThat(deadLetters("retry_budget_exhausted")).isEqualTo(1);
+        assertThat(deadLetters("max_deliveries_reached")).isEqualTo(1);
         assertThat(deadLetters("poison")).isZero();
     }
 

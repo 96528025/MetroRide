@@ -154,7 +154,7 @@ class RideAssignmentConsumerIT extends IntegrationTestSupport {
                 .contains("metroride_fare_events_reclaimed_total{")
                 .contains("metroride_fare_dead_letters_total{")
                 .contains("reason=\"poison\"")
-                .contains("reason=\"retry_budget_exhausted\"")
+                .contains("reason=\"max_deliveries_reached\"")
                 .contains("metroride_fare_dead_letter_publish_failures_total{")
                 .contains("metroride_stream_consume_errors_total")
                 .contains("metroride_dependency_errors_total");

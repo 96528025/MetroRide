@@ -125,7 +125,7 @@ public class FailureHandler {
                 entry = entry.addKeyValue("max_deliveries", properties.maxDeliveries());
                 if (deliveryCount >= properties.maxDeliveries()) {
                     entry.log("handle event failed; max deliveries reached, dead-lettering entry");
-                    yield deadLetter(commands, message, envelope, failure, DeadLetterReason.RETRY_BUDGET_EXHAUSTED);
+                    yield deadLetter(commands, message, envelope, failure, DeadLetterReason.MAX_DELIVERIES_REACHED);
                 }
                 entry.log("handle event failed; entry left pending for the next reclaim pass");
                 yield Disposition.LEFT_PENDING;

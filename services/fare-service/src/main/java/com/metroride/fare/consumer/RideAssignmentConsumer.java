@@ -88,6 +88,9 @@ public class RideAssignmentConsumer implements SmartLifecycle {
     /** Delivery count Redis assigns to an entry on its first {@code XREADGROUP} delivery. */
     private static final long FIRST_DELIVERY = 1;
 
+    /** Redis scans at most this many times {@code COUNT} pending entries per {@code XAUTOCLAIM} (hard-coded server-side). */
+    static final long XAUTOCLAIM_SCAN_FACTOR = 10;
+
     /** Delivery count reported when the {@code XPENDING} lookup for a reclaimed entry failed. */
     private static final long UNKNOWN_DELIVERY_COUNT = -1;
 
@@ -365,8 +368,13 @@ public class RideAssignmentConsumer implements SmartLifecycle {
     /**
      * {@code XAUTOCLAIM} returns the entries but not their delivery counts, so one {@code XPENDING}
      * over the claimed ID range fetches them. The count decides when a retryable entry has had its
-     * {@code max-deliveries}; an entry whose count could not be fetched is reported as {@code -1}
-     * and is left pending on failure rather than dead-lettered on a guess.
+     * {@code max-deliveries}, so the lookup must not miss a claimed entry: the range also holds this
+     * consumer's entries that were skipped for being too fresh, and {@code XPENDING}'s count is an
+     * upper bound on rows returned. Redis scans at most ten times {@code COUNT} pending entries per
+     * {@code XAUTOCLAIM}, so every claimed entry lies in a window of that size and the range holds
+     * at most that many entries; asking for that many is exact. An entry whose count still could
+     * not be fetched (the call failed) is reported as {@code -1} and is left pending on failure
+     * rather than dead-lettered on a guess.
      */
     private Map<String, Long> deliveryCounts(
             RedisCommands<String, String> commands,
@@ -375,7 +383,7 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             List<StreamMessage<String, String>> claimed) {
         Range<String> range = Range.create(claimed.get(0).getId(), claimed.get(claimed.size() - 1).getId());
         try {
-            return commands.xpending(stream, consumer, range, Limit.from(claimed.size() + (long) properties.batchSize()))
+            return commands.xpending(stream, consumer, range, Limit.from(XAUTOCLAIM_SCAN_FACTOR * properties.batchSize()))
                     .stream()
                     .collect(Collectors.toMap(PendingMessage::getId, PendingMessage::getRedeliveryCount, (a, b) -> a));
         } catch (RedisException e) {

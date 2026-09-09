@@ -58,7 +58,7 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
         assertThat(consumer.maxDeliveries()).as("default cap from application.yml").isEqualTo(25);
         String eventId = UUID.randomUUID().toString();
         String rideId = UUID.randomUUID().toString();
-        double deadLettersBefore = deadLetterCount("retry_budget_exhausted") + deadLetterCount("poison");
+        double deadLettersBefore = deadLetterCount("max_deliveries_reached") + deadLetterCount("poison");
         double reclaimedBefore = reclaimedCount();
 
         try (Connection lockHolder = DriverManager.getConnection(
@@ -83,7 +83,7 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
                 assertThat(postgresErrorCount()).isEqualTo(postgresErrorsBefore + 1);
                 assertThat(isPending(entry)).isTrue();
             });
-            assertThat(deadLetterCount("retry_budget_exhausted") + deadLetterCount("poison")).isEqualTo(deadLettersBefore);
+            assertThat(deadLetterCount("max_deliveries_reached") + deadLetterCount("poison")).isEqualTo(deadLettersBefore);
             assertThat(processedRows(eventId)).isZero();
             lockHolder.rollback();
         }
@@ -93,7 +93,7 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
             assertThat(reclaimedCount()).isGreaterThanOrEqualTo(reclaimedBefore + 1);
             assertThat(pendingEntries()).isZero();
         });
-        assertThat(deadLetterCount("retry_budget_exhausted") + deadLetterCount("poison")).isEqualTo(deadLettersBefore);
+        assertThat(deadLetterCount("max_deliveries_reached") + deadLetterCount("poison")).isEqualTo(deadLettersBefore);
     }
 
     private boolean isPending(RecordId id) {

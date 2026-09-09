@@ -110,7 +110,7 @@ class ReclaimCursorIT extends IntegrationTestSupport {
             assertThat(isPending(second)).isTrue();
             assertThat(processedRows(eventIds.get(0))).isZero();
             assertThat(processedRows(eventIds.get(1))).isZero();
-            assertThat(deadLetterCount("retry_budget_exhausted")).isZero();
+            assertThat(deadLetterCount("max_deliveries_reached")).isZero();
 
             lockHolders[0].rollback();
             lockHolders[1].rollback();

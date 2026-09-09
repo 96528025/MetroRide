@@ -29,7 +29,7 @@ import org.springframework.test.context.TestPropertySource;
  * A retryable failure that never clears: another session keeps the event row locked for the whole
  * test, so every delivery is cancelled by the transaction timeout. The entry must be reclaimed and
  * retried until its {@code max-deliveries}-th delivery fails, then dead-lettered with
- * {@code reason=retry_budget_exhausted} and acknowledged.
+ * {@code reason=max_deliveries_reached} and acknowledged.
  *
  * <p>The cap is shrunk through {@link TestPropertySource}, which gives this class its own Spring
  * context and therefore its own consumer, on the same containers. That consumer reads its own
@@ -65,7 +65,7 @@ class DeliveryCapIT extends IntegrationTestSupport {
         DeadLetterStream deadLetters = new DeadLetterStream(redisTemplate, mapper);
         String eventId = UUID.randomUUID().toString();
         String rideId = UUID.randomUUID().toString();
-        double exhaustedBefore = deadLetterCount("retry_budget_exhausted");
+        double exhaustedBefore = deadLetterCount("max_deliveries_reached");
         double poisonBefore = deadLetterCount("poison");
         double reclaimedBefore = reclaimedCount();
         double postgresErrorsBefore = postgresErrorCount();
@@ -86,7 +86,7 @@ class DeliveryCapIT extends IntegrationTestSupport {
             // Delivery 1 is the read, deliveries 2 and 3 are reclaims; each attempt costs the 2s
             // transaction timeout and the reclaims wait for 1s of idle time, so about 8s in all.
             await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-                assertThat(deadLetterCount("retry_budget_exhausted")).isEqualTo(exhaustedBefore + 1);
+                assertThat(deadLetterCount("max_deliveries_reached")).isEqualTo(exhaustedBefore + 1);
                 assertThat(isPending(entry)).isFalse();
             });
             assertThat(reclaimedCount()).isEqualTo(reclaimedBefore + 2);

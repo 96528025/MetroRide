@@ -94,12 +94,15 @@ from the stream ID is logged next to it (`message_id`, `age_seconds`, `delivery_
 restart of this service, and it only redelivers an entry idle for at least `reclaim-min-idle`, so
 25 deliveries guarantee at least 24 × 5s = 120s of retrying counted from the first delivery,
 however old the entry already was when the service first saw it and however long the service was
-down before that. Under load the window is longer, never shorter. The guarantee is what the next
-failure mode needs: the assignment and the completion of one ride will arrive on two streams from
-two outbox relays that poll every 250ms and back off up to 30s after a failed publish
-(`shared/pkg/outbox`), so a completion can precede its assignment by up to that long under normal
-operation, and "no hold for this ride yet" is then a retryable failure that clears itself when the
-assignment lands. 120s is four times the relay's maximum backoff. The age of the entry, now minus
+down before that. Under load the window is longer, never shorter. The guarantee is sized for the next
+failure mode: the assignment and the completion of one ride will arrive on two streams from two
+outbox relays that poll every 250ms and back off up to 30s between attempts after a failed publish
+(`shared/pkg/outbox`). One failed publish therefore delays an assignment by up to 30s, and a
+completion that arrives first is a retryable "no hold for this ride yet" that clears itself when
+the assignment lands; 120s is four times that. The gap is not bounded, though: a relay or its
+service that stays down longer delays the assignment for as long as it is down, and a completion
+that waits out its 25 deliveries goes to `events.dead_letter` for manual replay. The cap buys time
+for the ordinary case, not a proof that the completion is never given up on. The age of the entry, now minus
 the timestamp in its stream ID, is deliberately not the input: it counts time the service may have
 spent stopped, so after a restart it would dead-letter the whole backlog on its first hiccup, which
 is precisely the backlog a restart exists to work through. Age is kept in the logs for diagnosis.
@@ -228,7 +231,7 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | `metroride_fare_quotes_total` | `service`, `kind=quote_hold` | Journal entries written, counted after the commit |
 | `metroride_fare_quote_failures_total` | `service`, `reason=payload\|calculation` | `ride_assigned` envelopes whose payload did not decode or whose figures the calculator rejected; the transaction rolled back and the entry is dead-lettered as poison |
 | `metroride_fare_events_reclaimed_total` | `service`, `stream` | Pending entries delivered again by the reclaim pass |
-| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|retry_budget_exhausted` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK` |
+| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|max_deliveries_reached` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK` |
 | `metroride_fare_dead_letter_publish_failures_total` | `service`, `stream` | Dead-letter `XADD`s Redis did not confirm; the entry stayed pending |
 | `metroride_fare_consumer_halted` | `service` | Gauge, 1 once the consumer has stopped on a fatal failure |
 | `metroride_stream_consume_errors_total` | `service`, `stream` | Failed reads and undecodable entries (same name as the Go shared counter) |
@@ -281,7 +284,7 @@ released; nothing acknowledges by hand any more. Three classes run a consumer of
 `@TestPropertySource` context on the same containers, each reading its own stream so it never
 competes with the shared context's consumer): `DeliveryCapIT` holds the lock for good with
 `max-deliveries` 3 and asserts the entry is dead-lettered on its third delivery with
-`reason=retry_budget_exhausted` and acknowledged; `OldEntryRecoveryIT` publishes an entry with a
+`reason=max_deliveries_reached` and acknowledged; `OldEntryRecoveryIT` publishes an entry with a
 stream ID from 2001, fails it once, and asserts it is retried and recorded rather than
 dead-lettered for its age; `ReclaimCursorIT` keeps two entries failing with `batch-size` 2 and
 asserts the third, behind them, is still reclaimed and recorded.

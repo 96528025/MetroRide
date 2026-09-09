@@ -86,9 +86,11 @@ metroride:
     # 24 x 5s = 120s of retrying counted from the first delivery, however old the entry
     # already was when this service first saw it. Under load the window is longer,
     # never shorter. The events this service consumes come from outbox relays that poll
-    # every 250ms and back off up to 30s after a failed publish (shared/pkg/outbox), so
-    # two events of one ride can arrive up to 30s apart in either order; 120s is four
-    # times that.
+    # every 250ms and back off up to 30s between attempts after a failed publish
+    # (shared/pkg/outbox), so one failed publish delays an event by up to 30s and two
+    # events of one ride can then arrive in either order; 120s is four times that. A
+    # relay that stays down longer delays its event for as long as it is down, so the
+    # window is a margin for the ordinary case, not a bound.
     max-deliveries: 25
 
 logging:

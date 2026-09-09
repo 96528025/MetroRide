@@ -5,7 +5,7 @@ public enum DeadLetterReason {
     /** The entry was {@link FailureClass#POISON}: dead-lettered on its first failure. */
     POISON("poison"),
     /** The entry was {@link FailureClass#RETRYABLE} and failed on its {@code max-deliveries}-th delivery. */
-    RETRY_BUDGET_EXHAUSTED("retry_budget_exhausted");
+    MAX_DELIVERIES_REACHED("max_deliveries_reached");
 
     private final String label;
 
