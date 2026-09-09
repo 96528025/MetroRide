@@ -3,7 +3,8 @@ package com.metroride.fare.pricing;
 /**
  * A {@code ride_assigned} envelope could not be turned into a quote: its payload did not decode,
  * or its figures were rejected by the {@link FareCalculator}. Thrown inside the recording
- * transaction, so the event is not recorded either and the stream entry stays pending.
+ * transaction, so the event is not recorded either; the consumer classifies it as poison and
+ * dead-letters the entry (see {@code consumer/FailureClass}).
  */
 public class FareQuoteException extends RuntimeException {
 

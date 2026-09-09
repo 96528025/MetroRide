@@ -61,9 +61,37 @@ metroride:
     driver-share: 0.80
   consumer:
     stream: events.ride.assignments
-    batch-size: 10
+    batch-size: 10         # COUNT for XREADGROUP and for XAUTOCLAIM
     block-timeout: 1s      # must stay below spring.data.redis.timeout
     error-backoff: 1s
+    # Pending-entry recovery. Every reclaim-interval, before its next XREADGROUP, the
+    # consumer thread runs one XAUTOCLAIM over the group's pending entry list, starting
+    # where the previous pass stopped (its returned cursor; 0-0 starts over), and pushes
+    # up to batch-size entries that have been pending for at least reclaim-min-idle
+    # through the normal handler. An entry whose handling failed for a retryable reason
+    # therefore comes back within reclaim-interval + reclaim-min-idle of its last
+    # delivery while the pending list is short, and in its turn when it is long.
+    reclaim-interval: 5s
+    # Redis measures idle time from the delivery of the whole XREADGROUP batch, and the
+    # entries of a batch are handled one after another (up to about 4s each: 2s to get a
+    # connection, 2s of transaction), so a second instance of this service can claim an
+    # entry its owner has not reached yet. That overlap is safe because the primary key
+    # of fare.processed_events serialises the two writers (one records, the other sees a
+    # duplicate) and a poison entry may then be dead-lettered twice, which is accepted.
+    # min-idle only bounds how soon such a claim can happen; it is not a lock.
+    reclaim-min-idle: 5s
+    # A retryable failure on an entry's max-deliveries-th delivery dead-letters it. Redis
+    # keeps the delivery count in the pending entry list and only redelivers an entry
+    # idle for at least reclaim-min-idle, so 25 deliveries guarantee at least
+    # 24 x 5s = 120s of retrying counted from the first delivery, however old the entry
+    # already was when this service first saw it. Under load the window is longer,
+    # never shorter. The events this service consumes come from outbox relays that poll
+    # every 250ms and back off up to 30s between attempts after a failed publish
+    # (shared/pkg/outbox), so one failed publish delays an event by up to 30s and two
+    # events of one ride can then arrive in either order; 120s is four times that. A
+    # relay that stays down longer delays its event for as long as it is down, so the
+    # window is a margin for the ordinary case, not a bound.
+    max-deliveries: 25
 
 logging:
   structured:

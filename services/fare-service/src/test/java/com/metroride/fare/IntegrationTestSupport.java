@@ -17,8 +17,12 @@ import org.testcontainers.utility.DockerImageName;
  * keeps the connection details of whichever containers were running when it was created; per-class
  * containers would be stopped after the first class while the second class still used the cached
  * context. With singleton containers every class sees the same live containers and the same context.
- * Tests therefore share the consumer group: use fresh IDs, assert on deltas, and acknowledge any
- * entry a test deliberately leaves pending.
+ * Tests therefore share the consumer group: use fresh IDs and assert on deltas. Do not acknowledge
+ * entries by hand: the consumer's reclaim pass claims a pending entry within seconds, so a test
+ * that leaves one pending must either release what blocks it and assert the reclaim, or expect
+ * the dead letter. A test that needs different consumer settings gets its own Spring context
+ * through {@code @TestPropertySource} and must also set its own {@code metroride.consumer.stream},
+ * or its consumer competes with this context's for the same entries.
  *
  * <p>{@code @AutoConfigureObservability} is required by every {@code @SpringBootTest} in this
  * service: Spring Boot switches metrics export off in tests, and {@code MetricsController} needs the

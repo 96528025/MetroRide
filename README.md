@@ -35,6 +35,7 @@ flowchart LR
     Dispatch -.->|after 3 failed attempts| DLQ[events.dead_letter]
     RA -->|consumer group| Fare[fare-service]
     Fare -->|processed event ids, one row per envelope| DB
+    Fare -.->|poison entry, or 25 failed deliveries| DLQ
 ```
 
 `POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`.
@@ -60,10 +61,10 @@ Six core services form the default Docker Compose profile, the Helm chart, and t
 | --- | --- | --- | --- |
 | `events.ride.requests` | rider-service | dispatch-service (group) | outbox relay |
 | `events.driver.locations` | driver-service | routing-service (group) | direct `XADD` |
-| `events.ride.assignments` | dispatch-service | none yet | outbox relay |
+| `events.ride.assignments` | dispatch-service | fare-service (group, optional `fare` profile) | outbox relay |
 | `events.ride.notifications` | dispatch-service | notification-service (group) | outbox relay |
 | `events.traffic.updates` | traffic-service | none yet | direct `XADD` |
-| `events.dead_letter` | dispatch-service | none (inspection) | direct `XADD`, 3 attempts |
+| `events.dead_letter` | dispatch-service, fare-service | none (inspection) | direct `XADD`; dispatch 3 attempts, fare-service one per delivery of the failed entry |
 
 ## Quick start
 
@@ -101,7 +102,7 @@ ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 
 **Bounded dependency work.** Redis, PostgreSQL and routing contexts: 2 s. Readiness checks: 1.5 s. `reliability.Retry`: 3 attempts, 150 ms initial delay, doubling, cancellable. HTTP servers set read-header/read/write/idle timeouts (5/10/15/60 s) and drain on `SIGINT`/`SIGTERM`.
 
-**Consumers.** Dispatch is the idempotent consumer; notification-service logs and counts every delivery, so a redelivered assignment produces a second log line and count. When dispatch exhausts its retries, it publishes a `dead_lettered` envelope (original event ID and type, ride ID, error, service, timestamp) to `events.dead_letter`, retrying that publish up to 3 times, and acknowledges the original only if it succeeded. Consumers read new entries only; abandoned pending entries are not reclaimed (`XAUTOCLAIM`/`XCLAIM` is future work).
+**Consumers.** Dispatch is the idempotent consumer; notification-service logs and counts every delivery, so a redelivered assignment produces a second log line and count. When dispatch exhausts its retries, it publishes a `dead_lettered` envelope (original event ID and type, ride ID, error, service, timestamp) to `events.dead_letter`, retrying that publish up to 3 times, and acknowledges the original only if it succeeded. The Go consumers read new entries only and do not reclaim abandoned pending entries (`XAUTOCLAIM`/`XCLAIM` is future work there); `fare-service` reclaims its own with `XAUTOCLAIM` and dead-letters an entry after 25 failed deliveries.
 
 **Operability.** Every service serves `GET /healthz`, `GET /readyz` (named checks for the service's PostgreSQL, Redis and routing dependencies; rider-service deliberately depends only on PostgreSQL so intake stays up during a Redis outage; the optional Kafka producer is not probed), and `GET /metrics`. Logs are JSON with `service`, `ride_id`, `driver_id`, `event_type`, and `error` fields. Metrics: `metroride_ride_requests_total`, `metroride_rides_assigned_total`, `metroride_dispatch_latency_seconds`, `metroride_assignment_failures_total`, `metroride_stream_consume_errors_total`, `metroride_dependency_errors_total`, `metroride_outbox_events_published_total`, `metroride_outbox_publish_failures_total`, `metroride_routing_computation_seconds`, `metroride_active_drivers`.
 
@@ -133,7 +134,7 @@ The Helm chart (`infrastructure/helm/metro-ride`) packages the six core services
 ## Limitations
 
 - Outbox delivery is at-least-once with no attempt ceiling and no outbox dead-letter path; the relay holds row locks while publishing.
-- Stream consumers do not reclaim pending entries after a crash; dead-letter replay tooling does not exist.
+- The Go stream consumers do not reclaim pending entries after a crash; `fare-service` reclaims its own with `XAUTOCLAIM` and dead-letters after 25 failed deliveries. Dead-letter replay tooling does not exist.
 - Routing state is process-local. CI runs one routing replica; the chart's untested defaults set two, which this design does not support without partitioned or shared driver state.
 - Routing seeds three static placeholder drivers at startup in addition to the four simulated ones; availability is never reserved on assignment; traffic events are produced but unused; notifications are a log line and a counter.
 - Distance is Haversine, not road routing. There is a 10,000-driver in-process benchmark and no load test.
