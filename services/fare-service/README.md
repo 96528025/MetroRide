@@ -202,7 +202,7 @@ Entries are in insertion order.
 | `POSTGRES_DSN` | `postgres://metroride:metroride@localhost:5432/metroride?sslmode=disable` | Translated to a JDBC URL plus credentials |
 | `REDIS_ADDR` | `localhost:6379` | Redis host and port |
 | `CONSUMER_GROUP` | `fare-service` | Consumer group name |
-| `CONSUMER_NAME` | `fare-service-1` | Consumer name within the group |
+| `CONSUMER_NAME` | `fare-service-1` | Consumer name within the group; every running instance needs its own, or two instances share one pending entry list and cannot tell their deliveries apart |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `10` | Graceful shutdown budget, also the consumer drain budget |
 
 Pending-entry recovery is tuned in `application.yml` under `metroride.consumer`, next to the

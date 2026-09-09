@@ -37,17 +37,17 @@ import org.springframework.test.context.TestPropertySource;
  * {@code XPENDING} over the range from the first to the last claimed ID fetches their counts, and
  * that range also contains this consumer's entries that were skipped because they were not idle
  * long enough. If the lookup's row limit were smaller than the number of such entries, the last
- * claimed entry would get no count, and a retryable failure on it could never reach
- * {@code max-deliveries}.
+ * claimed entry would get no count for that pass; while the pending list keeps that shape, its
+ * retryable failures never count towards {@code max-deliveries}.
  *
  * <p>Seven entries fail their first delivery on lock waits and stay pending. The test then keeps
  * the five middle ones fresh ({@code XCLAIM ... IDLE 0 JUSTID}, which resets idle time without
  * counting a delivery) and the first and last one old ({@code IDLE 60000}), so every reclaim pass
  * claims exactly the first and the last with the five fresh ones between them. With
  * {@code batch-size} 2 a lookup limited to a handful of rows returns only the first claimed entry
- * and some of the fresh ones; the last claimed entry would be reported as {@code -1} and never
- * dead-lettered. The correct limit returns all seven, and both claimed entries are dead-lettered on
- * their third delivery.
+ * and some of the fresh ones; the last claimed entry would be reported as {@code -1} on every pass
+ * and not be dead-lettered while the layout lasts. The correct limit returns all seven, and both
+ * claimed entries are dead-lettered on their third delivery.
  *
  * <p>{@code reclaim-min-idle} is long so that no reclaim happens on its own while the seven first
  * deliveries are still failing; only the test's {@code XCLAIM} makes entries claimable.

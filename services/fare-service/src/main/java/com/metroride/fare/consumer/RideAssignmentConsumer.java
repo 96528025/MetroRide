@@ -372,7 +372,7 @@ public class RideAssignmentConsumer implements SmartLifecycle {
      * consumer's entries that were skipped for being too fresh, and {@code XPENDING}'s count is an
      * upper bound on rows returned. Redis scans at most ten times {@code COUNT} pending entries per
      * {@code XAUTOCLAIM}, so every claimed entry lies in a window of that size and the range holds
-     * at most that many entries; asking for that many is exact. An entry whose count still could
+     * at most that many entries; asking for that many is a sufficient upper bound. An entry whose count still could
      * not be fetched (the call failed) is reported as {@code -1} and is left pending on failure
      * rather than dead-lettered on a guess.
      */
