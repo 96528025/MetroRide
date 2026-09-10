@@ -1,13 +1,42 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 )
+
+type discardErrors struct{}
+
+func (discardErrors) Error(string, ...any) {}
+
+func TestConsumeDriverLocationsReturnsWhenContextIsCancelled(t *testing.T) {
+	// Nothing listens on port 1; with the context already cancelled the client
+	// fails every call with context.Canceled before it dials.
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	defer func() { _ = rdb.Close() }()
+	svc := &routingService{drivers: map[string]driver{}, rdb: rdb}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		svc.consumeDriverLocations(ctx, discardErrors{})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consumeDriverLocations kept looping after its context was cancelled")
+	}
+}
 
 func TestNearestDriverReportsHaversineAlgorithm(t *testing.T) {
 	svc := &routingService{
