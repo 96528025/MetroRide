@@ -80,6 +80,13 @@ func (s *notificationService) consume(ctx context.Context, log interface {
 		log.Error("notification consumer group failed", "error", err)
 	}
 	for {
+		// Without this check a cancelled context makes every read fail at once
+		// with context.Canceled, and the loop spins until the process exits.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		readCtx, readCancel := reliability.WithRedisTimeout(ctx)
 		result, err := s.rdb.XReadGroup(readCtx, &redis.XReadGroupArgs{
 			Group:    group,

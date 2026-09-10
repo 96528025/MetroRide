@@ -108,7 +108,7 @@ ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 
 ## Verification
 
-`go test -race ./...` compiles all 15 Go packages and runs 33 unit tests across 8 of them (event envelopes, config, HTTP/readiness helpers, retry and timeout helpers, the dispatch-to-routing client, nearest-driver selection and tie-breaking, outbox backoff, rider readiness). The other 7 packages have no unit tests. The race detector is a guard for future concurrent code: none of the unit tests exercise concurrent paths today, and the services under test run uninstrumented in containers, so it says nothing about relay or consumer concurrency. Running-stack tests need the Compose stack up:
+`go test -race ./...` compiles all 15 Go packages and runs 35 unit tests across 9 of them (event envelopes, config, HTTP/readiness helpers, retry and timeout helpers, the dispatch-to-routing client, nearest-driver selection and tie-breaking, outbox backoff, rider readiness, and the routing and notification consume loops returning once their context is cancelled). The other 6 packages have no unit tests. The race detector is a guard for future concurrent code: the only goroutines in the unit tests are the two cancellation tests, which run a consume loop against an unreachable Redis, and the services under test run uninstrumented in containers, so it says nothing about relay or consumer concurrency. Running-stack tests need the Compose stack up:
 
 | Check | Command | Asserts |
 | --- | --- | --- |
