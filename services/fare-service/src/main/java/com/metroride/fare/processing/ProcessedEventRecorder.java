@@ -4,26 +4,37 @@ import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
 import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.events.RideAssigned;
+import com.metroride.fare.events.RideCompleted;
+import com.metroride.fare.ledger.CorruptLedgerException;
 import com.metroride.fare.ledger.JournalEntry;
+import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.ledger.LedgerRepository;
 import com.metroride.fare.ledger.Money;
+import com.metroride.fare.ledger.StoredJournalEntry;
 import com.metroride.fare.pricing.FareCalculator;
+import com.metroride.fare.pricing.FareProperties;
 import com.metroride.fare.pricing.FareQuoteException;
-import com.metroride.fare.pricing.FareQuoteException.Reason;
 import java.time.Clock;
-import java.util.Optional;
+import java.time.Instant;
+import java.util.List;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The transactional unit of work for one consumed envelope: record the event ID, and for a
- * {@code ride_assigned} envelope also quote the fare and append the {@code quote_hold} journal
- * entry, all in one PostgreSQL transaction.
+ * The transactional unit of work for one consumed envelope: record the event ID, and then by
+ * type, all in one PostgreSQL transaction:
+ *
+ * <ul>
+ *   <li>{@code ride_assigned}: quote the fare and append the {@code quote_hold} entry;</li>
+ *   <li>{@code ride_completed}: lock the ride's {@code quote_hold}, check that it is the one
+ *       entry the service writes and that the ride is not settled yet, then append the
+ *       {@code hold_reversal} and the {@code settlement};</li>
+ *   <li>anything else: recorded, nothing more.</li>
+ * </ul>
  *
  * <p>Order inside the transaction matters. The idempotency insert runs first; when it inserts
  * nothing the envelope was fully handled by an earlier delivery, and the method returns
- * {@link Outcome#DUPLICATE} without touching the ledger. Envelopes of any other type are recorded
- * and nothing else happens to them.
+ * {@link Outcome#DUPLICATE} without touching the ledger.
  */
 @Service
 public class ProcessedEventRecorder {
@@ -36,21 +47,27 @@ public class ProcessedEventRecorder {
     }
 
     /**
-     * What one call did. {@code quoteHold} is present only when the envelope was a first-seen
-     * {@code ride_assigned} and its journal entry was written in the same transaction.
+     * What one call did. {@code entries} are the journal entries written in the same transaction,
+     * in the order written: one {@code quote_hold} for a first-seen {@code ride_assigned}, a
+     * {@code hold_reversal} then a {@code settlement} for a first-seen {@code ride_completed},
+     * nothing otherwise.
      */
-    public record Result(Outcome outcome, Optional<JournalEntry> quoteHold) {
+    public record Result(Outcome outcome, List<JournalEntry> entries) {
 
-        static Result recorded() {
-            return new Result(Outcome.RECORDED, Optional.empty());
+        public Result {
+            entries = List.copyOf(entries);
         }
 
-        static Result quoted(JournalEntry quoteHold) {
-            return new Result(Outcome.RECORDED, Optional.of(quoteHold));
+        static Result recorded() {
+            return new Result(Outcome.RECORDED, List.of());
+        }
+
+        static Result recorded(List<JournalEntry> entries) {
+            return new Result(Outcome.RECORDED, entries);
         }
 
         static Result duplicate() {
-            return new Result(Outcome.DUPLICATE, Optional.empty());
+            return new Result(Outcome.DUPLICATE, List.of());
         }
     }
 
@@ -58,6 +75,7 @@ public class ProcessedEventRecorder {
     private final LedgerRepository ledger;
     private final EnvelopeCodec codec;
     private final FareCalculator calculator;
+    private final FareProperties rates;
     private final Clock clock;
 
     public ProcessedEventRecorder(
@@ -65,11 +83,13 @@ public class ProcessedEventRecorder {
             LedgerRepository ledger,
             EnvelopeCodec codec,
             FareCalculator calculator,
+            FareProperties rates,
             Clock clock) {
         this.repository = repository;
         this.ledger = ledger;
         this.codec = codec;
         this.calculator = calculator;
+        this.rates = rates;
         this.clock = clock;
     }
 
@@ -82,17 +102,32 @@ public class ProcessedEventRecorder {
      * the remaining transaction time to every JDBC statement as its query timeout, whether it is
      * issued by Hibernate or by the ledger's {@code JdbcClient}, so a statement stuck waiting for a
      * lock is cancelled by the driver, the whole transaction rolls back (event row and journal
-     * entry alike), and the caller sees a {@code DataAccessException}: the entry stays pending and
-     * the consumer moves on instead of stalling on one event.
+     * entries alike), and the caller sees a {@code DataAccessException}: the entry stays pending
+     * and the consumer moves on instead of stalling on one event.
      *
      * <p>Two deliveries of the same envelope that arrive at once are serialised by the primary key
      * of {@code fare.processed_events}: the second insert waits for the first transaction to
      * commit, then hits the conflict clause and returns {@link Outcome#DUPLICATE} without ever
      * reaching the ledger. The unique key on {@code journal_entries (source_event_id, kind)} is a
-     * backstop for writers that bypass this method, not the mechanism relied on here.
+     * backstop for writers that bypass this method, not the mechanism relied on here. Two
+     * different completion events for one ride are a different case: their event rows do not
+     * collide, so the row lock on the ride's {@code quote_hold} serialises them and the second one
+     * finds the ride settled (see {@link #settle}). A completion and a second, distinct assignment
+     * for one ride are yet another: the lock is on a hold that the assignment does not touch, so
+     * nothing in this class can order them, and the per-ride unique index on {@code quote_hold}
+     * (V3) refuses the second hold instead; the recorder sees that as a
+     * {@link LedgerConflictException} and the consumer quarantines the assignment event as
+     * {@code duplicate_hold} with the ledger untouched.
      *
-     * @throws FareQuoteException when a {@code ride_assigned} payload cannot be quoted; the
-     *                            transaction rolls back and the event is not recorded
+     * @throws FareQuoteException     when a {@code ride_assigned} payload cannot be quoted; the
+     *                                transaction rolls back and the event is not recorded
+     * @throws SettlementException    when a {@code ride_completed} cannot be settled, with the
+     *                                reason that decides whether it is retried, quarantined or
+     *                                dead-lettered as poison
+     * @throws CorruptLedgerException when the ride's {@code quote_hold} rows are not a valid hold
+     * @throws LedgerConflictException when the database refused a second {@code quote_hold} for
+     *                                 the ride; the transaction rolls back and the event is not
+     *                                 recorded
      */
     @Transactional(timeoutString = "${metroride.postgres.timeout-seconds}")
     public Result record(String stream, Envelope envelope) {
@@ -100,12 +135,15 @@ public class ProcessedEventRecorder {
         if (inserted == 0) {
             return Result.duplicate();
         }
-        if (!Envelope.TYPE_RIDE_ASSIGNED.equals(envelope.type())) {
-            return Result.recorded();
-        }
-        JournalEntry quoteHold = quoteHold(envelope);
-        ledger.append(quoteHold, clock.instant());
-        return Result.quoted(quoteHold);
+        return switch (envelope.type()) {
+            case Envelope.TYPE_RIDE_ASSIGNED -> {
+                JournalEntry quoteHold = quoteHold(envelope);
+                ledger.append(quoteHold, clock.instant());
+                yield Result.recorded(List.of(quoteHold));
+            }
+            case Envelope.TYPE_RIDE_COMPLETED -> Result.recorded(settle(envelope));
+            default -> Result.recorded();
+        };
     }
 
     private JournalEntry quoteHold(Envelope envelope) {
@@ -113,18 +151,87 @@ public class ProcessedEventRecorder {
         try {
             assignment = codec.decodePayload(envelope, RideAssigned.class);
         } catch (EnvelopeDecodeException e) {
-            throw new FareQuoteException(Reason.PAYLOAD, e.getMessage(), e);
+            throw new FareQuoteException(FareQuoteException.Reason.PAYLOAD, e.getMessage(), e);
         }
         if (assignment.rideId() == null || assignment.rideId().isBlank()) {
-            throw new FareQuoteException(Reason.PAYLOAD,
+            throw new FareQuoteException(FareQuoteException.Reason.PAYLOAD,
                     "ride_assigned payload of event " + envelope.id() + " has no ride_id", null);
         }
         try {
             Money quote = calculator.quote(assignment.distanceKm(), assignment.etaSeconds());
             return JournalEntry.quoteHold(assignment.rideId(), envelope.id(), quote);
         } catch (IllegalArgumentException e) {
-            throw new FareQuoteException(Reason.CALCULATION,
+            throw new FareQuoteException(FareQuoteException.Reason.CALCULATION,
                     "quote for ride " + assignment.rideId() + " from event " + envelope.id() + ": " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Settlement by quote: the amount settled is the amount held, not a recomputed fare. In order:
+     *
+     * <ol>
+     *   <li>Decode the payload; an unusable one is poison ({@link SettlementException.Reason#PAYLOAD}),
+     *       never a missing hold, or an entry that can never name its ride would be retried
+     *       forever as "assignment not here yet".</li>
+     *   <li>Lock the ride's {@code quote_hold} rows ({@code select ... for update}). Zero rows: the
+     *       assignment has not arrived, retryable. More than one: a state the V3 unique index makes
+     *       impossible, so the index is gone or the schema has drifted; fatal, the consumer halts
+     *       rather than settle against the first of several holds.</li>
+     *   <li>Check the one hold has the shape {@link JournalEntry#quoteHold} writes; anything else
+     *       is a {@link CorruptLedgerException}, quarantined.</li>
+     *   <li>With the lock held, check the ride is not settled yet; if it is, quarantined as
+     *       {@code already_settled}. This is what stops two different completion events for one
+     *       ride, from a replayed dead letter for instance, from settling the ride twice: the
+     *       second waits on the hold's row lock and then sees the first's settlement.</li>
+     *   <li>Append the {@code hold_reversal} and the {@code settlement}, both under this event's ID.
+     *       Should a second settlement slip past the check above, the per-ride unique index on
+     *       settlements refuses it and the whole transaction, reversal included, rolls back; that
+     *       is reported as {@code already_settled} too.</li>
+     * </ol>
+     */
+    private List<JournalEntry> settle(Envelope envelope) {
+        RideCompleted completion;
+        try {
+            completion = codec.decodePayload(envelope, RideCompleted.class);
+        } catch (EnvelopeDecodeException e) {
+            throw new SettlementException(SettlementException.Reason.PAYLOAD, e.getMessage(), e);
+        }
+        if (completion.rideId() == null || completion.rideId().isBlank()) {
+            throw new SettlementException(SettlementException.Reason.PAYLOAD,
+                    "ride_completed payload of event " + envelope.id() + " has no ride_id");
+        }
+        String rideId = completion.rideId();
+
+        List<StoredJournalEntry> holds = ledger.lockQuoteHolds(rideId);
+        if (holds.isEmpty()) {
+            throw new SettlementException(SettlementException.Reason.MISSING_HOLD,
+                    "no quote_hold for ride " + rideId + " yet (event " + envelope.id() + "); its ride_assigned may not have arrived");
+        }
+        if (holds.size() > 1) {
+            throw new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD,
+                    "ride " + rideId + " has " + holds.size() + " quote_hold entries, which the unique index"
+                            + " journal_entries_one_quote_hold_per_ride should make impossible (event " + envelope.id() + ")");
+        }
+        Money quote = QuoteHoldShape.amountOf(rideId, holds.get(0).entry().postings());
+        if (ledger.hasSettlement(rideId)) {
+            throw new SettlementException(SettlementException.Reason.ALREADY_SETTLED,
+                    "ride " + rideId + " is already settled; event " + envelope.id() + " would settle it again");
+        }
+
+        JournalEntry reversal = JournalEntry.holdReversal(rideId, envelope.id(), quote);
+        JournalEntry settlement = JournalEntry.settlement(rideId, envelope.id(), quote, rates.driverShare());
+        Instant now = clock.instant();
+        try {
+            ledger.append(reversal, now);
+            ledger.append(settlement, now);
+        } catch (LedgerConflictException conflict) {
+            if (conflict.conflict() != LedgerConflictException.Conflict.DUPLICATE_SETTLEMENT) {
+                throw conflict;
+            }
+            throw new SettlementException(SettlementException.Reason.ALREADY_SETTLED,
+                    "ride " + rideId + " was settled by another transaction; event " + envelope.id()
+                            + " refused by " + conflict.conflict().indexName(), conflict);
+        }
+        return List.of(reversal, settlement);
     }
 }

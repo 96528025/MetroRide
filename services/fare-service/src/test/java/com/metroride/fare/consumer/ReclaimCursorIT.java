@@ -35,7 +35,8 @@ import org.springframework.test.context.TestPropertySource;
  * locked entries are not dead-lettered during the test.
  */
 @TestPropertySource(properties = {
-        "metroride.consumer.stream=events.ride.assignments.reclaim-cursor-test",
+        "metroride.consumer.streams[0]=events.ride.assignments.reclaim-cursor-test",
+        "metroride.consumer.streams[1]=events.ride.completions.reclaim-cursor-test",
         "metroride.consumer.batch-size=2",
         "metroride.consumer.reclaim-interval=1s",
         "metroride.consumer.reclaim-min-idle=1s",
@@ -55,7 +56,7 @@ class ReclaimCursorIT extends IntegrationTestSupport {
     MeterRegistry meterRegistry;
 
     @Autowired
-    RideAssignmentConsumer streamConsumer;
+    RideEventConsumer streamConsumer;
 
     @Test
     void anEntryBehindPersistentlyFailingOnesIsStillReclaimed() throws Exception {
@@ -70,7 +71,7 @@ class ReclaimCursorIT extends IntegrationTestSupport {
                 try (PreparedStatement insert = lockHolders[i].prepareStatement(
                         "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
                     insert.setString(1, eventIds.get(i));
-                    insert.setString(2, consumer.stream());
+                    insert.setString(2, assignments());
                     insert.setString(3, "ride_assigned");
                     insert.executeUpdate();
                 }
@@ -88,7 +89,7 @@ class ReclaimCursorIT extends IntegrationTestSupport {
             // already in the pending list behind them, i.e. delivered and failed (the consumer is one
             // thread, so no pass runs while an entry is still being handled).
             await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-                assertThat(streamConsumer.reclaimCursor(consumer.stream())).isEqualTo(third.getValue());
+                assertThat(streamConsumer.reclaimCursor(assignments())).isEqualTo(third.getValue());
                 assertThat(processedRows(eventIds.get(2))).isZero();
             });
             assertThat(isPending(first)).isTrue();
@@ -129,22 +130,27 @@ class ReclaimCursorIT extends IntegrationTestSupport {
         });
         // With nothing left pending a full scan completes and the cursor rests at the head again.
         await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                assertThat(streamConsumer.reclaimCursor(consumer.stream())).isEqualTo(RideAssignmentConsumer.RECLAIM_FROM_START));
+                assertThat(streamConsumer.reclaimCursor(assignments())).isEqualTo(RideEventConsumer.RECLAIM_FROM_START));
+    }
+
+    /** The assignments stream: first in {@code metroride.consumer.streams}. */
+    private String assignments() {
+        return consumer.streams().get(0);
     }
 
     private RecordId publish(String envelopeJson) {
         return redisTemplate.opsForStream().add(StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, envelopeJson))
-                .withStreamKey(consumer.stream()));
+                .withStreamKey(assignments()));
     }
 
     private boolean isPending(RecordId id) {
         return !redisTemplate.opsForStream()
-                .pending(consumer.stream(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
+                .pending(assignments(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
                 .isEmpty();
     }
 
     private long pendingEntries() {
-        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+        return redisTemplate.opsForStream().pending(assignments(), consumer.group()).getTotalPendingMessages();
     }
 
     private int processedRows(String eventId) {
@@ -155,7 +161,7 @@ class ReclaimCursorIT extends IntegrationTestSupport {
 
     private double deadLetterCount(String reason) {
         return meterRegistry.get("metroride.fare.dead_letters")
-                .tag("stream", consumer.stream()).tag("reason", reason).counter().count();
+                .tag("stream", assignments()).tag("reason", reason).counter().count();
     }
 
     private double postgresErrorCount() {

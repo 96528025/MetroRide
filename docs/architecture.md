@@ -34,7 +34,7 @@ Separating these responsibilities makes the architecture easier to scale and rea
 | `routing-service` | Default | Driver proximity and ETA calculation | In-memory driver cache hydrated from events |
 | `traffic-service` | Default | Regional congestion simulation | In-memory traffic model, Redis Stream output |
 | `notification-service` | Default | Simulated rider/driver notification handling | Consumer group offsets |
-| `fare-service` | Optional `fare` profile | Consumes `events.ride.assignments`, records each envelope ID once, quotes the fare and holds it in a double-entry ledger (Java) | PostgreSQL `fare.processed_events`, `fare.journal_entries`, `fare.postings`, consumer group offsets |
+| `fare-service` | Optional `fare` profile | Consumes `events.ride.assignments` and `events.ride.completions`, records each envelope ID once, quotes the fare and holds it in a double-entry ledger, and on completion reverses the hold and settles the quoted amount (Java) | PostgreSQL `fare.processed_events`, `fare.journal_entries`, `fare.postings`, consumer group offsets |
 | `analytics-service` | Optional `kafka` profile | Driver-location telemetry analytics | In-memory view hydrated from a Kafka consumer group |
 
 ## Event-Driven Architecture
@@ -47,6 +47,7 @@ Streams (constants in `shared/pkg/events/events.go`):
 - `events.driver.locations`
 - `events.ride.assignments`
 - `events.ride.notifications`
+- `events.ride.completions`
 - `events.traffic.updates`
 - `events.dead_letter`
 
@@ -55,10 +56,11 @@ Event types that are emitted today:
 - `ride_requested` (rider-service, via the outbox)
 - `driver_location_updated` (driver-service, direct `XADD`)
 - `ride_assigned` (dispatch-service, via the outbox, to both the assignments and notifications streams)
+- `ride_completed` (rider-service, via the outbox, to `events.ride.completions`, when `POST /v1/rides/{ride_id}/complete` moves an `assigned` ride to `completed`)
 - `traffic_updated` (traffic-service, direct `XADD`)
-- `dead_lettered` (dispatch-service, after retries are exhausted; direct `XADD`, not via the outbox, retried three times; if all publish attempts fail, no dead-letter record is persisted and the source message remains unacknowledged in the consumer group's pending list. Also fare-service, for an entry it cannot decode or quote, or one whose PostgreSQL write failed on 25 deliveries; same envelope and payload shape, one `XADD` attempt per delivery, and the source entry is reclaimed and tried again if that `XADD` fails; label `reason=poison|max_deliveries_reached`)
+- `dead_lettered` (dispatch-service, after retries are exhausted; direct `XADD`, not via the outbox, retried three times; if all publish attempts fail, no dead-letter record is persisted and the source message remains unacknowledged in the consumer group's pending list. Also fare-service, for an entry it cannot decode or quote, or one whose PostgreSQL write failed on 25 deliveries, or a completion whose ride's ledger cannot be settled (a malformed hold, or a ride already settled), or a second assignment for a ride that already has a hold (refused by a partial unique index); same envelope and payload shape, one `XADD` attempt per delivery, and the source entry is reclaimed and tried again if that `XADD` fails; label `reason=poison|max_deliveries_reached|duplicate_hold|corrupt_hold|already_settled`)
 
-`ride_completed` and `notification_created` are defined as constants but nothing publishes them yet.
+`notification_created` is defined as a constant but nothing publishes it yet.
 
 The shared event envelope includes event ID, type, source, correlation ID, timestamp, and payload. This keeps service contracts stable and gives the project a migration path to Kafka without changing domain payloads.
 
@@ -73,7 +75,8 @@ The shared event envelope includes event ID, type, source, correlation ID, times
 7. `dispatch-service` commits the assignment, status update, and pending assignment and notification outbox events together.
 8. Its relay publishes both pending events to their Redis Streams asynchronously.
 9. `notification-service` consumes notification events and logs simulated delivery.
-10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and, in one transaction, records its envelope ID in `fare.processed_events`, quotes the fare from `distance_km` and `eta_seconds`, and appends a `quote_hold` journal entry with two postings that sum to zero; a redelivery is acknowledged without a second row or a second entry. Nothing settles the hold yet because no service publishes `ride_completed`.
+10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and, in one transaction, records its envelope ID in `fare.processed_events`, quotes the fare from `distance_km` and `eta_seconds`, and appends a `quote_hold` journal entry with two postings that sum to zero; a redelivery is acknowledged without a second row or a second entry.
+11. `POST /v1/rides/{ride_id}/complete` on `rider-service` moves the ride from `assigned` to `completed` with a conditional update, requires exactly one `ride_assignments` row, and commits a `ride_completed` outbox event in the same transaction; its relay publishes it to `events.ride.completions`. `fare-service` consumes it and, in one transaction, locks the ride's `quote_hold` (`select ... for update`), refuses a malformed hold or an existing settlement (dead-lettered under its own reason; a second hold for a ride cannot exist, a partial unique index refuses it and the second assignment event is dead-lettered as `duplicate_hold`), and otherwise appends a `hold_reversal` and a `settlement` that splits the quoted amount between `driver_payable` (the configured driver share, rounded once) and `platform_revenue` (the remainder). A completion that arrives before its assignment stays pending and is retried by the reclaim pass until the hold exists. Settlement is by quote; no actual distance or time is metered.
 
 ## Why Redis Streams?
 

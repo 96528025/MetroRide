@@ -53,7 +53,8 @@ import org.springframework.test.context.TestPropertySource;
  * deliveries are still failing; only the test's {@code XCLAIM} makes entries claimable.
  */
 @TestPropertySource(properties = {
-        "metroride.consumer.stream=events.ride.assignments.delivery-count-test",
+        "metroride.consumer.streams[0]=events.ride.assignments.delivery-count-test",
+        "metroride.consumer.streams[1]=events.ride.completions.delivery-count-test",
         "metroride.consumer.batch-size=2",
         "metroride.consumer.reclaim-interval=1s",
         "metroride.consumer.reclaim-min-idle=30s",
@@ -99,7 +100,7 @@ class DeliveryCountLookupIT extends IntegrationTestSupport {
                 try (PreparedStatement insert = lockHolders[i].prepareStatement(
                         "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
                     insert.setString(1, eventIds.get(i));
-                    insert.setString(2, consumer.stream());
+                    insert.setString(2, assignments());
                     insert.setString(3, "ride_assigned");
                     insert.executeUpdate();
                 }
@@ -123,8 +124,8 @@ class DeliveryCountLookupIT extends IntegrationTestSupport {
             refresher = new Thread(() -> {
                 while (refreshing.get()) {
                     // JUSTID: reset (or set) the idle time without counting a delivery.
-                    commands.xclaim(consumer.stream(), owner, XClaimArgs.Builder.justid().minIdleTime(0).idle(0), middle);
-                    commands.xclaim(consumer.stream(), owner, XClaimArgs.Builder.justid().minIdleTime(0).idle(60_000), first, last);
+                    commands.xclaim(assignments(), owner, XClaimArgs.Builder.justid().minIdleTime(0).idle(0), middle);
+                    commands.xclaim(assignments(), owner, XClaimArgs.Builder.justid().minIdleTime(0).idle(60_000), first, last);
                     try {
                         Thread.sleep(200);
                     } catch (InterruptedException e) {
@@ -154,7 +155,7 @@ class DeliveryCountLookupIT extends IntegrationTestSupport {
                 lockHolders[i].rollback();
             }
             // Make the five claimable now instead of after 30s of idle time.
-            commands.xclaim(consumer.stream(), owner, XClaimArgs.Builder.justid().minIdleTime(0).idle(60_000), middle);
+            commands.xclaim(assignments(), owner, XClaimArgs.Builder.justid().minIdleTime(0).idle(60_000), middle);
         } finally {
             refreshing.set(false);
             for (Connection holder : lockHolders) {
@@ -173,19 +174,24 @@ class DeliveryCountLookupIT extends IntegrationTestSupport {
         assertThat(deadLetterCount("max_deliveries_reached")).isEqualTo(exhaustedBefore + 2);
     }
 
+    /** The assignments stream: first in {@code metroride.consumer.streams}. */
+    private String assignments() {
+        return consumer.streams().get(0);
+    }
+
     private RecordId publish(String envelopeJson) {
         return redisTemplate.opsForStream().add(StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, envelopeJson))
-                .withStreamKey(consumer.stream()));
+                .withStreamKey(assignments()));
     }
 
     private boolean isPending(RecordId id) {
         return !redisTemplate.opsForStream()
-                .pending(consumer.stream(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
+                .pending(assignments(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
                 .isEmpty();
     }
 
     private long pendingEntries() {
-        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+        return redisTemplate.opsForStream().pending(assignments(), consumer.group()).getTotalPendingMessages();
     }
 
     private int processedRows(String eventId) {
@@ -196,7 +202,7 @@ class DeliveryCountLookupIT extends IntegrationTestSupport {
 
     private double deadLetterCount(String reason) {
         return meterRegistry.get("metroride.fare.dead_letters")
-                .tag("stream", consumer.stream()).tag("reason", reason).counter().count();
+                .tag("stream", assignments()).tag("reason", reason).counter().count();
     }
 
     private double postgresErrorCount() {

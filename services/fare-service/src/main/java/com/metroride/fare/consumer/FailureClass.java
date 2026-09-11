@@ -12,9 +12,8 @@ import org.springframework.transaction.TransactionException;
 
 /**
  * What the consumer does with a stream entry whose handling threw. The mapping lives here, not in
- * the consumer, so the next failure modes (a completion whose hold is not in the ledger yet, a
- * completion whose ride has more than one hold) are added by extending {@link #of} and its unit
- * test, without touching the consumer loop.
+ * the consumer, so a new failure mode is added by extending {@link #of} (or by raising a
+ * {@link ClassifiedFailure}) and its unit test, without touching the consumer loop.
  */
 public enum FailureClass {
 
@@ -31,6 +30,16 @@ public enum FailureClass {
     POISON,
 
     /**
+     * The entry may be fine, but the state it must be applied to is not: the ride's ledger has two
+     * holds, a hold that is not the entry this service writes, or a settlement already. Retrying
+     * cannot repair an append-only ledger, and halting would let one ride stop every other ride,
+     * so the entry is set aside like poison (dead-lettered, then acknowledged) under a reason of
+     * its own so it is alerted on separately. The reason comes from the exception itself, which
+     * implements {@link ClassifiedFailure}.
+     */
+    QUARANTINE,
+
+    /**
      * The failure is not the entry's but the deployment's: wrong SQL, a schema that does not match
      * the code, misuse of a data-access API, or a broken database invariant. Every entry would fail
      * the same way, so neither retrying nor dead-lettering is right; the entry stays pending and the
@@ -42,6 +51,8 @@ public enum FailureClass {
      * Pure mapping from the exceptions {@code handle()} can see to a class.
      *
      * <ul>
+     *   <li>A {@link ClassifiedFailure} says which class it is; this rule comes first, so a
+     *       settlement failure or a corrupt ledger is classified by the code that detected it.</li>
      *   <li>{@link EnvelopeDecodeException} (the entry is not an envelope) and
      *       {@link FareQuoteException} (the payload cannot be quoted) are {@link #POISON}: the
      *       entry's bytes will not change, so a second delivery fails the same way.</li>
@@ -67,6 +78,9 @@ public enum FailureClass {
      * </ul>
      */
     public static FailureClass of(Throwable failure) {
+        if (failure instanceof ClassifiedFailure classified) {
+            return classified.failureClass();
+        }
         if (failure instanceof EnvelopeDecodeException || failure instanceof FareQuoteException) {
             return POISON;
         }

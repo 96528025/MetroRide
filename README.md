@@ -38,7 +38,7 @@ flowchart LR
     Fare -.->|poison entry, or 25 failed deliveries| DLQ
 ```
 
-`POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`.
+`POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`. `POST /v1/rides/{ride_id}/complete` then moves an `assigned` ride to `completed` and commits a `ride_completed` outbox event with it (`202`; `409 {"error":"ride is <status>"}` for any other status, `404` for an unknown ride).
 
 ### Services
 
@@ -46,13 +46,13 @@ Six core services form the default Docker Compose profile, the Helm chart, and t
 
 | Service | Port | Does | Depends on |
 | --- | --- | --- | --- |
-| `rider-service` | 8080 | Accepts and reads rides; commits ride + outbox row; runs its relay | PostgreSQL (readiness), Redis (relay only) |
+| `rider-service` | 8080 | Accepts and reads rides; completes an assigned ride (`POST /v1/rides/{ride_id}/complete`, conditional update on `status = 'assigned'`, exactly one `ride_assignments` row required); commits ride + outbox row; runs its relay | PostgreSQL (readiness), Redis (relay only) |
 | `driver-service` | 8081 | Moves four simulated drivers; publishes locations every 2 s | Redis; Kafka when enabled |
 | `dispatch-service` | 8082 | Consumes ride requests, calls routing, commits assignment + outbox rows, dead-letters failures | PostgreSQL, Redis, routing-service |
 | `routing-service` | 8083 | Keeps an in-memory driver view; returns nearest available driver (`haversine-nearest`, O(n) scan, ETA at 32 km/h with a 60 s floor) | Redis |
 | `traffic-service` | 8084 | Publishes simulated congestion every 10 s (not yet consumed) | Redis |
 | `notification-service` | 8085 | Consumes assignment notifications; logs them and counts them | Redis |
-| `fare-service` | 8087 | Consumes `events.ride.assignments`; records each envelope ID once, quotes the fare from distance and ETA, and holds it as a balanced `quote_hold` entry in a double-entry ledger in the `fare` PostgreSQL schema; `GET /v1/rides/{ride_id}/ledger` (Java 21, Spring Boot); optional `fare` Compose profile | PostgreSQL, Redis |
+| `fare-service` | 8087 | Consumes `events.ride.assignments` and `events.ride.completions`; records each envelope ID once, quotes the fare from distance and ETA and holds it as a balanced `quote_hold` entry in a double-entry ledger in the `fare` PostgreSQL schema, then on completion reverses the hold and settles the quoted amount into `driver_payable` and `platform_revenue`; `GET /v1/rides/{ride_id}/ledger` (Java 21, Spring Boot); optional `fare` Compose profile | PostgreSQL, Redis |
 | `analytics-service` | 8086 | Optional Kafka consumer; latest location per driver at `GET /v1/analytics/drivers` | Kafka |
 
 ### Streams
@@ -63,6 +63,7 @@ Six core services form the default Docker Compose profile, the Helm chart, and t
 | `events.driver.locations` | driver-service | routing-service (group) | direct `XADD` |
 | `events.ride.assignments` | dispatch-service | fare-service (group, optional `fare` profile) | outbox relay |
 | `events.ride.notifications` | dispatch-service | notification-service (group) | outbox relay |
+| `events.ride.completions` | rider-service | fare-service (group, optional `fare` profile) | outbox relay |
 | `events.traffic.updates` | traffic-service | none yet | direct `XADD` |
 | `events.dead_letter` | dispatch-service, fare-service | none (inspection) | direct `XADD`; dispatch 3 attempts, fare-service one per delivery of the failed entry |
 

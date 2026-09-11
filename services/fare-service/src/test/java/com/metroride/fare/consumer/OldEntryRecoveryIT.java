@@ -33,7 +33,8 @@ import org.springframework.test.context.TestPropertySource;
  * the first entry of the stream, which is why this class has a single test.
  */
 @TestPropertySource(properties = {
-        "metroride.consumer.stream=events.ride.assignments.old-entry-test",
+        "metroride.consumer.streams[0]=events.ride.assignments.old-entry-test",
+        "metroride.consumer.streams[1]=events.ride.completions.old-entry-test",
         "metroride.consumer.reclaim-interval=1s",
         "metroride.consumer.reclaim-min-idle=1s"})
 class OldEntryRecoveryIT extends IntegrationTestSupport {
@@ -67,7 +68,7 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
             try (PreparedStatement insert = lockHolder.prepareStatement(
                     "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
                 insert.setString(1, eventId);
-                insert.setString(2, consumer.stream());
+                insert.setString(2, assignments());
                 insert.setString(3, "ride_assigned");
                 insert.executeUpdate();
             }
@@ -75,7 +76,7 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
 
             RecordId entry = redisTemplate.opsForStream().add(
                     StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, goEnvelope(eventId, rideId)))
-                            .withStreamKey(consumer.stream())
+                            .withStreamKey(assignments())
                             .withId(RecordId.of(ANCIENT_ID)));
             assertThat(entry.getValue()).isEqualTo(ANCIENT_ID);
 
@@ -96,14 +97,19 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
         assertThat(deadLetterCount("max_deliveries_reached") + deadLetterCount("poison")).isEqualTo(deadLettersBefore);
     }
 
+    /** The assignments stream: first in {@code metroride.consumer.streams}. */
+    private String assignments() {
+        return consumer.streams().get(0);
+    }
+
     private boolean isPending(RecordId id) {
         return !redisTemplate.opsForStream()
-                .pending(consumer.stream(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
+                .pending(assignments(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
                 .isEmpty();
     }
 
     private long pendingEntries() {
-        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+        return redisTemplate.opsForStream().pending(assignments(), consumer.group()).getTotalPendingMessages();
     }
 
     private int processedRows(String eventId) {
@@ -114,11 +120,11 @@ class OldEntryRecoveryIT extends IntegrationTestSupport {
 
     private double deadLetterCount(String reason) {
         return meterRegistry.get("metroride.fare.dead_letters")
-                .tag("stream", consumer.stream()).tag("reason", reason).counter().count();
+                .tag("stream", assignments()).tag("reason", reason).counter().count();
     }
 
     private double reclaimedCount() {
-        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
+        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", assignments()).counter().count();
     }
 
     private double postgresErrorCount() {

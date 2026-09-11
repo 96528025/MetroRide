@@ -15,7 +15,10 @@ import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.consumer.FailureHandler.Disposition;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeDecodeException;
+import com.metroride.fare.ledger.CorruptLedgerException;
+import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.pricing.FareQuoteException;
+import com.metroride.fare.processing.SettlementException;
 import io.lettuce.core.RedisCommandTimeoutException;
 import io.lettuce.core.StreamMessage;
 import io.lettuce.core.api.sync.RedisCommands;
@@ -25,6 +28,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -50,6 +54,7 @@ import org.springframework.jdbc.BadSqlGrammarException;
 class FailureHandlerTest {
 
     private static final String STREAM = "events.ride.assignments";
+    private static final String COMPLETIONS = "events.ride.completions";
     private static final String GROUP = "fare-service";
     private static final String MESSAGE_ID = "1788642754475-0";
     private static final int MAX_DELIVERIES = 3;
@@ -63,7 +68,7 @@ class FailureHandlerTest {
 
     @BeforeEach
     void handler() {
-        ConsumerProperties properties = new ConsumerProperties(STREAM, GROUP, "fare-service-1", 10,
+        ConsumerProperties properties = new ConsumerProperties(List.of(STREAM, COMPLETIONS), GROUP, "fare-service-1", 10,
                 Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(5), Duration.ofSeconds(5), MAX_DELIVERIES);
         handler = new FailureHandler(properties, publisher, halt,
                 Clock.fixed(Instant.parse("2026-09-08T14:03:07Z"), ZoneOffset.UTC), registry);
@@ -182,6 +187,143 @@ class FailureHandlerTest {
         assertThat(deadLetters("poison")).isEqualTo(1);
     }
 
+    /**
+     * Quarantine is poison's disposition with the exception's own reason: dead letter first, then
+     * ack. A second hold refused by the database is counted on the dead-letter series alone: it is
+     * not a settlement failure (the event was an assignment) and not a consume error.
+     */
+    @Test
+    void aQuarantinedFailureIsDeadLetteredUnderItsOwnReasonThenAcknowledged() {
+        when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(true);
+        LedgerConflictException duplicateHold = new LedgerConflictException(
+                LedgerConflictException.Conflict.DUPLICATE_HOLD, "ride r1 already has a quote_hold", null);
+
+        Disposition disposition = handler.onFailure(commands, message(), envelope(), duplicateHold, 1);
+
+        assertThat(disposition).isEqualTo(Disposition.DEAD_LETTERED);
+        InOrder order = inOrder(publisher, commands);
+        order.verify(publisher).publish(eq(commands), eq(message()), eq(envelope()), eq(duplicateHold));
+        order.verify(commands).xack(STREAM, GROUP, MESSAGE_ID);
+        assertThat(deadLetters("duplicate_hold")).isEqualTo(1);
+        assertThat(deadLetters("poison")).isZero();
+        for (String reason : FailureHandler.SETTLEMENT_FAILURE_REASONS) {
+            assertThat(settlementFailures(reason)).as(reason).isZero();
+        }
+        assertThat(consumeErrors()).isZero();
+        assertThat(postgresErrors()).isZero();
+        assertThat(halt.isHalted()).isFalse();
+    }
+
+    /**
+     * Two holds for one ride mean the V3 unique index is not doing its job: fatal. The consumer
+     * halts with the entry pending; nothing is dead-lettered, and the failure is still counted
+     * under its settlement reason so the halt is attributable.
+     */
+    @Test
+    void twoHoldsForOneRideHaltTheConsumerWithoutDeadLettering() {
+        SettlementException ambiguous = new SettlementException(
+                SettlementException.Reason.AMBIGUOUS_HOLD, "ride r1 has 2 quote_hold entries");
+
+        Disposition disposition = handler.onFailure(commands, message(), envelope(), ambiguous, 1);
+
+        assertThat(disposition).isEqualTo(Disposition.HALT);
+        verifyNoInteractions(publisher);
+        verifyNoInteractions(commands);
+        assertThat(halt.isHalted()).isTrue();
+        assertThat(halt.reason()).hasValueSatisfying(reason -> assertThat(reason).contains("2 quote_hold"));
+        assertThat(settlementFailures("ambiguous_hold")).isEqualTo(1);
+    }
+
+    @Test
+    void anAlreadySettledRideIsQuarantinedUnderAlreadySettled() {
+        when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(true);
+
+        handler.onFailure(commands, message(), envelope(),
+                new SettlementException(SettlementException.Reason.ALREADY_SETTLED, "ride r1 is already settled"), 1);
+
+        assertThat(deadLetters("already_settled")).isEqualTo(1);
+        assertThat(settlementFailures("already_settled")).isEqualTo(1);
+        verify(commands).xack(STREAM, GROUP, MESSAGE_ID);
+    }
+
+    @Test
+    void aCorruptHoldIsQuarantinedUnderCorruptHoldNotHalted() {
+        when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(true);
+
+        Disposition disposition = handler.onFailure(commands, message(), envelope(),
+                new CorruptLedgerException("quote_hold of ride r1 posts to driver_payable"), 1);
+
+        assertThat(disposition).isEqualTo(Disposition.DEAD_LETTERED);
+        assertThat(deadLetters("corrupt_hold")).isEqualTo(1);
+        assertThat(settlementFailures("corrupt_hold")).isEqualTo(1);
+        assertThat(halt.isHalted()).isFalse();
+        verify(commands).xack(STREAM, GROUP, MESSAGE_ID);
+    }
+
+    @Test
+    void aQuarantinedEntryWhoseDeadLetterWasNotConfirmedIsLeftPending() {
+        when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(false);
+
+        Disposition disposition = handler.onFailure(commands, message(), envelope(),
+                new SettlementException(SettlementException.Reason.ALREADY_SETTLED, "ride r1 is already settled"), 1);
+
+        assertThat(disposition).isEqualTo(Disposition.LEFT_PENDING);
+        verify(commands, never()).xack(anyString(), anyString(), any());
+        assertThat(deadLetters("already_settled")).isZero();
+        assertThat(publishFailures()).isEqualTo(1);
+    }
+
+    /** A missing hold is retried like a lock wait, and every failed delivery is counted. */
+    @Test
+    void aMissingHoldIsLeftPendingAndCountedOnEveryDeliveryUntilTheCap() {
+        SettlementException missing = new SettlementException(
+                SettlementException.Reason.MISSING_HOLD, "no quote_hold for ride r1 yet");
+
+        assertThat(handler.onFailure(commands, message(), envelope(), missing, 1)).isEqualTo(Disposition.LEFT_PENDING);
+        assertThat(handler.onFailure(commands, message(), envelope(), missing, 2)).isEqualTo(Disposition.LEFT_PENDING);
+        verifyNoInteractions(publisher);
+        verifyNoInteractions(commands);
+        assertThat(settlementFailures("missing_hold")).isEqualTo(2);
+        assertThat(postgresErrors()).isZero();
+
+        when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(true);
+        assertThat(handler.onFailure(commands, message(), envelope(), missing, MAX_DELIVERIES)).isEqualTo(Disposition.DEAD_LETTERED);
+        assertThat(settlementFailures("missing_hold")).isEqualTo(3);
+        assertThat(deadLetters("max_deliveries_reached")).isEqualTo(1);
+    }
+
+    /** A completion whose payload cannot name a ride is poison, and never counted as a missing hold. */
+    @Test
+    void anUnusableCompletionPayloadIsPoisonNotAMissingHold() {
+        when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(true);
+
+        Disposition disposition = handler.onFailure(commands, message(), envelope(),
+                new SettlementException(SettlementException.Reason.PAYLOAD, "ride_completed payload of event e1 has no ride_id"), 1);
+
+        assertThat(disposition).isEqualTo(Disposition.DEAD_LETTERED);
+        assertThat(deadLetters("poison")).isEqualTo(1);
+        assertThat(settlementFailures("missing_hold")).isZero();
+        assertThat(consumeErrors()).isEqualTo(1);
+    }
+
+    /** Every per-stream series exists at zero for every configured stream, not only the first. */
+    @Test
+    void perStreamSeriesAreRegisteredForEveryConfiguredStream() {
+        for (String stream : List.of(STREAM, COMPLETIONS)) {
+            for (DeadLetterReason reason : DeadLetterReason.values()) {
+                assertThat(registry.get("metroride.fare.dead_letters").tag("stream", stream)
+                        .tag("reason", reason.label()).counter().count()).isZero();
+            }
+            assertThat(registry.get("metroride.fare.dead_letter.publish.failures").tag("stream", stream).counter().count()).isZero();
+            assertThat(registry.get("metroride.stream.consume.errors").tag("stream", stream).counter().count()).isZero();
+        }
+        for (String reason : FailureHandler.SETTLEMENT_FAILURE_REASONS) {
+            assertThat(settlementFailures(reason)).isZero();
+        }
+        assertThat(FailureHandler.SETTLEMENT_FAILURE_REASONS)
+                .containsExactly("missing_hold", "ambiguous_hold", "corrupt_hold", "already_settled");
+    }
+
     @Test
     void acknowledgeReportsWhetherRedisConfirmed() {
         assertThat(handler.acknowledge(commands, message())).isTrue();
@@ -210,6 +352,10 @@ class FailureHandlerTest {
 
     private double deadLetters(String reason) {
         return registry.get("metroride.fare.dead_letters").tag("stream", STREAM).tag("reason", reason).counter().count();
+    }
+
+    private double settlementFailures(String reason) {
+        return registry.get("metroride.fare.settlement.failures").tag("reason", reason).counter().count();
     }
 
     private double publishFailures() {

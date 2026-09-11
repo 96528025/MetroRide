@@ -1,6 +1,7 @@
 package com.metroride.fare.config;
 
 import java.time.Duration;
+import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
@@ -8,7 +9,13 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * {@code application.yml}. {@code group} and {@code name} come from {@code CONSUMER_GROUP} and
  * {@code CONSUMER_NAME}, the same variables the Go consumers read.
  *
- * @param stream          stream to consume; {@code events.ride.assignments}, see {@code shared/pkg/events/events.go}
+ * @param streams         streams to consume, all through the same group and consumer name and one
+ *                        {@code XREADGROUP}: {@code events.ride.assignments} and
+ *                        {@code events.ride.completions}, see {@code shared/pkg/events/events.go}.
+ *                        Order is not significant to the consumer (envelopes are dispatched by
+ *                        type, not by stream); {@code application.yml} lists the assignments stream
+ *                        first and the completions stream second, and the integration tests rely
+ *                        on that order to know which stream to publish on
  * @param group           consumer group name
  * @param name            this consumer's name inside the group
  * @param batchSize       {@code COUNT} for each {@code XREADGROUP} and each {@code XAUTOCLAIM}
@@ -24,7 +31,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  */
 @ConfigurationProperties(prefix = "metroride.consumer")
 public record ConsumerProperties(
-        String stream,
+        List<String> streams,
         String group,
         String name,
         int batchSize,

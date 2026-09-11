@@ -84,6 +84,30 @@ class DeadLetterPublisherTest {
         assertThat(payload.get("failed_at").asText()).isEqualTo("2026-09-08T14:03:07.123456789Z");
     }
 
+    /** For a {@code ride_completed} the ride ID is read from the payload, as for a {@code ride_assigned}. */
+    @Test
+    void aCompletionsRideIdIsTakenFromItsPayload() throws Exception {
+        String eventId = UUID.randomUUID().toString();
+        String rideId = UUID.randomUUID().toString();
+        // An empty correlation_id, so the value can only have come from the payload.
+        Envelope original = new EnvelopeCodec(mapper).decode(MESSAGE_ID, Map.of(EnvelopeCodec.EVENT_FIELD,
+                "{\"id\":\"" + eventId + "\",\"type\":\"ride_completed\",\"source\":\"rider-service\","
+                        + "\"correlation_id\":\"\",\"occurred_at\":\"2026-09-10T21:12:34.293710969Z\","
+                        + "\"payload\":{\"ride_id\":\"" + rideId + "\",\"rider_id\":\"rider-42\",\"driver_id\":\"driver-2\","
+                        + "\"assignment_id\":\"a1\",\"completed_at\":\"2026-09-10T21:12:34.293710969Z\"}}"));
+
+        JsonNode json = mapper.readTree(mapper.writeValueAsString(publisher.envelope(
+                new StreamMessage<>("events.ride.completions", MESSAGE_ID, Map.of(EnvelopeCodec.EVENT_FIELD, "{}")),
+                original, new IllegalStateException("ride " + rideId + " is already settled"))));
+
+        assertThat(json.get("correlation_id").asText()).isEqualTo(rideId);
+        JsonNode payload = json.get("payload");
+        assertThat(payload.get("original_event_id").asText()).isEqualTo(eventId);
+        assertThat(payload.get("original_event_type").asText()).isEqualTo("ride_completed");
+        assertThat(payload.get("ride_id").asText()).isEqualTo(rideId);
+        assertThat(payload.get("error").asText()).contains("already settled");
+    }
+
     @Test
     void anUndecodableEntryIsDeadLetteredUnderItsMessageIdWithoutARideId() throws Exception {
         EnvelopeDecodeException cause = new EnvelopeDecodeException(

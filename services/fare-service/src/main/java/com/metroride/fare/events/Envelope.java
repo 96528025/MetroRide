@@ -29,6 +29,7 @@ public record Envelope(
 
     /** Stream and event-type names shared with the Go services. */
     public static final String STREAM_RIDE_ASSIGNMENTS = "events.ride.assignments";
+    public static final String STREAM_RIDE_COMPLETIONS = "events.ride.completions";
     public static final String STREAM_DEAD_LETTER = "events.dead_letter";
     public static final String TYPE_RIDE_ASSIGNED = "ride_assigned";
     public static final String TYPE_RIDE_COMPLETED = "ride_completed";

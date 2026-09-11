@@ -2,10 +2,11 @@ package com.metroride.fare.consumer;
 
 import com.metroride.fare.FareServiceApplication;
 import com.metroride.fare.config.ConsumerProperties;
-import com.metroride.fare.events.Envelope;
 import com.metroride.fare.consumer.FailureHandler.Disposition;
+import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
 import com.metroride.fare.ledger.JournalEntry;
+import com.metroride.fare.ledger.JournalKind;
 import com.metroride.fare.processing.ProcessedEventRecorder;
 import com.metroride.fare.processing.ProcessedEventRecorder.Outcome;
 import com.metroride.fare.processing.ProcessedEventRecorder.Result;
@@ -27,6 +28,8 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,41 +49,45 @@ import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactor
 import org.springframework.stereotype.Component;
 
 /**
- * Consumer-group reader for {@code events.ride.assignments}, structured like {@code consume()} in
- * {@code services/dispatch-service/cmd/main.go}, plus the pending-entry recovery that the Go
- * consumers do not have:
+ * Consumer-group reader for {@code events.ride.assignments} and {@code events.ride.completions},
+ * structured like {@code consume()} in {@code services/dispatch-service/cmd/main.go}, plus the
+ * pending-entry recovery that the Go consumers do not have:
  *
  * <ol>
- *   <li>{@code XGROUP CREATE ... 0 MKSTREAM} at startup; an existing group is fine.</li>
+ *   <li>{@code XGROUP CREATE ... 0 MKSTREAM} on every configured stream at startup; an existing
+ *       group is fine.</li>
  *   <li>Loop: every {@code reclaim-interval}, one
- *       {@code XAUTOCLAIM stream group consumer min-idle <cursor> COUNT n}, where the cursor is
- *       what the previous pass returned ({@code 0-0} to start over), so a long pending list is
- *       walked in turn instead of its head being claimed again and again. Every claimed entry
- *       goes through {@link #handle} like a new one. Then
- *       {@code XREADGROUP GROUP g c COUNT n BLOCK t STREAMS stream >}.</li>
- *   <li>Per entry: decode the envelope, record it (and for {@code ride_assigned}, quote the fare
- *       and append the ledger entry) in one PostgreSQL transaction, then {@code XACK}.</li>
+ *       {@code XAUTOCLAIM stream group consumer min-idle <cursor> COUNT n} per stream, where the
+ *       cursor is what the previous pass of that stream returned ({@code 0-0} to start over), so
+ *       a long pending list is walked in turn instead of its head being claimed again and again.
+ *       Every claimed entry goes through {@link #handle} like a new one. Then one
+ *       {@code XREADGROUP GROUP g c COUNT n BLOCK t STREAMS s1 s2 > >}.</li>
+ *   <li>Per entry: decode the envelope and record it in one PostgreSQL transaction (for
+ *       {@code ride_assigned}, quote the fare and append the hold; for {@code ride_completed},
+ *       reverse the hold and settle), then {@code XACK}. Envelopes are dispatched by type, never
+ *       by the stream they arrived on.</li>
  *   <li>Per failed entry: {@link FailureHandler} classifies the failure and disposes of the entry.
- *       Poison is dead-lettered at once; retryable is left pending until its
- *       {@code max-deliveries}-th delivery fails, then dead-lettered too; fatal leaves the entry
- *       pending and halts this consumer ({@link ConsumerHalt}). Dead-lettering is {@code XADD}
- *       first and {@code XACK} only after Redis confirmed it, so a dead letter can be published
- *       twice; {@code original_event_id} is the key to deduplicate on.</li>
+ *       Poison and quarantined entries are dead-lettered at once; retryable ones are left pending
+ *       until their {@code max-deliveries}-th delivery fails, then dead-lettered too; fatal leaves
+ *       the entry pending and halts this consumer ({@link ConsumerHalt}). Dead-lettering is
+ *       {@code XADD} first and {@code XACK} only after Redis confirmed it, so a dead letter can be
+ *       published twice; {@code original_event_id} is the key to deduplicate on.</li>
  * </ol>
  *
  * <p>Everything above runs on one thread over one dedicated Lettuce connection: the blocking read
  * never stalls the shared connection the readiness check uses, the reclaim pass never runs
  * concurrently with the read loop, and {@code ProcessedEventRecorder.record} keeps its single-writer
- * concurrency model. The reclaim pass is in this class rather than on a scheduler for that reason.
+ * concurrency model within one instance. The reclaim pass is in this class rather than on a
+ * scheduler for that reason.
  *
  * <p>Reclaim, acknowledgement and dead-lettering take the stream from the message itself
- * ({@link StreamMessage#getStream()}), and the reclaim cursor is kept per stream, so a second
- * stream offset in the read can be added without touching any of the three.
+ * ({@link StreamMessage#getStream()}), the reclaim cursor is kept per stream, and every per-stream
+ * metric is registered for each configured stream at startup.
  */
 @Component
-public class RideAssignmentConsumer implements SmartLifecycle {
+public class RideEventConsumer implements SmartLifecycle {
 
-    private static final Logger log = LoggerFactory.getLogger(RideAssignmentConsumer.class);
+    private static final Logger log = LoggerFactory.getLogger(RideEventConsumer.class);
 
     /** {@code XAUTOCLAIM} cursor meaning "from the head of the pending entry list"; also what it returns once a scan is complete. */
     static final String RECLAIM_FROM_START = "0-0";
@@ -104,10 +111,8 @@ public class RideAssignmentConsumer implements SmartLifecycle {
     private final MeterRegistry meterRegistry;
     private final Duration shutdownTimeout;
 
-    private final Counter recordedEvents;
-    private final Counter duplicateEvents;
     private final Counter quoteHolds;
-    private final Counter consumeErrors;
+    private final Map<JournalKind, Counter> journalEntries = new EnumMap<>(JournalKind.class);
     private final Counter redisErrors;
 
     /**
@@ -121,7 +126,7 @@ public class RideAssignmentConsumer implements SmartLifecycle {
     private Future<?> loop;
     private StatefulRedisConnection<String, String> connection;
 
-    public RideAssignmentConsumer(
+    public RideEventConsumer(
             ConsumerProperties properties,
             LettuceConnectionFactory connectionFactory,
             EnvelopeCodec codec,
@@ -144,19 +149,32 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         // Registered eagerly so /metrics exposes every series at zero. The Go CounterVecs with the
         // same names only materialize a label set on its first increment.
         String service = FareServiceApplication.SERVICE_NAME;
-        this.recordedEvents = meterRegistry.counter("metroride.fare.events.processed",
-                "service", service, "stream", properties.stream(), "outcome", "recorded");
-        this.duplicateEvents = meterRegistry.counter("metroride.fare.events.processed",
-                "service", service, "stream", properties.stream(), "outcome", "duplicate");
         this.quoteHolds = meterRegistry.counter("metroride.fare.quotes",
-                "service", service, "kind", "quote_hold");
-        this.consumeErrors = meterRegistry.counter("metroride.stream.consume.errors",
-                "service", service, "stream", properties.stream());
+                "service", service, "kind", JournalKind.QUOTE_HOLD.code());
+        for (JournalKind kind : JournalKind.values()) {
+            journalEntries.put(kind, meterRegistry.counter("metroride.fare.journal.entries",
+                    "service", service, "kind", kind.code()));
+        }
         this.redisErrors = meterRegistry.counter("metroride.dependency.errors",
                 "service", service, "dependency", "redis");
-        // Looked up by the message's own stream when incremented; registering it here for the
-        // configured stream only pins it at zero on /metrics.
-        reclaimedEntries(properties.stream());
+        // Per-stream series are looked up by the message's own stream when incremented;
+        // registering them for every configured stream pins them at zero on /metrics.
+        for (String stream : properties.streams()) {
+            processedEvents(stream, "recorded");
+            processedEvents(stream, "duplicate");
+            consumeErrors(stream);
+            reclaimedEntries(stream);
+        }
+    }
+
+    private Counter processedEvents(String stream, String outcome) {
+        return meterRegistry.counter("metroride.fare.events.processed",
+                "service", FareServiceApplication.SERVICE_NAME, "stream", stream, "outcome", outcome);
+    }
+
+    private Counter consumeErrors(String stream) {
+        return meterRegistry.counter("metroride.stream.consume.errors",
+                "service", FareServiceApplication.SERVICE_NAME, "stream", stream);
     }
 
     private Counter reclaimedEntries(String stream) {
@@ -183,11 +201,17 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             throw new IllegalStateException("metroride.consumer.max-deliveries (" + properties.maxDeliveries()
                     + ") must be at least 2, or a retryable failure would be dead-lettered on its first delivery");
         }
+        if (properties.streams() == null || properties.streams().isEmpty()
+                || new HashSet<>(properties.streams()).size() != properties.streams().size()) {
+            running.set(false);
+            throw new IllegalStateException("metroride.consumer.streams must list at least one stream, each once, got "
+                    + properties.streams());
+        }
 
         // Standalone Redis only, which is all the Go services support as well.
         RedisClient client = (RedisClient) connectionFactory.getRequiredNativeClient();
         connection = client.connect();
-        ensureConsumerGroup(connection.sync());
+        ensureConsumerGroups(connection.sync());
 
         executor = Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "fare-stream-consumer");
@@ -196,7 +220,7 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         });
         loop = executor.submit(this::runLoop);
         log.atInfo()
-                .addKeyValue("stream", properties.stream())
+                .addKeyValue("streams", properties.streams())
                 .addKeyValue("group", properties.group())
                 .addKeyValue("consumer", properties.name())
                 .addKeyValue("reclaim_interval", properties.reclaimInterval().toString())
@@ -236,32 +260,43 @@ public class RideAssignmentConsumer implements SmartLifecycle {
 
     // ---- consumption -----------------------------------------------------------------------
 
-    private void ensureConsumerGroup(RedisCommands<String, String> commands) {
-        try {
-            // "0" reads the stream from its beginning, as the Go ensureGroup does.
-            commands.xgroupCreate(
-                    XReadArgs.StreamOffset.from(properties.stream(), "0"),
-                    properties.group(),
-                    XGroupCreateArgs.Builder.mkstream(true));
-        } catch (RedisBusyException alreadyExists) {
-            // BUSYGROUP: the group is already there, which is the normal case after the first start.
+    private void ensureConsumerGroups(RedisCommands<String, String> commands) {
+        for (String stream : properties.streams()) {
+            try {
+                // "0" reads the stream from its beginning, as the Go ensureGroup does.
+                commands.xgroupCreate(
+                        XReadArgs.StreamOffset.from(stream, "0"),
+                        properties.group(),
+                        XGroupCreateArgs.Builder.mkstream(true));
+            } catch (RedisBusyException alreadyExists) {
+                // BUSYGROUP: the group is already there, which is the normal case after the first start.
+            }
         }
     }
 
+    @SuppressWarnings("unchecked")
     private void runLoop() {
         RedisCommands<String, String> commands = connection.sync();
         Consumer<String> consumer = Consumer.from(properties.group(), properties.name());
         XReadArgs readArgs = XReadArgs.Builder
                 .count(properties.batchSize())
                 .block(properties.blockTimeout());
-        XReadArgs.StreamOffset<String> newEntries = XReadArgs.StreamOffset.lastConsumed(properties.stream());
+        // One XREADGROUP over every stream, each at ">" (entries never delivered to this group).
+        XReadArgs.StreamOffset<String>[] newEntries = properties.streams().stream()
+                .map(XReadArgs.StreamOffset::lastConsumed)
+                .toArray(XReadArgs.StreamOffset[]::new);
         // The first pass runs before the first read, so whatever a previous instance left pending
         // is retried before any new entry is touched.
         Instant nextReclaim = clock.instant();
 
         while (running.get() && !halt.isHalted()) {
             if (!clock.instant().isBefore(nextReclaim)) {
-                reclaim(commands, consumer, newEntries.getName());
+                for (String stream : properties.streams()) {
+                    reclaim(commands, consumer, stream);
+                    if (halt.isHalted()) {
+                        break;
+                    }
+                }
                 nextReclaim = clock.instant().plus(properties.reclaimInterval());
                 if (halt.isHalted()) {
                     break;
@@ -274,14 +309,17 @@ public class RideAssignmentConsumer implements SmartLifecycle {
                 if (!running.get()) {
                     break;
                 }
-                consumeErrors.increment();
+                // The one read covers every stream, so the failure is counted against each.
+                for (String stream : properties.streams()) {
+                    consumeErrors(stream).increment();
+                }
                 redisErrors.increment();
-                log.atError().addKeyValue("stream", properties.stream()).setCause(e)
-                        .log("read ride assignment stream failed");
+                log.atError().addKeyValue("streams", properties.streams()).setCause(e)
+                        .log("read ride event streams failed");
                 if (e.getMessage() != null && e.getMessage().contains("NOGROUP")) {
-                    // The stream or group was deleted underneath us; recreate rather than spin.
+                    // A stream or group was deleted underneath us; recreate rather than spin.
                     try {
-                        ensureConsumerGroup(commands);
+                        ensureConsumerGroups(commands);
                     } catch (RedisException recreate) {
                         log.error("recreate consumer group failed", recreate);
                     }
@@ -401,9 +439,9 @@ public class RideAssignmentConsumer implements SmartLifecycle {
             // handle() classifies every failure of the work itself. Anything that escapes comes from
             // the failure handling (a bug), and must not end this thread silently while isRunning()
             // and /readyz still look healthy. The entry stays pending for the next reclaim pass.
-            consumeErrors.increment();
-            log.atError().addKeyValue("message_id", message.getId()).setCause(e)
-                    .log("unexpected failure handling ride assignment event; entry left pending");
+            consumeErrors(message.getStream()).increment();
+            log.atError().addKeyValue("stream", message.getStream()).addKeyValue("message_id", message.getId()).setCause(e)
+                    .log("unexpected failure handling ride event; entry left pending");
             return true;
         }
     }
@@ -419,24 +457,27 @@ public class RideAssignmentConsumer implements SmartLifecycle {
         }
 
         Outcome outcome = result.outcome();
-        if (outcome == Outcome.RECORDED) {
-            recordedEvents.increment();
-        } else {
-            duplicateEvents.increment();
+        processedEvents(message.getStream(), outcome.name().toLowerCase()).increment();
+        // Counted here, after the commit, so a rolled-back transaction never counts as written.
+        for (JournalEntry written : result.entries()) {
+            journalEntries.get(written.kind()).increment();
+            if (written.kind() == JournalKind.QUOTE_HOLD) {
+                quoteHolds.increment();
+            }
         }
-        // Counted here, after the commit, so a rolled-back transaction never counts as a quote.
-        result.quoteHold().ifPresent(hold -> quoteHolds.increment());
         var entry = log.atInfo()
+                .addKeyValue("stream", message.getStream())
                 .addKeyValue("message_id", message.getId())
                 .addKeyValue("event_id", envelope.id())
                 .addKeyValue("event_type", envelope.type())
                 .addKeyValue("source", envelope.source())
                 .addKeyValue("ride_id", envelope.correlationId())
                 .addKeyValue("outcome", outcome.name().toLowerCase());
-        if (result.quoteHold().isPresent()) {
-            JournalEntry hold = result.quoteHold().get();
-            entry = entry.addKeyValue("journal_kind", hold.kind().code())
-                    .addKeyValue("quote", hold.postings().get(0).amount().toString());
+        if (!result.entries().isEmpty()) {
+            // The first posting of the first entry is the quoted amount X for every kind written.
+            entry = entry.addKeyValue("journal_kinds",
+                            result.entries().stream().map(written -> written.kind().code()).collect(Collectors.joining(",")))
+                    .addKeyValue("amount", result.entries().get(0).postings().get(0).amount().toString().replace("-", ""));
         }
         entry.log(outcome == Outcome.RECORDED ? "event recorded" : "duplicate event skipped");
 
