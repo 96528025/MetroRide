@@ -171,7 +171,7 @@ public class ProcessedEventRecorder {
      *       is a {@link CorruptLedgerException}, quarantined.</li>
      *   <li>With the lock held, check the ride is not settled yet; if it is, quarantined as
      *       {@code already_settled}. This is what stops two different completion events for one
-     *       ride, from a replayed dead letter for instance, from charging the rider twice: the
+     *       ride, from a replayed dead letter for instance, from settling the ride twice: the
      *       second waits on the hold's row lock and then sees the first's settlement.</li>
      *   <li>Append the {@code hold_reversal} and the {@code settlement}, both under this event's ID.</li>
      * </ol>

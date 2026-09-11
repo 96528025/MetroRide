@@ -94,7 +94,7 @@ perfectly fine, the ride's ledger is not, and no number of retries repairs an ap
 It is not fatal either, because it is one ride's problem, and halting would let that one ride
 stop every other ride's quotes and settlements; so it is set aside like poison but under its own
 reason. `already_settled` is quarantined for the same reason and is the last line against
-charging a rider twice: rider-service's status guard never publishes a second completion, but a
+settling one ride twice: rider-service's status guard never publishes a second completion, but a
 dead letter replayed by hand can. A payload without a `ride_id` is poison, deliberately not a
 missing hold: an entry that can never name its ride would otherwise be retried for its whole
 delivery budget as "assignment not here yet".

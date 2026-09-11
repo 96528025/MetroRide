@@ -33,7 +33,7 @@ public class SettlementException extends RuntimeException implements ClassifiedF
         /**
          * The ride already has a {@code settlement} from a different completion event. Quarantined:
          * the status guard in rider-service never publishes a second completion, but a replayed
-         * dead letter can, and this is the last check before the rider would be charged twice.
+         * dead letter can, and this is the last check before the ride would be settled twice.
          */
         ALREADY_SETTLED("already_settled", FailureClass.QUARANTINE, DeadLetterReason.ALREADY_SETTLED);
 
