@@ -133,6 +133,27 @@ stay in the pending list. `/readyz` answers 503 with `{"status":"not_ready","fai
 `metroride_fare_consumer_halted` reads 1. Nothing clears a halt at runtime: fix the deployment and
 restart, and the first reclaim pass of the new process picks the entries up.
 
+**After a halt.** A halt caused by one entry is not cleared by a restart alone: if the entry was
+misclassified as fatal, or the fix did not land, the first reclaim pass of the new process claims
+the same entry and halts again. The steps, in order:
+
+1. Find the root cause from the halt log line: `stream` and `message_id` identify the entry,
+   `XRANGE <stream> <message_id> <message_id>` shows its content, and `reason` on `/readyz`
+   carries the exception and its root cause.
+2. Fix what is actually wrong: the code, the schema (a new Flyway migration), or the mapping in
+   `FailureClass` if the exception should have been poison or retryable. Deploy the fix.
+3. Restart the service. The reclaim pass delivers the entry again and it is handled by the fixed
+   code. Nothing else is needed for the entries that queued up behind it.
+4. Only when someone has decided that the entry must be skipped rather than fixed: first save the
+   original entry (`XRANGE <stream> <message_id> <message_id>`), then write a `dead_lettered`
+   envelope for it by hand with `XADD events.dead_letter '*' event '<json>'` (the fields are listed
+   under "Dead letter first, acknowledge second"; `original_event_id` is the envelope `id` from the
+   saved entry), confirm the `XADD` returned an ID, and only then
+   `XACK <stream> fare-service <message_id>`. The order is the service's own: an `XADD` that
+   succeeded followed by an `XACK` that failed leaves a duplicate dead letter, identified by
+   `original_event_id`; the reverse order would lose the record. A bare `XACK` without the dead
+   letter is an explicit data-loss operation and the last resort.
+
 What is true after this:
 
 - fare-service reclaims its own pending entries and dead-letters what it gives up on. The Go
