@@ -31,7 +31,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.dao.InvalidDataAccessApiUsageException;
+import com.metroride.fare.ledger.CorruptLedgerException;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamRecords;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -144,7 +144,9 @@ class QuoteLedgerIT extends IntegrationTestSupport {
         String rideId = UUID.randomUUID().toString();
         double quotesBefore = quoteCount();
 
-        RecordId id = publish("{\"id\":\"" + eventId + "\",\"type\":\"ride_completed\",\"source\":\"dispatch-service\","
+        // ride_completed is settled since the completions stream exists; a type this service does
+        // not act on is the case here.
+        RecordId id = publish("{\"id\":\"" + eventId + "\",\"type\":\"traffic_updated\",\"source\":\"traffic-service\","
                 + "\"correlation_id\":\"" + rideId + "\",\"occurred_at\":\"2026-09-07T10:00:00Z\",\"payload\":{}}");
 
         await().atMost(TIMEOUT).untilAsserted(() -> {
@@ -176,7 +178,7 @@ class QuoteLedgerIT extends IntegrationTestSupport {
         CountDownLatch start = new CountDownLatch(1);
         Callable<Result> call = () -> {
             start.await(5, TimeUnit.SECONDS);
-            return recorder.record(consumer.stream(), envelope);
+            return recorder.record(assignments(), envelope);
         };
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -217,12 +219,12 @@ class QuoteLedgerIT extends IntegrationTestSupport {
             try (PreparedStatement insert = holder.prepareStatement(
                     "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
                 insert.setString(1, eventId);
-                insert.setString(2, consumer.stream());
+                insert.setString(2, assignments());
                 insert.setString(3, "ride_assigned");
                 insert.executeUpdate();
             }
 
-            Future<Result> blocked = pool.submit(() -> recorder.record(consumer.stream(), envelope));
+            Future<Result> blocked = pool.submit(() -> recorder.record(assignments(), envelope));
             assertThatThrownBy(() -> blocked.get(500, TimeUnit.MILLISECONDS))
                     .as("record() must wait on the uncommitted event row")
                     .isInstanceOf(java.util.concurrent.TimeoutException.class);
@@ -248,14 +250,15 @@ class QuoteLedgerIT extends IntegrationTestSupport {
         String eventId = UUID.randomUUID().toString();
         String rideId = UUID.randomUUID().toString();
         jdbc.update("insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())",
-                eventId, consumer.stream(), "ride_assigned");
+                eventId, assignments(), "ride_assigned");
         jdbc.update("insert into fare.journal_entries (ride_id, kind, source_event_id, created_at) values (?, ?, ?, now())",
                 rideId, "quote_hold", eventId);
 
-        // The constructor's IllegalArgumentException, translated by @Repository into Spring's
-        // data-access hierarchy.
+        // The constructor's IllegalArgumentException, wrapped by the repository into the one
+        // exception Spring's @Repository translation leaves alone: the consumer must quarantine a
+        // ride whose rows are wrong, not halt on an InvalidDataAccessApiUsageException.
         assertThatThrownBy(() -> ledger.findByRideId(rideId))
-                .isInstanceOf(InvalidDataAccessApiUsageException.class)
+                .isInstanceOf(CorruptLedgerException.class)
                 .hasMessageContaining("at least one posting");
         ResponseEntity<String> response = http.getForEntity("/v1/rides/" + rideId + "/ledger", String.class);
         assertThat(response.getStatusCode().value()).isEqualTo(500);
@@ -320,9 +323,14 @@ class QuoteLedgerIT extends IntegrationTestSupport {
                 .contains("reason=\"calculation\"");
     }
 
+    /** The assignments stream: first in {@code metroride.consumer.streams}. */
+    private String assignments() {
+        return consumer.streams().get(0);
+    }
+
     private RecordId publish(String envelopeJson) {
         return redisTemplate.opsForStream().add(StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, envelopeJson))
-                .withStreamKey(consumer.stream()));
+                .withStreamKey(assignments()));
     }
 
     private int processedRows(String eventId) {
@@ -355,11 +363,11 @@ class QuoteLedgerIT extends IntegrationTestSupport {
     }
 
     private long pendingEntries() {
-        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+        return redisTemplate.opsForStream().pending(assignments(), consumer.group()).getTotalPendingMessages();
     }
 
     private String lastDeliveredId() {
-        return redisTemplate.opsForStream().groups(consumer.stream()).stream()
+        return redisTemplate.opsForStream().groups(assignments()).stream()
                 .filter(group -> group.groupName().equals(consumer.group()))
                 .findFirst()
                 .orElseThrow()
@@ -379,7 +387,7 @@ class QuoteLedgerIT extends IntegrationTestSupport {
     }
 
     private double reclaimedCount() {
-        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
+        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", assignments()).counter().count();
     }
 
     /** Same shape as {@code events.Publish} writes: one field named {@code event} holding the envelope JSON. */

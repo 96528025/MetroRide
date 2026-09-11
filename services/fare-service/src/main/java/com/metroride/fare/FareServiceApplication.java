@@ -7,12 +7,14 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 /**
- * fare-service consumes {@code events.ride.assignments} from Redis Streams, records every
- * envelope it sees exactly once in its own PostgreSQL schema, and for each first-seen
- * {@code ride_assigned} quotes the fare and holds it in a double-entry ledger.
+ * fare-service consumes {@code events.ride.assignments} and {@code events.ride.completions} from
+ * Redis Streams, records every envelope it sees exactly once in its own PostgreSQL schema, quotes
+ * and holds the fare of each first-seen {@code ride_assigned} in a double-entry ledger, and on
+ * {@code ride_completed} reverses that hold and settles the quoted amount between driver and
+ * platform.
  *
- * <p>Settlement on {@code ride_completed} and publication of {@code events.ride.fares} are
- * deliberately absent; see {@code services/fare-service/README.md} for the boundary.
+ * <p>Publication of {@code events.ride.fares} is deliberately absent; see
+ * {@code services/fare-service/README.md} for the boundary.
  */
 @SpringBootApplication
 @EnableConfigurationProperties({ConsumerProperties.class, FareProperties.class})

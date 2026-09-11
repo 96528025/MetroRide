@@ -36,6 +36,19 @@ public class LedgerRepository {
             order by j.id, p.id
             """;
 
+    // The same rows restricted to one kind, with the journal rows locked for the rest of the
+    // transaction. "for update of j": the postings side of a left join cannot be locked, and the
+    // journal row is the lock that matters. Two transactions settling the same ride serialise on
+    // it, and the second sees the first's settlement once it has the lock.
+    private static final String LOCK_BY_RIDE_AND_KIND = """
+            select j.id, j.ride_id, j.kind, j.source_event_id, j.created_at, p.id as posting_id, p.account, p.amount
+            from fare.journal_entries j
+            left join fare.postings p on p.journal_entry_id = j.id
+            where j.ride_id = :rideId and j.kind = :kind
+            order by j.id, p.id
+            for update of j
+            """;
+
     private final JdbcClient jdbc;
 
     public LedgerRepository(JdbcClient jdbc) {
@@ -72,14 +85,62 @@ public class LedgerRepository {
         return journalId;
     }
 
-    /** All entries on one ride in insertion order, each rebuilt through the {@link JournalEntry} constructor. */
+    /**
+     * All entries on one ride in insertion order, each rebuilt through the {@link JournalEntry}
+     * constructor.
+     *
+     * @throws CorruptLedgerException when the rows do not form valid entries (see {@link #collect})
+     */
     public List<StoredJournalEntry> findByRideId(String rideId) {
         return jdbc.sql(SELECT_BY_RIDE)
                 .param("rideId", rideId)
                 .query(LedgerRepository::collect);
     }
 
+    /**
+     * The ride's {@code quote_hold} entries, with their journal rows locked ({@code select ... for
+     * update}) until the surrounding transaction ends. Must be called inside a transaction; the
+     * lock wait is bounded by the transaction's timeout like every other statement. Settlement
+     * calls this first, so two instances handling two different completion events for one ride
+     * serialise here, and the second finds the first's settlement with {@link #hasSettlement}.
+     *
+     * @throws CorruptLedgerException when the rows do not form valid entries (see {@link #collect})
+     */
+    public List<StoredJournalEntry> lockQuoteHolds(String rideId) {
+        return jdbc.sql(LOCK_BY_RIDE_AND_KIND)
+                .param("rideId", rideId)
+                .param("kind", JournalKind.QUOTE_HOLD.code())
+                .query(LedgerRepository::collect);
+    }
+
+    /** Whether the ride already has a {@code settlement} entry, from any source event. */
+    public boolean hasSettlement(String rideId) {
+        Integer count = jdbc.sql("select count(*) from fare.journal_entries where ride_id = :rideId and kind = :kind")
+                .param("rideId", rideId)
+                .param("kind", JournalKind.SETTLEMENT.code())
+                .query(Integer.class)
+                .single();
+        return count != null && count > 0;
+    }
+
+    /**
+     * Rebuilds entries from the joined rows. The {@link JournalEntry} constructor (and the code
+     * lookups) refuse rows that do not form a valid entry with an {@code IllegalArgumentException};
+     * inside a {@code @Repository} Spring would translate that into
+     * {@code InvalidDataAccessApiUsageException}, which the consumer treats as a fatal
+     * misconfiguration and halts on. A ledger whose rows are wrong is a data problem on one ride,
+     * not a deployment problem, so it is reported as a {@link CorruptLedgerException} instead,
+     * which Spring leaves untranslated and the consumer quarantines.
+     */
     private static List<StoredJournalEntry> collect(ResultSet rs) throws SQLException {
+        try {
+            return rebuild(rs);
+        } catch (IllegalArgumentException invalid) {
+            throw new CorruptLedgerException("ledger rows do not form a valid entry: " + invalid.getMessage(), invalid);
+        }
+    }
+
+    private static List<StoredJournalEntry> rebuild(ResultSet rs) throws SQLException {
         Map<Long, EntryRows> byId = new LinkedHashMap<>();
         while (rs.next()) {
             long id = rs.getLong("id");

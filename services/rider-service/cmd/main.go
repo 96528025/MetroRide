@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/metroride/metroride/shared/pkg/config"
 	"github.com/metroride/metroride/shared/pkg/events"
@@ -23,10 +25,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var rideRequests = prometheus.NewCounter(prometheus.CounterOpts{
-	Name: "metroride_ride_requests_total",
-	Help: "Total number of ride requests accepted by rider-service.",
-})
+var (
+	rideRequests = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "metroride_ride_requests_total",
+		Help: "Total number of ride requests accepted by rider-service.",
+	})
+	ridesCompleted = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "metroride_rides_completed_total",
+		Help: "Total number of rides moved to completed by rider-service.",
+	})
+)
 
 type createRideRequest struct {
 	RiderID    string  `json:"rider_id"`
@@ -50,7 +58,7 @@ func riderReadinessChecks(checkPostgres httpx.ReadinessCheck) map[string]httpx.R
 func main() {
 	metrics.RegisterCommon()
 	outbox.RegisterMetrics()
-	prometheus.MustRegister(rideRequests)
+	prometheus.MustRegister(rideRequests, ridesCompleted)
 	cfg := config.Load("rider-service", ":8080")
 	log := logging.New(cfg.ServiceName)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,6 +91,7 @@ func main() {
 	mux := httpx.CommonMuxWithReadiness(log, riderReadinessChecks(svc.checkPostgres))
 	mux.HandleFunc("POST /v1/rides", svc.createRide)
 	mux.HandleFunc("GET /v1/rides/{ride_id}", svc.getRide)
+	mux.HandleFunc("POST /v1/rides/{ride_id}/complete", svc.completeRide)
 
 	server := httpx.NewServer(cfg.HTTPAddr, mux)
 	go func() {
@@ -189,6 +198,150 @@ func (s *service) getRide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.RespondJSON(w, http.StatusOK, response)
+}
+
+// completeRide moves an assigned ride to completed and enqueues the
+// ride_completed event in the same transaction, the way createRide commits
+// the ride with its ride_requested event. The conditional update
+// (status = 'assigned') is the whole concurrency control: concurrent
+// completions of one ride block on the row lock, re-evaluate the predicate
+// after the first commits, touch no row, and are answered 409. The
+// assignment lookup refuses anything but exactly one row so a completion is
+// never published for a ride whose assignment state is inconsistent.
+func (s *service) completeRide(w http.ResponseWriter, r *http.Request) {
+	rideID := r.PathValue("ride_id")
+	if _, err := uuid.Parse(rideID); err != nil {
+		// rides.id is a uuid column; a value that is not one cannot name a ride.
+		httpx.RespondJSON(w, http.StatusNotFound, map[string]string{"error": "ride not found"})
+		return
+	}
+	now := time.Now().UTC()
+	dbCtx, dbCancel := reliability.WithPostgresTimeout(r.Context())
+	defer dbCancel()
+	tx, err := s.db.Begin(dbCtx)
+	if err != nil {
+		s.completionFailed(w, "begin ride completion transaction failed", err, rideID)
+		return
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	tag, err := tx.Exec(dbCtx, `
+		update rides set status = 'completed', updated_at = $1
+		where id = $2 and status = 'assigned'
+	`, now, rideID)
+	if err != nil {
+		s.completionFailed(w, "complete ride failed", err, rideID)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var status string
+		lookupErr := tx.QueryRow(dbCtx, `select status from rides where id = $1`, rideID).Scan(&status)
+		code, body := completionRejection(status, lookupErr)
+		if code == http.StatusInternalServerError {
+			metrics.DependencyErrors.WithLabelValues("rider-service", "postgres").Inc()
+			s.log.Error("read ride status after rejected completion failed", "error", lookupErr, "ride_id", rideID)
+		}
+		httpx.RespondJSON(w, code, body)
+		return
+	}
+
+	assignmentID, riderID, driverID, err := s.singleAssignment(dbCtx, tx, rideID)
+	if err != nil {
+		if errors.Is(err, errAssignmentStateInconsistent) {
+			s.log.Error("ride assignment state inconsistent; completion rolled back", "error", err, "ride_id", rideID)
+			httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "ride assignment state inconsistent"})
+			return
+		}
+		s.completionFailed(w, "read ride assignment failed", err, rideID)
+		return
+	}
+
+	payload := events.RideCompleted{
+		RideID:       rideID,
+		RiderID:      riderID,
+		DriverID:     driverID,
+		AssignmentID: assignmentID,
+		CompletedAt:  now.Format(time.RFC3339Nano),
+	}
+	envelope, err := events.NewEnvelope(uuid.NewString(), events.TypeRideCompleted, "rider-service", rideID, payload)
+	if err != nil {
+		httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode event"})
+		return
+	}
+	if err := outbox.Enqueue(dbCtx, tx, events.StreamRideCompletions, envelope); err != nil {
+		s.completionFailed(w, "enqueue ride completion failed", err, rideID)
+		return
+	}
+	if err := tx.Commit(dbCtx); err != nil {
+		s.completionFailed(w, "commit ride completion failed", err, rideID)
+		return
+	}
+
+	ridesCompleted.Inc()
+	s.log.Info("ride completed", "ride_id", rideID, "driver_id", driverID, "assignment_id", assignmentID, "event_id", envelope.ID)
+	httpx.RespondJSON(w, http.StatusAccepted, map[string]any{"ride_id": rideID, "status": "completed", "event_id": envelope.ID})
+}
+
+// errAssignmentStateInconsistent is returned when a ride that the conditional
+// update just moved to completed has zero or several ride_assignments rows.
+// Neither can happen through dispatch-service, whose status guard allows one
+// assignment per ride; either means the data is already wrong, so the
+// completion is refused rather than published against a guessed assignment.
+var errAssignmentStateInconsistent = errors.New("ride assignment state inconsistent")
+
+// singleAssignment reads the ride's assignment inside the completion
+// transaction and requires exactly one row. It deliberately has no LIMIT 1 and
+// never picks the newest row: a ride with two assignments is a data problem
+// to surface, not to paper over.
+func (s *service) singleAssignment(ctx context.Context, tx pgx.Tx, rideID string) (assignmentID, riderID, driverID string, err error) {
+	rows, err := tx.Query(ctx, `
+		select a.id, r.rider_id, a.driver_id
+		from ride_assignments a
+		join rides r on r.id = a.ride_id
+		where a.ride_id = $1
+	`, rideID)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		if count > 1 {
+			continue
+		}
+		if err := rows.Scan(&assignmentID, &riderID, &driverID); err != nil {
+			return "", "", "", err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", "", err
+	}
+	if count != 1 {
+		return "", "", "", fmt.Errorf("%w: ride %s has %d assignments, want 1", errAssignmentStateInconsistent, rideID, count)
+	}
+	return assignmentID, riderID, driverID, nil
+}
+
+// completionRejection maps what the completion transaction found after its
+// conditional update touched no row to the HTTP response: the ride's current
+// status (a 409 that names it), no such ride (404), or a failed lookup (500;
+// a database error must not be reported as a missing ride).
+func completionRejection(status string, lookupErr error) (int, map[string]string) {
+	switch {
+	case lookupErr == nil:
+		return http.StatusConflict, map[string]string{"error": "ride is " + status}
+	case errors.Is(lookupErr, pgx.ErrNoRows):
+		return http.StatusNotFound, map[string]string{"error": "ride not found"}
+	default:
+		return http.StatusInternalServerError, map[string]string{"error": "failed to complete ride"}
+	}
+}
+
+func (s *service) completionFailed(w http.ResponseWriter, message string, err error, rideID string) {
+	metrics.DependencyErrors.WithLabelValues("rider-service", "postgres").Inc()
+	s.log.Error(message, "error", err, "ride_id", rideID)
+	httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to complete ride"})
 }
 
 func (s *service) checkPostgres(ctx context.Context) error {

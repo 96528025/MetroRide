@@ -14,6 +14,7 @@ const (
 	StreamDriverLocations   = "events.driver.locations"
 	StreamRideAssignments   = "events.ride.assignments"
 	StreamRideNotifications = "events.ride.notifications"
+	StreamRideCompletions   = "events.ride.completions"
 	StreamTrafficUpdates    = "events.traffic.updates"
 	StreamDeadLetter        = "events.dead_letter"
 )
@@ -61,6 +62,17 @@ type RideAssigned struct {
 	DistanceKM   float64 `json:"distance_km"`
 	ETASeconds   int     `json:"eta_seconds"`
 	AssignmentID string  `json:"assignment_id"`
+}
+
+// RideCompleted is published by rider-service when a ride moves from
+// "assigned" to "completed". CompletedAt is an RFC 3339 string with
+// nanoseconds, like RequestedAt on RideRequested.
+type RideCompleted struct {
+	RideID       string `json:"ride_id"`
+	RiderID      string `json:"rider_id"`
+	DriverID     string `json:"driver_id"`
+	AssignmentID string `json:"assignment_id"`
+	CompletedAt  string `json:"completed_at"`
 }
 
 type TrafficUpdated struct {

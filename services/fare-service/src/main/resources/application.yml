@@ -57,10 +57,17 @@ metroride:
     base-fare: 2.50
     per-km: 1.20
     per-minute: 0.30
-    # Driver's share of a settled fare. Bound and validated now; read once settlement exists.
+    # Driver's share of a settled fare: on ride_completed, driver_payable is credited
+    # quote * driver-share (rounded once, in Money) and platform_revenue the remainder.
     driver-share: 0.80
   consumer:
-    stream: events.ride.assignments
+    # Both streams are read by one XREADGROUP under the same group and consumer name,
+    # and both get their own XGROUP CREATE and their own reclaim pass. Envelopes are
+    # dispatched by type, not by stream. Assignments first, completions second; the
+    # integration tests rely on that order.
+    streams:
+      - events.ride.assignments
+      - events.ride.completions
     batch-size: 10         # COUNT for XREADGROUP and for XAUTOCLAIM
     block-timeout: 1s      # must stay below spring.data.redis.timeout
     error-backoff: 1s

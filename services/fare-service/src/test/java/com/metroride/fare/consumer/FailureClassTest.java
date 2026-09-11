@@ -3,8 +3,10 @@ package com.metroride.fare.consumer;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.metroride.fare.events.EnvelopeDecodeException;
+import com.metroride.fare.ledger.CorruptLedgerException;
 import com.metroride.fare.pricing.FareQuoteException;
 import com.metroride.fare.pricing.FareQuoteException.Reason;
+import com.metroride.fare.processing.SettlementException;
 import java.sql.SQLException;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataAccessResourceFailureException;
@@ -33,6 +35,36 @@ class FailureClassTest {
                 .isEqualTo(FailureClass.POISON);
         assertThat(FailureClass.of(new FareQuoteException(Reason.CALCULATION, "distance must not be negative", null)))
                 .isEqualTo(FailureClass.POISON);
+    }
+
+    /** A settlement failure carries its own class; the mapping asks it before applying any rule of its own. */
+    @Test
+    void aSettlementFailureIsClassifiedByItsReason() {
+        assertThat(FailureClass.of(new SettlementException(SettlementException.Reason.MISSING_HOLD, "no hold yet")))
+                .isEqualTo(FailureClass.RETRYABLE);
+        assertThat(FailureClass.of(new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD, "two holds")))
+                .isEqualTo(FailureClass.QUARANTINE);
+        assertThat(FailureClass.of(new SettlementException(SettlementException.Reason.ALREADY_SETTLED, "settled")))
+                .isEqualTo(FailureClass.QUARANTINE);
+    }
+
+    /** A completion that cannot name its ride is poison, never a missing hold to wait for. */
+    @Test
+    void aCompletionWithoutARideIdIsPoison() {
+        SettlementException noRide = new SettlementException(SettlementException.Reason.PAYLOAD,
+                "ride_completed payload of event e1 has no ride_id");
+
+        assertThat(FailureClass.of(noRide)).isEqualTo(FailureClass.POISON);
+        assertThat(noRide.deadLetterReason()).isEqualTo(DeadLetterReason.POISON);
+    }
+
+    /** Wrong rows in the ledger are one ride's problem, quarantined; not the deployment's, not fatal. */
+    @Test
+    void aCorruptLedgerIsQuarantinedNotFatal() {
+        CorruptLedgerException corrupt = new CorruptLedgerException("quote_hold of ride r1 posts to driver_payable");
+
+        assertThat(FailureClass.of(corrupt)).isEqualTo(FailureClass.QUARANTINE);
+        assertThat(corrupt.deadLetterReason()).isEqualTo(DeadLetterReason.CORRUPT_HOLD);
     }
 
     @Test

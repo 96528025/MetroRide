@@ -126,7 +126,7 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
         long pendingBefore = pendingEntries();
 
         RecordId garbage = redisTemplate.opsForStream().add(
-                StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, "not-json")).withStreamKey(consumer.stream()));
+                StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, "not-json")).withStreamKey(assignments()));
 
         await().atMost(TIMEOUT).untilAsserted(() -> {
             assertThat(deadLetterCount("poison")).isEqualTo(poisonBefore + 1);
@@ -201,19 +201,24 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
         assertThat(processedRows(eventId)).isZero();
     }
 
+    /** The assignments stream: first in {@code metroride.consumer.streams}. */
+    private String assignments() {
+        return consumer.streams().get(0);
+    }
+
     private RecordId publish(String envelopeJson) {
         return redisTemplate.opsForStream().add(StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, envelopeJson))
-                .withStreamKey(consumer.stream()));
+                .withStreamKey(assignments()));
     }
 
     private boolean isPending(RecordId id) {
         return !redisTemplate.opsForStream()
-                .pending(consumer.stream(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
+                .pending(assignments(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
                 .isEmpty();
     }
 
     private long pendingEntries() {
-        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+        return redisTemplate.opsForStream().pending(assignments(), consumer.group()).getTotalPendingMessages();
     }
 
     private int processedRows(String eventId) {
@@ -230,11 +235,11 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
 
     private double deadLetterCount(String reason) {
         return meterRegistry.get("metroride.fare.dead_letters")
-                .tag("stream", consumer.stream()).tag("reason", reason).counter().count();
+                .tag("stream", assignments()).tag("reason", reason).counter().count();
     }
 
     private double reclaimedCount() {
-        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
+        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", assignments()).counter().count();
     }
 
     private double postgresErrorCount() {
@@ -246,7 +251,7 @@ class PendingEntryRecoveryIT extends IntegrationTestSupport {
     }
 
     private double consumeErrorCount() {
-        return meterRegistry.get("metroride.stream.consume.errors").tag("stream", consumer.stream()).counter().count();
+        return meterRegistry.get("metroride.stream.consume.errors").tag("stream", assignments()).counter().count();
     }
 
     /** Same shape as {@code events.Publish} writes: one field named {@code event} holding the envelope JSON. */

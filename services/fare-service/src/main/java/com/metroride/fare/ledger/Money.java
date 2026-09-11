@@ -67,6 +67,18 @@ public record Money(BigDecimal amount) implements Comparable<Money> {
         return new Money(numerator.divide(denominator, SCALE, ROUNDING));
     }
 
+    /**
+     * This amount times an exact factor, rounded to cents once, half up. Used for the driver's
+     * share of a settled fare: the exact product is rounded here and nowhere else, and the
+     * platform's share is what remains after that rounding, so the two always add up to the fare.
+     */
+    public Money times(BigDecimal factor) {
+        if (factor == null) {
+            throw new IllegalArgumentException("factor is required");
+        }
+        return of(amount.multiply(factor));
+    }
+
     public Money plus(Money other) {
         return new Money(amount.add(other.amount));
     }

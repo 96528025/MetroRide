@@ -8,6 +8,7 @@ import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
 import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.events.RideAssigned;
+import com.metroride.fare.events.RideCompleted;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.StreamMessage;
 import io.lettuce.core.api.sync.RedisCommands;
@@ -116,18 +117,22 @@ public class DeadLetterPublisher {
 
     /**
      * The Go publisher prefers the payload's own {@code ride_id} over the correlation ID when the
-     * payload decodes; for a {@code ride_assigned} they are the same value, but keep the rule.
+     * payload decodes; for the ride events this service consumes they are the same value, but keep
+     * the rule.
      */
     private String rideIdOf(Envelope original) {
-        if (Envelope.TYPE_RIDE_ASSIGNED.equals(original.type())) {
-            try {
-                RideAssigned assignment = codec.decodePayload(original, RideAssigned.class);
-                if (assignment.rideId() != null && !assignment.rideId().isBlank()) {
-                    return assignment.rideId();
-                }
-            } catch (EnvelopeDecodeException undecodablePayload) {
-                // fall through to the correlation ID
+        String fromPayload = null;
+        try {
+            if (Envelope.TYPE_RIDE_ASSIGNED.equals(original.type())) {
+                fromPayload = codec.decodePayload(original, RideAssigned.class).rideId();
+            } else if (Envelope.TYPE_RIDE_COMPLETED.equals(original.type())) {
+                fromPayload = codec.decodePayload(original, RideCompleted.class).rideId();
             }
+        } catch (EnvelopeDecodeException undecodablePayload) {
+            // fall through to the correlation ID
+        }
+        if (fromPayload != null && !fromPayload.isBlank()) {
+            return fromPayload;
         }
         return original.correlationId() == null ? "" : original.correlationId();
     }

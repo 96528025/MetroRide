@@ -24,6 +24,20 @@ class MoneyTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    /** The driver's share: the exact product is rounded once, half up, and only here. */
+    @Test
+    void timesRoundsTheExactProductOnce() {
+        assertThat(Money.of("5.85").times(new BigDecimal("0.80"))).hasToString("4.68");
+        // 0.008 rounds up to a cent; 0.004 rounds to nothing.
+        assertThat(Money.of("0.01").times(new BigDecimal("0.80"))).hasToString("0.01");
+        assertThat(Money.of("0.01").times(new BigDecimal("0.40"))).hasToString("0.00");
+        // Exact .5 boundary, half up.
+        assertThat(Money.of("1.25").times(new BigDecimal("0.5"))).hasToString("0.63");
+        assertThat(Money.of("5.85").times(BigDecimal.ZERO)).isEqualTo(Money.ZERO);
+        assertThat(Money.of("5.85").times(BigDecimal.ONE)).isEqualTo(Money.of("5.85"));
+        assertThatThrownBy(() -> Money.of("1.00").times(null)).isInstanceOf(IllegalArgumentException.class);
+    }
+
     @Test
     void canonicalConstructorAcceptsOnlyScaleTwo() {
         assertThatThrownBy(() -> new Money(new BigDecimal("1.5")))

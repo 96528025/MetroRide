@@ -34,10 +34,13 @@ import org.springframework.test.context.TestPropertySource;
  * <p>The cap is shrunk through {@link TestPropertySource}, which gives this class its own Spring
  * context and therefore its own consumer, on the same containers. That consumer reads its own
  * stream so it never competes with the cached context's consumer for the other tests' entries and
- * their per-context metrics.
+ * their per-context metrics. Both configured streams get test-specific names: a context that
+ * kept the default completions stream would compete with the shared context's consumer for the
+ * completion tests' entries.
  */
 @TestPropertySource(properties = {
-        "metroride.consumer.stream=events.ride.assignments.delivery-cap-test",
+        "metroride.consumer.streams[0]=events.ride.assignments.delivery-cap-test",
+        "metroride.consumer.streams[1]=events.ride.completions.delivery-cap-test",
         "metroride.consumer.reclaim-interval=1s",
         "metroride.consumer.reclaim-min-idle=1s",
         "metroride.consumer.max-deliveries=3"})
@@ -60,7 +63,8 @@ class DeliveryCapIT extends IntegrationTestSupport {
 
     @Test
     void anEntryThatKeepsFailingIsDeadLetteredOnItsThirdDeliveryThenAcknowledged() throws Exception {
-        assertThat(consumer.stream()).isEqualTo("events.ride.assignments.delivery-cap-test");
+        assertThat(consumer.streams()).containsExactly(
+                "events.ride.assignments.delivery-cap-test", "events.ride.completions.delivery-cap-test");
         assertThat(consumer.maxDeliveries()).isEqualTo(3);
         DeadLetterStream deadLetters = new DeadLetterStream(redisTemplate, mapper);
         String eventId = UUID.randomUUID().toString();
@@ -76,7 +80,7 @@ class DeliveryCapIT extends IntegrationTestSupport {
             try (PreparedStatement insert = lockHolder.prepareStatement(
                     "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
                 insert.setString(1, eventId);
-                insert.setString(2, consumer.stream());
+                insert.setString(2, assignments());
                 insert.setString(3, "ride_assigned");
                 insert.executeUpdate();
             }
@@ -112,19 +116,24 @@ class DeliveryCapIT extends IntegrationTestSupport {
         assertThat(processedRows(eventId)).isZero();
     }
 
+    /** The assignments stream: first in {@code metroride.consumer.streams}. */
+    private String assignments() {
+        return consumer.streams().get(0);
+    }
+
     private RecordId publish(String envelopeJson) {
         return redisTemplate.opsForStream().add(StreamRecords.string(Map.of(EnvelopeCodec.EVENT_FIELD, envelopeJson))
-                .withStreamKey(consumer.stream()));
+                .withStreamKey(assignments()));
     }
 
     private boolean isPending(RecordId id) {
         return !redisTemplate.opsForStream()
-                .pending(consumer.stream(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
+                .pending(assignments(), consumer.group(), Range.closed(id.getValue(), id.getValue()), 1)
                 .isEmpty();
     }
 
     private long pendingEntries() {
-        return redisTemplate.opsForStream().pending(consumer.stream(), consumer.group()).getTotalPendingMessages();
+        return redisTemplate.opsForStream().pending(assignments(), consumer.group()).getTotalPendingMessages();
     }
 
     private int processedRows(String eventId) {
@@ -135,11 +144,11 @@ class DeliveryCapIT extends IntegrationTestSupport {
 
     private double deadLetterCount(String reason) {
         return meterRegistry.get("metroride.fare.dead_letters")
-                .tag("stream", consumer.stream()).tag("reason", reason).counter().count();
+                .tag("stream", assignments()).tag("reason", reason).counter().count();
     }
 
     private double reclaimedCount() {
-        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", consumer.stream()).counter().count();
+        return meterRegistry.get("metroride.fare.events.reclaimed").tag("stream", assignments()).counter().count();
     }
 
     private double postgresErrorCount() {

@@ -90,6 +90,37 @@ Response:
 }
 ```
 
+### Complete Ride
+
+Moves an `assigned` ride to `completed` and atomically persists a pending `ride_completed` outbox event with it; the relay publishes the event to `events.ride.completions` after the response. The transition is a conditional update on `status = 'assigned'`, so concurrent completions of one ride yield exactly one `202` and the rest `409`. The ride must have exactly one `ride_assignments` row; zero or several roll the transaction back with `500`.
+
+```http
+POST /v1/rides/{ride_id}/complete
+```
+
+No request body.
+
+Responses:
+
+```http
+202 Accepted
+```
+
+```json
+{
+  "ride_id": "7b2c6e17-8e76-4d4b-b8d6-0c8ff4c7f1b1",
+  "status": "completed",
+  "event_id": "0b2d0a5e-6a8a-4d2b-9f3c-4b0d2d1f7e10"
+}
+```
+
+```http
+404 Not Found   {"error":"ride not found"}
+409 Conflict    {"error":"ride is requested"}   (or "ride is completed", "ride is cancelled", ...)
+500             {"error":"ride assignment state inconsistent"}   (zero or several assignment rows)
+500             {"error":"failed to complete ride"}
+```
+
 ## Dispatch Service
 
 Base URL: `http://localhost:8082`
