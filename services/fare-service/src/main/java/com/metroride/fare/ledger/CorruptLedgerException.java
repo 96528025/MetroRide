@@ -3,6 +3,7 @@ package com.metroride.fare.ledger;
 import com.metroride.fare.consumer.ClassifiedFailure;
 import com.metroride.fare.consumer.DeadLetterReason;
 import com.metroride.fare.consumer.FailureClass;
+import java.util.Optional;
 
 /**
  * Rows already in the ledger do not describe a valid entry: a journal entry without postings, a
@@ -33,7 +34,7 @@ public class CorruptLedgerException extends RuntimeException implements Classifi
     }
 
     @Override
-    public DeadLetterReason deadLetterReason() {
-        return DeadLetterReason.CORRUPT_HOLD;
+    public Optional<DeadLetterReason> deadLetterReason() {
+        return Optional.of(DeadLetterReason.CORRUPT_HOLD);
     }
 }

@@ -52,10 +52,11 @@
       <groupId>org.flywaydb</groupId>
       <artifactId>flyway-database-postgresql</artifactId>
     </dependency>
+    <!-- Compile scope, not runtime: LedgerRepository reads the violated constraint's name from
+         the driver's PSQLException to tell a per-ride ledger conflict from any other class-23 error. -->
     <dependency>
       <groupId>org.postgresql</groupId>
       <artifactId>postgresql</artifactId>
-      <scope>runtime</scope>
     </dependency>
 
     <dependency>

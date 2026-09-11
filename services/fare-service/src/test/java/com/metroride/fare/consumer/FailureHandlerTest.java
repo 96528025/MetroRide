@@ -16,6 +16,7 @@ import com.metroride.fare.consumer.FailureHandler.Disposition;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.ledger.CorruptLedgerException;
+import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.pricing.FareQuoteException;
 import com.metroride.fare.processing.SettlementException;
 import io.lettuce.core.RedisCommandTimeoutException;
@@ -186,23 +187,51 @@ class FailureHandlerTest {
         assertThat(deadLetters("poison")).isEqualTo(1);
     }
 
-    /** Quarantine is poison's disposition with the exception's own reason: dead letter first, then ack. */
+    /**
+     * Quarantine is poison's disposition with the exception's own reason: dead letter first, then
+     * ack. A second hold refused by the database is counted on the dead-letter series alone: it is
+     * not a settlement failure (the event was an assignment) and not a consume error.
+     */
     @Test
     void aQuarantinedFailureIsDeadLetteredUnderItsOwnReasonThenAcknowledged() {
         when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(true);
-        SettlementException ambiguous = new SettlementException(
-                SettlementException.Reason.AMBIGUOUS_HOLD, "ambiguous ledger: ride r1 has 2 quote_hold entries");
+        LedgerConflictException duplicateHold = new LedgerConflictException(
+                LedgerConflictException.Conflict.DUPLICATE_HOLD, "ride r1 already has a quote_hold", null);
 
-        Disposition disposition = handler.onFailure(commands, message(), envelope(), ambiguous, 1);
+        Disposition disposition = handler.onFailure(commands, message(), envelope(), duplicateHold, 1);
 
         assertThat(disposition).isEqualTo(Disposition.DEAD_LETTERED);
         InOrder order = inOrder(publisher, commands);
-        order.verify(publisher).publish(eq(commands), eq(message()), eq(envelope()), eq(ambiguous));
+        order.verify(publisher).publish(eq(commands), eq(message()), eq(envelope()), eq(duplicateHold));
         order.verify(commands).xack(STREAM, GROUP, MESSAGE_ID);
-        assertThat(deadLetters("ambiguous_hold")).isEqualTo(1);
+        assertThat(deadLetters("duplicate_hold")).isEqualTo(1);
         assertThat(deadLetters("poison")).isZero();
-        assertThat(settlementFailures("ambiguous_hold")).isEqualTo(1);
+        for (String reason : FailureHandler.SETTLEMENT_FAILURE_REASONS) {
+            assertThat(settlementFailures(reason)).as(reason).isZero();
+        }
+        assertThat(consumeErrors()).isZero();
+        assertThat(postgresErrors()).isZero();
         assertThat(halt.isHalted()).isFalse();
+    }
+
+    /**
+     * Two holds for one ride mean the V3 unique index is not doing its job: fatal. The consumer
+     * halts with the entry pending; nothing is dead-lettered, and the failure is still counted
+     * under its settlement reason so the halt is attributable.
+     */
+    @Test
+    void twoHoldsForOneRideHaltTheConsumerWithoutDeadLettering() {
+        SettlementException ambiguous = new SettlementException(
+                SettlementException.Reason.AMBIGUOUS_HOLD, "ride r1 has 2 quote_hold entries");
+
+        Disposition disposition = handler.onFailure(commands, message(), envelope(), ambiguous, 1);
+
+        assertThat(disposition).isEqualTo(Disposition.HALT);
+        verifyNoInteractions(publisher);
+        verifyNoInteractions(commands);
+        assertThat(halt.isHalted()).isTrue();
+        assertThat(halt.reason()).hasValueSatisfying(reason -> assertThat(reason).contains("2 quote_hold"));
+        assertThat(settlementFailures("ambiguous_hold")).isEqualTo(1);
     }
 
     @Test
@@ -236,11 +265,11 @@ class FailureHandlerTest {
         when(publisher.publish(eq(commands), any(), any(), any())).thenReturn(false);
 
         Disposition disposition = handler.onFailure(commands, message(), envelope(),
-                new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD, "two holds"), 1);
+                new SettlementException(SettlementException.Reason.ALREADY_SETTLED, "ride r1 is already settled"), 1);
 
         assertThat(disposition).isEqualTo(Disposition.LEFT_PENDING);
         verify(commands, never()).xack(anyString(), anyString(), any());
-        assertThat(deadLetters("ambiguous_hold")).isZero();
+        assertThat(deadLetters("already_settled")).isZero();
         assertThat(publishFailures()).isEqualTo(1);
     }
 

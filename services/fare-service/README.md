@@ -28,7 +28,7 @@ recovery".
 | Failure handling | `consumer/FailureHandler`, `consumer/ConsumerHalt` | Leaves the entry pending, dead-letters it, or halts the consumer; owns the one `XACK` in the service; the halt fails `/readyz` |
 | Entry age | `consumer/StreamEntryAge` | Age of an entry from the millisecond timestamp in its stream ID; logged, never decided on |
 | Dead letters | `consumer/DeadLetterPublisher`, `events/DeadLetter` | `XADD` to `events.dead_letter` in the shape `publishDeadLetter` in dispatch-service writes; `DeadLetter` mirrors `events.DeadLetter` in `events.go` |
-| Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables are checked by the integration tests |
+| Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql`, `V3__one_hold_and_one_settlement_per_ride.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables and the V3 per-ride unique indexes are checked by the integration tests |
 | Endpoints | `web/HealthController`, `web/MetricsController`, `web/LedgerController` | `/healthz`, `/readyz`, `/metrics` with the same paths and JSON as `shared/pkg/httpx/httpx.go`; `GET /v1/rides/{ride_id}/ledger` |
 
 ### Processing rule
@@ -43,10 +43,10 @@ For each stream entry, from either stream (the type decides, never the stream it
    2. if the type is `ride_assigned`, decode the payload, compute the quote, and append a
       `quote_hold` journal entry with two postings;
    3. if the type is `ride_completed`, decode the payload, lock the ride's `quote_hold`
-      (`select ... for update`), check that there is exactly one and that it has the shape
-      the service writes, check that the ride has no `settlement` yet, and append a
-      `hold_reversal` and a `settlement`, both with this event's ID as `source_event_id`
-      (see "Settlement");
+      (`select ... for update`), check that there is exactly one (two cannot exist since V3;
+      finding two is fatal) and that it has the shape the service writes, check that the ride
+      has no `settlement` yet, and append a `hold_reversal` and a `settlement`, both with this
+      event's ID as `source_event_id` (see "Settlement");
    4. any other type is only recorded.
 3. After the transaction commits, `XACK` the entry.
 
@@ -81,19 +81,23 @@ first and names its own class; the rules below apply to everything else.
 | Class | Exceptions | What happens to the entry |
 | --- | --- | --- |
 | `POISON` | `EnvelopeDecodeException` (the entry is not an envelope), `FareQuoteException` (the payload cannot be quoted), `SettlementException` with reason `payload` (a `ride_completed` whose payload is missing, undecodable or has no `ride_id`), `DataIntegrityViolationException` whose root SQLSTATE is class 22 (PostgreSQL or the driver refused a value: a NUL character in a text field, an invalid byte sequence, a numeric overflow) | Dead-lettered immediately, then acknowledged |
-| `QUARANTINE` | `SettlementException` with reason `ambiguous_hold` (the ride has two `quote_hold` entries) or `already_settled` (the ride has a `settlement` from another event); `CorruptLedgerException` (the ride's hold rows are not the entry this service writes: no postings, unbalanced, an unknown account or kind, a wrong account or side) | As poison: dead-lettered immediately under the reason the exception names, then acknowledged. Counted separately, so a corrupted ride is alerted on as such |
-| `FATAL` | `InvalidDataAccessResourceUsageException` (bad SQL, wrong column type), `InvalidDataAccessApiUsageException` (a repository was misused, or a constructor threw inside one), any other `DataIntegrityViolationException` (class 23, a constraint the writer cannot reach unless the schema or the data is already wrong) | Left pending; the consumer halts and `/readyz` fails with the reason until the deployment is fixed and the service restarted |
+| `QUARANTINE` | `SettlementException` with reason `already_settled` (the ride has a `settlement` from another event, found under the hold's lock or refused by the per-ride settlement index); `CorruptLedgerException` (the ride's hold rows are not the entry this service writes: no postings, unbalanced, an unknown account or kind, a wrong account or side); `LedgerConflictException` (a `ride_assigned` for a ride that already has a `quote_hold`, refused by the per-ride index `journal_entries_one_quote_hold_per_ride`; reason `duplicate_hold`) | As poison: dead-lettered immediately under the reason the exception names, then acknowledged. Settlement reasons and `corrupt_hold` are counted on `metroride_fare_settlement_failures_total`; `duplicate_hold` only on the dead-letter counter, since the failed event is an assignment |
+| `FATAL` | `InvalidDataAccessResourceUsageException` (bad SQL, wrong column type), `InvalidDataAccessApiUsageException` (a repository was misused, or a constructor threw inside one), any `DataIntegrityViolationException` other than the two per-ride indexes above (class 23, a constraint the writer cannot reach unless the schema or the data is already wrong), `SettlementException` with reason `ambiguous_hold` (two `quote_hold` rows for one ride, a state the V3 index makes unrepresentable, so the index is gone or the schema has drifted; the check stays so the service never settles against the first of several holds) | Left pending; the consumer halts and `/readyz` fails with the reason until the deployment is fixed and the service restarted |
 | `RETRYABLE` | `SettlementException` with reason `missing_hold` (the ride has no `quote_hold` yet), every other `DataAccessException` (cancelled lock wait, lost connection, deadlock), every `TransactionException`, and anything unforeseen | Left pending and delivered again by the reclaim pass; dead-lettered when its `max-deliveries`-th delivery fails |
 
 Why the settlement outcomes fall where they do. A missing hold says nothing is wrong: the
 assignment and the completion of one ride travel on two streams through two outbox relays, and
 the completion can arrive first under ordinary scheduling, so the entry waits in the pending list
 and the reclaim pass retries it every `reclaim-interval` until the hold exists (see "Delivery cap,
-not age" for the window). An ambiguous or corrupt hold is the opposite: the message may be
-perfectly fine, the ride's ledger is not, and no number of retries repairs an append-only ledger.
-It is not fatal either, because it is one ride's problem, and halting would let that one ride
-stop every other ride's quotes and settlements; so it is set aside like poison but under its own
-reason. `already_settled` is quarantined for the same reason and is the last line against
+not age" for the window). A corrupt hold is the opposite: the message may be perfectly fine, the
+ride's ledger is not, and no number of retries repairs an append-only ledger. It is not fatal
+either, because it is one ride's problem, and halting would let that one ride stop every other
+ride's quotes and settlements; so it is set aside like poison but under its own reason. A
+duplicate hold is the mirror image: the ledger is fine and the second assignment event is the
+odd one out, refused by the database before it can write anything. Two holds for one ride are
+neither: V3 makes that state impossible, so seeing it means the database is not what the code
+assumes, which is the deployment's problem and halts the consumer rather than let it settle
+against a hold it picked. `already_settled` is quarantined like a corrupt hold and is the last line against
 settling one ride twice: rider-service's status guard never publishes a second completion, but a
 dead letter replayed by hand can. A payload without a `ride_id` is poison, deliberately not a
 missing hold: an entry that can never name its ride would otherwise be retried for its whole
@@ -214,8 +218,11 @@ What is true after this:
   reclaim pass and the read loop are the same thread and cannot overlap.
 - Two instances settling the same ride from two *different* completion events are serialised by
   the `select ... for update` on the ride's `quote_hold`; the second sees the first's settlement
-  and quarantines its entry as `already_settled`. That is the only multi-instance protection
-  added with settlement: it covers the settlement of one ride and nothing else.
+  and quarantines its entry as `already_settled`. That lock cannot order a completion against a
+  second, distinct *assignment* for the same ride (the assignment never touches the locked row),
+  so the per-ride unique indexes of V3 do that: the second `quote_hold`, or a second `settlement`
+  that slipped past the check, is refused by the database and the transaction rolls back whole.
+  Together these cover one ride's hold and settlement across instances, and nothing else.
 
 ### Fare and ledger
 
@@ -272,16 +279,32 @@ only the rider debit and the driver credit; `X` 0.01 with share 0.80 rounds `D` 
 the platform posting. The three cases are on `JournalEntry.settlement`.
 
 Before writing, the settlement reads the ride's `quote_hold` rows with `select ... for update`
-and classifies what it finds (see the failure table): none, retryable; more than one, quarantined
-as `ambiguous_hold`; one that is not the two-posting shape `quoteHold` writes, quarantined as
-`corrupt_hold`; and, with the lock held, an existing `settlement` on the ride, quarantined as
-`already_settled`.
+and classifies what it finds (see the failure table): none, retryable; more than one, fatal
+(`ambiguous_hold`, a state V3 forbids); one that is not the two-posting shape `quoteHold` writes,
+quarantined as `corrupt_hold`; and, with the lock held, an existing `settlement` on the ride,
+quarantined as `already_settled`.
+
+`V3__one_hold_and_one_settlement_per_ride.sql` adds two partial unique indexes, one `quote_hold`
+and one `settlement` per `ride_id`. They exist because the checks above run inside one
+transaction and cannot see another transaction's uncommitted insert: a completion that has
+locked and read hold A cannot stop a second, distinct `ride_assigned` from inserting hold B for
+the same ride, and without the index both would commit and leave B un-reversed behind a settled
+ride. With it the second hold is refused at insert, the whole transaction (event row included)
+rolls back, and the assignment event is quarantined as `duplicate_hold`; a second settlement that
+slips past the checked path is refused the same way and reported as `already_settled`.
+`LedgerRepository.append` recognises the two indexes by the constraint name in the driver's
+error; any other integrity violation stays what Spring made of it and is fatal. The row lock is
+still what gives the second completion its clean `already_settled` before writing anything; the
+indexes are the backstop for the window the lock cannot close.
 
 The balance rule (postings of one entry sum to zero, at least one posting, no zero posting) is
 enforced in the `JournalEntry` constructor and nowhere else. There is no database trigger on
 purpose: with a single writer, making the illegal state unrepresentable in the application is
 enough, and a trigger would duplicate the rule in a second language with its own tests. A
-trigger is defense in depth to add when a second writer appears. Reads go through the same
+trigger is defense in depth to add when a second writer appears. The per-ride *cardinality* rules
+(one hold, one settlement) are the exception and live in the database since V3, because two
+instances of this service are that second writer and no application check can order their
+inserts. Reads go through the same
 constructor (the query is a left join, so an entry that lost its postings is not hidden), so a
 row set that no longer balances or has no postings is refused rather than served.
 
@@ -343,7 +366,7 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | `metroride_fare_quote_failures_total` | `service`, `reason=payload\|calculation` | `ride_assigned` envelopes whose payload did not decode or whose figures the calculator rejected; the transaction rolled back and the entry is dead-lettered as poison |
 | `metroride_fare_settlement_failures_total` | `service`, `reason=missing_hold\|ambiguous_hold\|corrupt_hold\|already_settled` | `ride_completed` envelopes that could not be settled, counted once per failed delivery, so `missing_hold` grows by one per retry of a completion that is waiting for its assignment |
 | `metroride_fare_events_reclaimed_total` | `service`, `stream` | Pending entries delivered again by the reclaim pass |
-| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|max_deliveries_reached\|ambiguous_hold\|corrupt_hold\|already_settled` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK`. The reason is only here: the dead letter JSON has no `reason` field, the specific cause is in its `error` text |
+| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|max_deliveries_reached\|duplicate_hold\|corrupt_hold\|already_settled` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK`. The reason is only here: the dead letter JSON has no `reason` field, the specific cause is in its `error` text |
 | `metroride_fare_dead_letter_publish_failures_total` | `service`, `stream` | Dead-letter `XADD`s Redis did not confirm; the entry stayed pending |
 | `metroride_fare_consumer_halted` | `service` | Gauge, 1 once the consumer has stopped on a fatal failure |
 | `metroride_stream_consume_errors_total` | `service`, `stream` | Failed reads and undecodable entries (same name as the Go shared counter) |
@@ -391,10 +414,18 @@ nothing; a completion that arrives *before* its assignment fails as `missing_hol
 and settles on the reclaimed delivery once the assignment has landed, within
 `reclaim-interval + reclaim-min-idle`, which is the case the reclaim pass exists for; two threads
 recording two different completion events for one ride settle it once, the other failing as
-`already_settled`, which is the `for update` on the hold at work; a ride with two holds, a hold
-credited to `driver_payable`, and a hold without postings each dead-letter the completion under
-`ambiguous_hold` or `corrupt_hold`, with the reason in both the metric label and `payload.error`,
-the entry acknowledged, nothing recorded, and the consumer still running with `/readyz` 200; a
+`already_settled`, which is the `for update` on the hold at work; a second, distinct
+`ride_assigned` for a ride whose hold is committed is dead-lettered as `duplicate_hold` with the
+ledger unchanged and the ride still settling afterwards, and the same with the first hold still
+uncommitted when the second arrives (the consumer's insert waits on the index and is refused once
+the hold commits); the settlement index refuses a second `settlement` at the repository as a
+`LedgerConflictException` (the recorder's `already_settled`), while a violation of the
+`(source_event_id, kind)` key stays Spring's `DuplicateKeyException` and fatal; a hold credited to
+`driver_payable` and a hold without postings each dead-letter the completion under
+`corrupt_hold`, with the reason in both the metric label and `payload.error`, the entry
+acknowledged, nothing recorded, and the consumer still running with `/readyz` 200 (two holds for
+one ride can no longer be arranged against the real schema; `ProcessedEventRecorderTest` covers
+that branch against a mocked ledger and asserts it is fatal and writes nothing); a
 second completion event after settlement is dead-lettered as `already_settled` and the ledger
 is unchanged; a completion without a `ride_id` is dead-lettered as `poison` and never counted as
 a missing hold; and a settlement blocked on `fare.postings` past the timeout (the table is held
@@ -414,9 +445,9 @@ and a fatal failure neither acknowledges nor dead-letters and halts the consumer
 
 Integration, all on the containers from `IntegrationTestSupport`. `PendingEntryRecoveryIT` sends
 a `ride_assigned` with a negative distance, an entry whose `event` field is not JSON, and an
-envelope whose event ID contains a NUL character (refused by the driver as SQLSTATE 22023), and
+envelope whose event ID contains a NUL character (refused as SQLSTATE 22023 by the driver, or 22021 by the server when the driver sends the parameter in binary), and
 asserts the dead letter's content, the acknowledgement, the empty pending list, the untouched
-tables, and for the NUL entry that the consumer did not halt. The lock-wait tests in `RideAssignmentConsumerIT` and `QuoteLedgerIT` assert that the
+tables, and for the NUL entry that the consumer did not halt. The lock-wait tests in `RideEventConsumerIT` and `QuoteLedgerIT` assert that the
 entry is reclaimed and recorded within `reclaim-interval + reclaim-min-idle` of the lock being
 released; nothing acknowledges by hand any more. Three classes run a consumer of their own (a
 `@TestPropertySource` context on the same containers, each reading its own stream so it never
@@ -452,6 +483,9 @@ RIDE=$(curl -s -X POST localhost:8080/v1/rides -H 'Content-Type: application/jso
   -d '{"rider_id":"rider-42","pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["ride_id"])')
 until curl -s localhost:8080/v1/rides/$RIDE | grep -q '"status":"assigned"'; do sleep 0.5; done
+# "assigned" is dispatch's commit; the assignment event still has to cross the relay and this
+# consumer, so poll the ledger for the hold rather than reading it once.
+until curl -s localhost:8087/v1/rides/$RIDE/ledger | grep -q quote_hold; do sleep 0.5; done
 curl -s localhost:8087/v1/rides/$RIDE/ledger                          # the quote_hold
 curl -s -X POST localhost:8080/v1/rides/$RIDE/complete                # 202 {"ride_id":...,"status":"completed","event_id":...}
 sleep 2

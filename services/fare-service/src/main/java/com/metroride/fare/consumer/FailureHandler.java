@@ -4,6 +4,7 @@ import com.metroride.fare.FareServiceApplication;
 import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.ledger.CorruptLedgerException;
+import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.pricing.FareQuoteException;
 import com.metroride.fare.processing.SettlementException;
 import io.lettuce.core.RedisException;
@@ -141,7 +142,7 @@ public class FailureHandler {
             case QUARANTINE -> {
                 // Only a ClassifiedFailure is ever classified QUARANTINE, and it names its own reason.
                 DeadLetterReason reason = failure instanceof ClassifiedFailure classified
-                        ? classified.deadLetterReason() : DeadLetterReason.POISON;
+                        ? classified.deadLetterReason().orElse(DeadLetterReason.POISON) : DeadLetterReason.POISON;
                 entry.addKeyValue("reason", reason.label())
                         .log("handle event failed; quarantining entry: the ride's ledger, not the entry, is at fault");
                 yield deadLetter(commands, message, envelope, failure, reason);
@@ -242,6 +243,9 @@ public class FailureHandler {
             settlementFailures.get(settlement.reason().label()).increment();
         } else if (failure instanceof CorruptLedgerException) {
             settlementFailures.get(DeadLetterReason.CORRUPT_HOLD.label()).increment();
+        } else if (failure instanceof LedgerConflictException) {
+            // A second hold for a ride refused by the database. Not a settlement failure and not a
+            // consume error: the dead-letter counter's reason label is its only series.
         } else if (failure instanceof DataAccessException || failure instanceof TransactionException) {
             postgresErrors.increment();
         } else {

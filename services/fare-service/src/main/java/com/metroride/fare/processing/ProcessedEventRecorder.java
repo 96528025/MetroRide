@@ -7,6 +7,7 @@ import com.metroride.fare.events.RideAssigned;
 import com.metroride.fare.events.RideCompleted;
 import com.metroride.fare.ledger.CorruptLedgerException;
 import com.metroride.fare.ledger.JournalEntry;
+import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.ledger.LedgerRepository;
 import com.metroride.fare.ledger.Money;
 import com.metroride.fare.ledger.StoredJournalEntry;
@@ -111,7 +112,12 @@ public class ProcessedEventRecorder {
      * backstop for writers that bypass this method, not the mechanism relied on here. Two
      * different completion events for one ride are a different case: their event rows do not
      * collide, so the row lock on the ride's {@code quote_hold} serialises them and the second one
-     * finds the ride settled (see {@link #settle}).
+     * finds the ride settled (see {@link #settle}). A completion and a second, distinct assignment
+     * for one ride are yet another: the lock is on a hold that the assignment does not touch, so
+     * nothing in this class can order them, and the per-ride unique index on {@code quote_hold}
+     * (V3) refuses the second hold instead; the recorder sees that as a
+     * {@link LedgerConflictException} and the consumer quarantines the assignment event as
+     * {@code duplicate_hold} with the ledger untouched.
      *
      * @throws FareQuoteException     when a {@code ride_assigned} payload cannot be quoted; the
      *                                transaction rolls back and the event is not recorded
@@ -119,6 +125,9 @@ public class ProcessedEventRecorder {
      *                                reason that decides whether it is retried, quarantined or
      *                                dead-lettered as poison
      * @throws CorruptLedgerException when the ride's {@code quote_hold} rows are not a valid hold
+     * @throws LedgerConflictException when the database refused a second {@code quote_hold} for
+     *                                 the ride; the transaction rolls back and the event is not
+     *                                 recorded
      */
     @Transactional(timeoutString = "${metroride.postgres.timeout-seconds}")
     public Result record(String stream, Envelope envelope) {
@@ -165,15 +174,19 @@ public class ProcessedEventRecorder {
      *       never a missing hold, or an entry that can never name its ride would be retried
      *       forever as "assignment not here yet".</li>
      *   <li>Lock the ride's {@code quote_hold} rows ({@code select ... for update}). Zero rows: the
-     *       assignment has not arrived, retryable. More than one: the ledger is ambiguous,
-     *       quarantined.</li>
+     *       assignment has not arrived, retryable. More than one: a state the V3 unique index makes
+     *       impossible, so the index is gone or the schema has drifted; fatal, the consumer halts
+     *       rather than settle against the first of several holds.</li>
      *   <li>Check the one hold has the shape {@link JournalEntry#quoteHold} writes; anything else
      *       is a {@link CorruptLedgerException}, quarantined.</li>
      *   <li>With the lock held, check the ride is not settled yet; if it is, quarantined as
      *       {@code already_settled}. This is what stops two different completion events for one
      *       ride, from a replayed dead letter for instance, from settling the ride twice: the
      *       second waits on the hold's row lock and then sees the first's settlement.</li>
-     *   <li>Append the {@code hold_reversal} and the {@code settlement}, both under this event's ID.</li>
+     *   <li>Append the {@code hold_reversal} and the {@code settlement}, both under this event's ID.
+     *       Should a second settlement slip past the check above, the per-ride unique index on
+     *       settlements refuses it and the whole transaction, reversal included, rolls back; that
+     *       is reported as {@code already_settled} too.</li>
      * </ol>
      */
     private List<JournalEntry> settle(Envelope envelope) {
@@ -196,7 +209,8 @@ public class ProcessedEventRecorder {
         }
         if (holds.size() > 1) {
             throw new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD,
-                    "ambiguous ledger: ride " + rideId + " has " + holds.size() + " quote_hold entries (event " + envelope.id() + ")");
+                    "ride " + rideId + " has " + holds.size() + " quote_hold entries, which the unique index"
+                            + " journal_entries_one_quote_hold_per_ride should make impossible (event " + envelope.id() + ")");
         }
         Money quote = QuoteHoldShape.amountOf(rideId, holds.get(0).entry().postings());
         if (ledger.hasSettlement(rideId)) {
@@ -207,8 +221,17 @@ public class ProcessedEventRecorder {
         JournalEntry reversal = JournalEntry.holdReversal(rideId, envelope.id(), quote);
         JournalEntry settlement = JournalEntry.settlement(rideId, envelope.id(), quote, rates.driverShare());
         Instant now = clock.instant();
-        ledger.append(reversal, now);
-        ledger.append(settlement, now);
+        try {
+            ledger.append(reversal, now);
+            ledger.append(settlement, now);
+        } catch (LedgerConflictException conflict) {
+            if (conflict.conflict() != LedgerConflictException.Conflict.DUPLICATE_SETTLEMENT) {
+                throw conflict;
+            }
+            throw new SettlementException(SettlementException.Reason.ALREADY_SETTLED,
+                    "ride " + rideId + " was settled by another transaction; event " + envelope.id()
+                            + " refused by " + conflict.conflict().indexName(), conflict);
+        }
         return List.of(reversal, settlement);
     }
 }

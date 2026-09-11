@@ -3,6 +3,7 @@ package com.metroride.fare.processing;
 import com.metroride.fare.consumer.ClassifiedFailure;
 import com.metroride.fare.consumer.DeadLetterReason;
 import com.metroride.fare.consumer.FailureClass;
+import java.util.Optional;
 
 /**
  * A {@code ride_completed} envelope could not be settled. Thrown inside the recording
@@ -25,15 +26,20 @@ public class SettlementException extends RuntimeException implements ClassifiedF
          */
         MISSING_HOLD("missing_hold", FailureClass.RETRYABLE, DeadLetterReason.MAX_DELIVERIES_REACHED),
         /**
-         * The ride has more than one {@code quote_hold}. Quarantined: the entry may be fine but the
-         * ride's ledger is not, retrying cannot fix an append-only ledger, and halting would let
-         * one ride stop every other ride.
+         * The ride has more than one {@code quote_hold}. Fatal: the partial unique index
+         * {@code journal_entries_one_quote_hold_per_ride} makes this state unrepresentable, so
+         * seeing it means the index is gone or the schema has drifted from the migrations, and
+         * every ride's ledger is then suspect. The check stays in the code so the service never
+         * settles against the first of several holds; it halts instead of guessing.
          */
-        AMBIGUOUS_HOLD("ambiguous_hold", FailureClass.QUARANTINE, DeadLetterReason.AMBIGUOUS_HOLD),
+        AMBIGUOUS_HOLD("ambiguous_hold", FailureClass.FATAL, null),
         /**
          * The ride already has a {@code settlement} from a different completion event. Quarantined:
          * the status guard in rider-service never publishes a second completion, but a replayed
-         * dead letter can, and this is the last check before the ride would be settled twice.
+         * dead letter can. Detected by the check under the hold's row lock, or, should two writers
+         * slip past it, by the per-ride unique index on settlements (see
+         * {@code LedgerConflictException}); either way this is the last line before a ride is
+         * settled twice.
          */
         ALREADY_SETTLED("already_settled", FailureClass.QUARANTINE, DeadLetterReason.ALREADY_SETTLED);
 
@@ -44,7 +50,7 @@ public class SettlementException extends RuntimeException implements ClassifiedF
         Reason(String label, FailureClass failureClass, DeadLetterReason deadLetterReason) {
             this.label = label;
             this.failureClass = failureClass;
-            this.deadLetterReason = deadLetterReason;
+            this.deadLetterReason = deadLetterReason;  // null only for FATAL, which is never dead-lettered
         }
 
         /** Value of the {@code reason} label on {@code metroride_fare_settlement_failures_total}. */
@@ -56,8 +62,8 @@ public class SettlementException extends RuntimeException implements ClassifiedF
             return failureClass;
         }
 
-        public DeadLetterReason deadLetterReason() {
-            return deadLetterReason;
+        public Optional<DeadLetterReason> deadLetterReason() {
+            return Optional.ofNullable(deadLetterReason);
         }
     }
 
@@ -82,7 +88,7 @@ public class SettlementException extends RuntimeException implements ClassifiedF
     }
 
     @Override
-    public DeadLetterReason deadLetterReason() {
-        return reason.deadLetterReason;
+    public Optional<DeadLetterReason> deadLetterReason() {
+        return reason.deadLetterReason();
     }
 }

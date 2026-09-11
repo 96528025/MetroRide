@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.ledger.CorruptLedgerException;
+import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.pricing.FareQuoteException;
 import com.metroride.fare.pricing.FareQuoteException.Reason;
 import com.metroride.fare.processing.SettlementException;
@@ -42,10 +43,42 @@ class FailureClassTest {
     void aSettlementFailureIsClassifiedByItsReason() {
         assertThat(FailureClass.of(new SettlementException(SettlementException.Reason.MISSING_HOLD, "no hold yet")))
                 .isEqualTo(FailureClass.RETRYABLE);
-        assertThat(FailureClass.of(new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD, "two holds")))
-                .isEqualTo(FailureClass.QUARANTINE);
         assertThat(FailureClass.of(new SettlementException(SettlementException.Reason.ALREADY_SETTLED, "settled")))
                 .isEqualTo(FailureClass.QUARANTINE);
+    }
+
+    /**
+     * Two holds for one ride cannot exist while the V3 unique index does; seeing them means the
+     * schema has drifted, which is the deployment's problem: fatal, with no dead-letter reason.
+     * The branch stays so the service never settles against the first of several holds.
+     */
+    @Test
+    void twoHoldsForOneRideAreFatalNotQuarantined() {
+        SettlementException ambiguous = new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD, "two holds");
+
+        assertThat(FailureClass.of(ambiguous)).isEqualTo(FailureClass.FATAL);
+        assertThat(ambiguous.deadLetterReason()).isEmpty();
+    }
+
+    /**
+     * The per-ride unique indexes are the one integrity violation a well-formed entry can cause;
+     * the repository reports them as their own type, quarantined under the reason the index means.
+     * A {@link DuplicateKeyException} on any other constraint keeps the class-23 rule: fatal.
+     */
+    @Test
+    void aPerRideLedgerConflictIsQuarantinedButOtherDuplicateKeysStayFatal() {
+        LedgerConflictException duplicateHold = new LedgerConflictException(
+                LedgerConflictException.Conflict.DUPLICATE_HOLD, "ride r1 already has a quote_hold", null);
+        LedgerConflictException duplicateSettlement = new LedgerConflictException(
+                LedgerConflictException.Conflict.DUPLICATE_SETTLEMENT, "ride r1 already has a settlement", null);
+
+        assertThat(FailureClass.of(duplicateHold)).isEqualTo(FailureClass.QUARANTINE);
+        assertThat(duplicateHold.deadLetterReason()).contains(DeadLetterReason.DUPLICATE_HOLD);
+        assertThat(FailureClass.of(duplicateSettlement)).isEqualTo(FailureClass.QUARANTINE);
+        assertThat(duplicateSettlement.deadLetterReason()).contains(DeadLetterReason.ALREADY_SETTLED);
+        assertThat(FailureClass.of(new DuplicateKeyException("duplicate key value violates unique constraint"
+                + " \"journal_entries_source_event_id_kind_key\"", new SQLException("duplicate key", "23505"))))
+                .isEqualTo(FailureClass.FATAL);
     }
 
     /** A completion that cannot name its ride is poison, never a missing hold to wait for. */
@@ -55,7 +88,7 @@ class FailureClassTest {
                 "ride_completed payload of event e1 has no ride_id");
 
         assertThat(FailureClass.of(noRide)).isEqualTo(FailureClass.POISON);
-        assertThat(noRide.deadLetterReason()).isEqualTo(DeadLetterReason.POISON);
+        assertThat(noRide.deadLetterReason()).contains(DeadLetterReason.POISON);
     }
 
     /** Wrong rows in the ledger are one ride's problem, quarantined; not the deployment's, not fatal. */
@@ -64,7 +97,7 @@ class FailureClassTest {
         CorruptLedgerException corrupt = new CorruptLedgerException("quote_hold of ride r1 posts to driver_payable");
 
         assertThat(FailureClass.of(corrupt)).isEqualTo(FailureClass.QUARANTINE);
-        assertThat(corrupt.deadLetterReason()).isEqualTo(DeadLetterReason.CORRUPT_HOLD);
+        assertThat(corrupt.deadLetterReason()).contains(DeadLetterReason.CORRUPT_HOLD);
     }
 
     @Test

@@ -8,6 +8,11 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.ServerErrorMessage;
+import org.springframework.core.NestedExceptionUtils;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
@@ -59,18 +64,25 @@ public class LedgerRepository {
      * Inserts the entry and its postings. Must be called inside a transaction.
      *
      * @return the generated {@code journal_entries.id}
+     * @throws LedgerConflictException when the ride already has an entry of this kind and the
+     *                                 per-ride unique index refused this one; any other integrity
+     *                                 violation is rethrown as Spring reports it
      */
     public long append(JournalEntry entry, Instant createdAt) {
         KeyHolder key = new GeneratedKeyHolder();
-        jdbc.sql("""
-                insert into fare.journal_entries (ride_id, kind, source_event_id, created_at)
-                values (:rideId, :kind, :sourceEventId, :createdAt)
-                """)
-                .param("rideId", entry.rideId())
-                .param("kind", entry.kind().code())
-                .param("sourceEventId", entry.sourceEventId())
-                .param("createdAt", java.sql.Timestamp.from(createdAt))
-                .update(key, "id");
+        try {
+            jdbc.sql("""
+                    insert into fare.journal_entries (ride_id, kind, source_event_id, created_at)
+                    values (:rideId, :kind, :sourceEventId, :createdAt)
+                    """)
+                    .param("rideId", entry.rideId())
+                    .param("kind", entry.kind().code())
+                    .param("sourceEventId", entry.sourceEventId())
+                    .param("createdAt", java.sql.Timestamp.from(createdAt))
+                    .update(key, "id");
+        } catch (DuplicateKeyException duplicate) {
+            throw perRideConflict(entry, duplicate).orElse(duplicate);
+        }
         long journalId = key.getKeyAs(Long.class);
         for (Posting posting : entry.postings()) {
             jdbc.sql("""
@@ -111,6 +123,29 @@ public class LedgerRepository {
                 .param("rideId", rideId)
                 .param("kind", JournalKind.QUOTE_HOLD.code())
                 .query(LedgerRepository::collect);
+    }
+
+    /**
+     * The per-ride unique indexes of V3 are the only constraints a well-formed entry can violate,
+     * and they name the ride's ledger state, not a deployment fault, so they get their own
+     * exception. The violated constraint's name is in the driver's error; anything else (the
+     * {@code (source_event_id, kind)} key, a foreign key) is left as the {@link DuplicateKeyException}
+     * Spring raised, which the consumer treats as fatal.
+     */
+    private static Optional<RuntimeException> perRideConflict(JournalEntry entry, DuplicateKeyException duplicate) {
+        Throwable root = NestedExceptionUtils.getMostSpecificCause(duplicate);
+        if (!(root instanceof PSQLException psql)) {
+            return Optional.empty();
+        }
+        ServerErrorMessage error = psql.getServerErrorMessage();
+        if (error == null || error.getConstraint() == null) {
+            return Optional.empty();
+        }
+        return LedgerConflictException.Conflict.forConstraint(error.getConstraint())
+                .map(conflict -> new LedgerConflictException(conflict,
+                        "ride " + entry.rideId() + " already has a " + entry.kind().code()
+                                + "; entry from event " + entry.sourceEventId() + " refused by " + conflict.indexName(),
+                        duplicate));
     }
 
     /** Whether the ride already has a {@code settlement} entry, from any source event. */

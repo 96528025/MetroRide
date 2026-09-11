@@ -10,7 +10,7 @@ Streams (see `shared/pkg/events/events.go`):
 - `events.ride.notifications` (`ride_assigned`, from the dispatch-service outbox)
 - `events.ride.completions` (`ride_completed`, from the rider-service outbox when `POST /v1/rides/{ride_id}/complete` moves an `assigned` ride to `completed`; payload `RideCompleted`: `ride_id`, `rider_id`, `driver_id`, `assignment_id`, `completed_at` as RFC 3339 with nanoseconds)
 - `events.traffic.updates` (`traffic_updated`, direct from traffic-service)
-- `events.dead_letter` (`dead_lettered`, written by dispatch-service with a direct `XADD` after three failed attempts, not via the outbox; nothing consumes it yet)
+- `events.dead_letter` (`dead_lettered`, written with a direct `XADD`, not via the outbox, by dispatch-service after three failed attempts and by fare-service for an entry it cannot decode, quote or settle or that failed 25 deliveries; same envelope and payload shape; nothing consumes it yet)
 
 `notification_created` exists as a constant and is not published by any service.
 

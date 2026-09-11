@@ -10,13 +10,21 @@ import com.metroride.fare.IntegrationTestSupport;
 import com.metroride.fare.config.ConsumerProperties;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
+import com.metroride.fare.consumer.DeadLetterReason;
+import com.metroride.fare.consumer.FailureClass;
+import com.metroride.fare.ledger.JournalEntry;
+import com.metroride.fare.ledger.LedgerConflictException;
+import com.metroride.fare.ledger.LedgerRepository;
+import com.metroride.fare.ledger.Money;
 import com.metroride.fare.processing.ProcessedEventRecorder.Outcome;
 import com.metroride.fare.processing.ProcessedEventRecorder.Result;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.Instant;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -33,6 +41,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.RecordId;
@@ -40,6 +49,8 @@ import org.springframework.data.redis.connection.stream.StreamRecords;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Settlement on {@code ride_completed} against real PostgreSQL and Redis, on the containers and
@@ -73,6 +84,12 @@ class SettlementIT extends IntegrationTestSupport {
 
     @Autowired
     EnvelopeCodec codec;
+
+    @Autowired
+    LedgerRepository ledger;
+
+    @Autowired
+    PlatformTransactionManager transactionManager;
 
     @Autowired
     MeterRegistry meterRegistry;
@@ -240,19 +257,168 @@ class SettlementIT extends IntegrationTestSupport {
         assertThat(recordedCompletions).isEqualTo(1);
     }
 
+    /**
+     * A second, distinct {@code ride_assigned} for a ride whose hold is committed. Nothing in the
+     * application orders a completion against a second assignment: the hold lock is on a row the
+     * assignment never touches, and a completion that has read one hold cannot see an assignment
+     * committing a second one behind it. That is the database's job. The partial unique index
+     * {@code journal_entries_one_quote_hold_per_ride} refuses the second hold, the transaction
+     * rolls back whole (no event row either), and the assignment entry is quarantined as
+     * {@code duplicate_hold} with the ledger exactly as it was. The ride then settles as usual.
+     */
     @Test
-    void aRideWithTwoHoldsQuarantinesTheCompletionAsAmbiguous() {
+    void aSecondAssignmentForARideWithACommittedHoldIsQuarantinedAsDuplicateHold() {
         String rideId = UUID.randomUUID().toString();
         String assignedId = UUID.randomUUID().toString();
+        String secondAssignedId = UUID.randomUUID().toString();
         String completedId = UUID.randomUUID().toString();
         publishAssignment(goAssignment(assignedId, rideId));
         await().atMost(TIMEOUT).untilAsserted(() -> assertThat(journalRows(assignedId)).isEqualTo(1));
-        insertHold(rideId, List.of(posting("rider_receivable", "5.85"), posting("fare_hold", "-5.85")));
+        double duplicatesBefore = deadLetterCount(assignments(), "duplicate_hold");
+        double holdsBefore = journalEntries("quote_hold");
+        long pendingBefore = pendingEntries(assignments());
 
-        JsonNode payload = expectQuarantine(completedId, rideId, "ambiguous_hold");
+        RecordId second = publishAssignment(goAssignment(secondAssignedId, rideId));
 
-        assertThat(payload.get("error").asText()).contains("ambiguous").contains(rideId);
-        assertThat(entries(rideId)).extracting(row -> row.get("kind")).containsExactly("quote_hold", "quote_hold");
+        await().atMost(TIMEOUT).untilAsserted(() -> {
+            assertThat(deadLetterCount(assignments(), "duplicate_hold")).isEqualTo(duplicatesBefore + 1);
+            assertThat(isPending(assignments(), second)).as("acknowledged after the dead letter").isFalse();
+        });
+        assertThat(pendingEntries(assignments())).isEqualTo(pendingBefore);
+        assertThat(processedRows(secondAssignedId)).as("rolled back with the refused hold").isZero();
+        assertThat(journalRows(secondAssignedId)).isZero();
+        assertThat(entries(rideId)).extracting(row -> row.get("source_event_id")).containsExactly(assignedId);
+        assertThat(postings(rideId)).hasSize(2);
+        assertThat(journalEntries("quote_hold")).isEqualTo(holdsBefore);
+        assertThat(meterRegistry.get("metroride.fare.consumer.halted").gauge().value()).isZero();
+        assertThat(http.getForEntity("/readyz", String.class).getStatusCode().value()).isEqualTo(200);
+        JsonNode payload = deadLetter(secondAssignedId).get("payload");
+        assertThat(payload.get("original_event_type").asText()).isEqualTo(Envelope.TYPE_RIDE_ASSIGNED);
+        assertThat(payload.get("ride_id").asText()).isEqualTo(rideId);
+        assertThat(payload.get("error").asText()).contains("already has a quote_hold").contains("journal_entries_one_quote_hold_per_ride");
+        assertThat(payload.has("reason")).isFalse();
+
+        publishCompletion(goCompletion(completedId, rideId));
+        await().atMost(TIMEOUT).untilAsserted(() -> assertThat(journalRows(completedId)).isEqualTo(2));
+        assertThat(entries(rideId)).extracting(row -> row.get("kind")).containsExactly("quote_hold", "hold_reversal", "settlement");
+        assertThat(sumOfPostings(rideId)).isEqualByComparingTo(BigDecimal.ZERO);
+    }
+
+    /**
+     * The same conflict with the first hold still uncommitted when the second assignment arrives,
+     * the interleaving a completion-versus-assignment race can produce. The consumer's insert
+     * waits on the unique index for the other transaction; when that one commits, the wait ends
+     * in a conflict and the entry is quarantined as {@code duplicate_hold}. Only the committed
+     * hold remains. (The holder commits well inside the 2s transaction timeout, so what is
+     * observed is the index wait, not a cancelled statement.)
+     */
+    @Test
+    void aSecondAssignmentWaitsOnAnUncommittedHoldAndIsQuarantinedOnceItCommits() throws Exception {
+        String rideId = UUID.randomUUID().toString();
+        String firstEventId = UUID.randomUUID().toString();
+        String secondEventId = UUID.randomUUID().toString();
+        double duplicatesBefore = deadLetterCount(assignments(), "duplicate_hold");
+        RecordId second;
+
+        try (Connection holder = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
+            holder.setAutoCommit(false);
+            try (PreparedStatement event = holder.prepareStatement(
+                    "insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())")) {
+                event.setString(1, firstEventId);
+                event.setString(2, assignments());
+                event.setString(3, "ride_assigned");
+                event.executeUpdate();
+            }
+            long journalId;
+            try (PreparedStatement journal = holder.prepareStatement(
+                    "insert into fare.journal_entries (ride_id, kind, source_event_id, created_at) values (?, 'quote_hold', ?, now()) returning id")) {
+                journal.setString(1, rideId);
+                journal.setString(2, firstEventId);
+                try (var rs = journal.executeQuery()) {
+                    rs.next();
+                    journalId = rs.getLong(1);
+                }
+            }
+            try (PreparedStatement posting = holder.prepareStatement(
+                    "insert into fare.postings (journal_entry_id, account, amount) values (?, ?, ?)")) {
+                posting.setLong(1, journalId);
+                posting.setString(2, "rider_receivable");
+                posting.setBigDecimal(3, X);
+                posting.executeUpdate();
+                posting.setString(2, "fare_hold");
+                posting.setBigDecimal(3, X.negate());
+                posting.executeUpdate();
+            }
+
+            second = publishAssignment(goAssignment(secondEventId, rideId));
+
+            // Delivered at once, then waiting on the index for the uncommitted hold.
+            Thread.sleep(700);
+            assertThat(isPending(assignments(), second)).isTrue();
+            assertThat(deadLetterCount(assignments(), "duplicate_hold")).isEqualTo(duplicatesBefore);
+            assertThat(processedRows(secondEventId)).isZero();
+
+            holder.commit();
+        }
+
+        await().atMost(TIMEOUT).untilAsserted(() -> {
+            assertThat(deadLetterCount(assignments(), "duplicate_hold")).isEqualTo(duplicatesBefore + 1);
+            assertThat(isPending(assignments(), second)).isFalse();
+        });
+        assertThat(processedRows(secondEventId)).isZero();
+        assertThat(entries(rideId)).extracting(row -> row.get("source_event_id")).containsExactly(firstEventId);
+        assertThat(postings(rideId)).hasSize(2);
+        assertThat(deadLetter(secondEventId).get("payload").get("error").asText()).contains("journal_entries_one_quote_hold_per_ride");
+    }
+
+    /**
+     * The settlement side of V3, exercised at the repository since the recorder's own check
+     * (under the hold's lock) reaches the index only in a race: a second {@code settlement} for a
+     * ride is refused, reported as a {@link LedgerConflictException} that the recorder turns into
+     * {@code already_settled}, and the transaction that hit it rolls back whole.
+     */
+    @Test
+    void theSettlementIndexRefusesASecondSettlementForARide() {
+        String rideId = UUID.randomUUID().toString();
+        String first = UUID.randomUUID().toString();
+        String second = UUID.randomUUID().toString();
+        TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+
+        assertThatThrownBy(() -> transaction.executeWithoutResult(status -> {
+            recordEvent(first, completions(), "ride_completed");
+            recordEvent(second, completions(), "ride_completed");
+            ledger.append(JournalEntry.settlement(rideId, first, Money.of(X), new BigDecimal("0.80")), Instant.now());
+            ledger.append(JournalEntry.settlement(rideId, second, Money.of(X), new BigDecimal("0.80")), Instant.now());
+        })).isInstanceOfSatisfying(LedgerConflictException.class, conflict -> {
+            assertThat(conflict.conflict()).isEqualTo(LedgerConflictException.Conflict.DUPLICATE_SETTLEMENT);
+            assertThat(conflict.deadLetterReason()).contains(DeadLetterReason.ALREADY_SETTLED);
+            assertThat(conflict.getCause()).isInstanceOf(DuplicateKeyException.class);
+            assertThat(FailureClass.of(conflict)).isEqualTo(FailureClass.QUARANTINE);
+        });
+        assertThat(entries(rideId)).as("the whole transaction rolled back").isEmpty();
+        assertThat(processedRows(first)).isZero();
+    }
+
+    /**
+     * Only the two per-ride indexes become a ledger conflict. The {@code (source_event_id, kind)}
+     * key of V2 is still reported as Spring's {@link DuplicateKeyException} and classified fatal:
+     * a writer hitting it bypassed the idempotency insert, which is a deployment fault.
+     */
+    @Test
+    void anUnrelatedUniqueViolationKeepsSpringsExceptionAndStaysFatal() {
+        String eventId = UUID.randomUUID().toString();
+        TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+
+        assertThatThrownBy(() -> transaction.executeWithoutResult(status -> {
+            recordEvent(eventId, assignments(), "ride_assigned");
+            // Two rides, one source event: violates (source_event_id, kind) and nothing else.
+            ledger.append(JournalEntry.quoteHold(UUID.randomUUID().toString(), eventId, Money.of(X)), Instant.now());
+            ledger.append(JournalEntry.quoteHold(UUID.randomUUID().toString(), eventId, Money.of(X)), Instant.now());
+        })).isInstanceOf(DuplicateKeyException.class)
+                .isNotInstanceOf(LedgerConflictException.class)
+                .satisfies(failure -> assertThat(FailureClass.of(failure)).isEqualTo(FailureClass.FATAL));
+        assertThat(journalRows(eventId)).isZero();
     }
 
     @Test
@@ -396,7 +562,9 @@ class SettlementIT extends IntegrationTestSupport {
                 .contains("reason=\"missing_hold\"")
                 .contains("reason=\"ambiguous_hold\"")
                 .contains("reason=\"corrupt_hold\"")
-                .contains("reason=\"already_settled\"");
+                .contains("reason=\"already_settled\"")
+                .contains("metroride_fare_dead_letters_total{reason=\"duplicate_hold\"")
+                .doesNotContain("metroride_fare_dead_letters_total{reason=\"ambiguous_hold\"");
         assertThatThrownBy(() -> meterRegistry.get("metroride.fare.quotes").tag("kind", "settlement").counter())
                 .as("quotes count holds only").isInstanceOf(io.micrometer.core.instrument.search.MeterNotFoundException.class);
     }
@@ -439,6 +607,12 @@ class SettlementIT extends IntegrationTestSupport {
         assertThat(payload.get("service").asText()).isEqualTo("fare-service");
         assertThat(payload.has("reason")).as("the cross-language schema has no reason field").isFalse();
         return payload;
+    }
+
+    /** An event row written by hand, inside the caller's transaction (the journal has a foreign key to it). */
+    private void recordEvent(String eventId, String stream, String type) {
+        jdbc.update("insert into fare.processed_events (event_id, stream, event_type, processed_at) values (?, ?, ?, now())",
+                eventId, stream, type);
     }
 
     /** A {@code quote_hold} written by hand, with its event row (the journal has a foreign key to it). */
