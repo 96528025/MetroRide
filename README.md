@@ -1,150 +1,207 @@
-# MetroRide
+# MetroRide — Event-Driven Dispatch and Fare Settlement
 
 [![CI](https://github.com/96528025/MetroRide/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/96528025/MetroRide/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)
+![Java](https://img.shields.io/badge/Java-21-orange)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
-![Redis Streams](https://img.shields.io/badge/Redis%20Streams-7-DC382D?logo=redis&logoColor=white)
-![Helm](https://img.shields.io/badge/Helm-validated%20on%20KinD%20in%20CI-326CE5?logo=kubernetes&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis%20Streams-7-DC382D?logo=redis&logoColor=white)
 
-**A ride-dispatch backend in Go that keeps its database and its event stream in agreement when things fail.** A rider posts a trip; six small services persist it, pick the nearest driver, commit the assignment, and fan the result out over Redis Streams. PostgreSQL is the source of truth, Redis Streams carries the workflow, and ride and assignment state changes are committed together with the events announcing them (a transactional outbox). Driver locations and traffic updates are simulated telemetry and go straight to Redis.
+**A ride-dispatch backend that demonstrates reliable event delivery, duplicate-safe state changes, and a double-entry fare ledger.** A rider creates a trip, Go services assign a nearby simulated driver, and an optional Java/Spring Boot service records a quote hold and settles it when the ride is completed.
 
-This is a portfolio-scale systems project, not a production service. What it demonstrates is concrete: service boundaries, at-least-once delivery with an idempotent dispatch transition, 2-second dependency deadlines with three-attempt consumer retries, a dead-letter path for failed dispatches, integration tests against the real stack, and a Helm release that CI installs and drives end to end on a throwaway Kubernetes cluster.
+The project focuses on **backend engineering, event-driven systems, database transactions, failure recovery, and container delivery**. It has six core Go services, an optional Java fare service, and an optional Kafka analytics extension. There is no rider/driver frontend; Grafana supplies operational dashboards. Kubernetes deployment is validated in disposable CI clusters, with no continuously hosted application claimed.
 
-## What is interesting here
+## Engineering highlights
 
-- **No lost events, no dual-write gap.** `rider-service` and `dispatch-service` write their domain rows and an `event_outbox` row in the same PostgreSQL transaction; a per-service relay publishes committed rows to Redis with `FOR UPDATE SKIP LOCKED`. CI proves it: Redis is stopped, a ride is accepted with HTTP 202, and after Redis returns the ride is assigned with no client retry.
-- **Duplicate-safe assignment.** Dispatch checks persisted state, then updates `rides ... where status = 'requested'` and inserts the assignment in one transaction. An integration test replays the same `ride_requested` event and asserts exactly one `ride_assignments` row.
-- **Failures are bounded and inspectable.** Request-path Redis, PostgreSQL and routing calls run under 2-second deadlines (deferred transaction rollbacks use a background context); message handling retries 3 times (150 ms, doubling); if that fails, dispatch writes a record to `events.dead_letter` and only then acknowledges the message. A CI test stops `routing-service` and asserts the dead letter and the untouched ride.
-- **Delivery is validated, not just packaged.** Six distroless, non-root images tagged with the full commit SHA are installed via Helm into an ephemeral KinD cluster inside the CI runner, a ride is driven through them, and the result is checked over HTTP, in PostgreSQL, and at the notification consumer.
+| Problem | Implemented approach | Evidence |
+| --- | --- | --- |
+| Database commits but event publishing fails | Domain changes and outbox rows commit in one PostgreSQL transaction; a relay retries publishing to Redis | [`shared/pkg/outbox`](shared/pkg/outbox), Redis-outage and process-kill recovery scripts |
+| A ride request is delivered again | Conditional `requested → assigned` update and assignment insert in one transaction | [`dispatch-service`](services/dispatch-service/cmd/main.go), duplicate-event integration test |
+| Completion or settlement is attempted twice | Conditional `assigned → completed` update; fare event-ID deduplication, quote-hold row lock, per-ride unique indexes | [`rider-service`](services/rider-service/cmd/main.go), [`fare-service`](services/fare-service/README.md), concurrent completion/settlement tests |
+| A consumer crashes or receives unusable data | Fare consumer reclaims pending entries, classifies failures, and dead-letters before acknowledging | `RideEventConsumer`, `FailureHandler`, Testcontainers recovery tests |
+| Images build but fail when deployed | CI installs the six core images through Helm into KinD and drives a ride through the deployed stack | [Deployment workflow](.github/workflows/deploy-validation.yml) |
 
-## Architecture
+## Run locally
 
-```mermaid
-flowchart LR
-    Client -->|POST /v1/rides| Rider[rider-service]
-    Rider -->|ride + outbox row, one tx| DB[(PostgreSQL)]
-    DB -->|relay| RQ[events.ride.requests]
-    RQ -->|consumer group| Dispatch[dispatch-service]
-    Dispatch -->|POST /v1/routes/nearest-driver| Routing[routing-service]
-    Driver[driver-service] -->|every 2 s| DL[events.driver.locations]
-    DL -->|consumer group| Routing
-    Dispatch -->|assignment + 2 outbox rows, one tx| DB
-    DB -->|relay| RA[events.ride.assignments]
-    DB -->|relay| RN[events.ride.notifications]
-    RN -->|consumer group| Notify[notification-service]
-    Dispatch -.->|after 3 failed attempts| DLQ[events.dead_letter]
-    RA -->|consumer group| Fare[fare-service]
-    Fare -->|processed event ids, one row per envelope| DB
-    Fare -.->|poison entry, or 25 failed deliveries| DLQ
-```
-
-`POST /v1/rides` returns `202` before dispatch runs; clients poll `GET /v1/rides/{ride_id}` until `status` is `assigned`. `POST /v1/rides/{ride_id}/complete` then moves an `assigned` ride to `completed` and commits a `ride_completed` outbox event with it (`202`; `409 {"error":"ride is <status>"}` for any other status, `404` for an unknown ride).
-
-### Services
-
-Six core services form the default Docker Compose profile, the Helm chart, and the published image set. A seventh, `analytics-service`, exists only behind the optional `kafka` Compose profile. `fare-service` (Java) sits behind the optional `fare` profile; it is validated by its own CI job (Maven unit tests plus Testcontainers integration tests against real PostgreSQL and Redis) and is not yet part of the smoke test, the published image set, or the Helm chart.
-
-| Service | Port | Does | Depends on |
-| --- | --- | --- | --- |
-| `rider-service` | 8080 | Accepts and reads rides; completes an assigned ride (`POST /v1/rides/{ride_id}/complete`, conditional update on `status = 'assigned'`, exactly one `ride_assignments` row required); commits ride + outbox row; runs its relay | PostgreSQL (readiness), Redis (relay only) |
-| `driver-service` | 8081 | Moves four simulated drivers; publishes locations every 2 s | Redis; Kafka when enabled |
-| `dispatch-service` | 8082 | Consumes ride requests, calls routing, commits assignment + outbox rows, dead-letters failures | PostgreSQL, Redis, routing-service |
-| `routing-service` | 8083 | Keeps an in-memory driver view; returns nearest available driver (`haversine-nearest`, O(n) scan, ETA at 32 km/h with a 60 s floor) | Redis |
-| `traffic-service` | 8084 | Publishes simulated congestion every 10 s (not yet consumed) | Redis |
-| `notification-service` | 8085 | Consumes assignment notifications; logs them and counts them | Redis |
-| `fare-service` | 8087 | Consumes `events.ride.assignments` and `events.ride.completions`; records each envelope ID once, quotes the fare from distance and ETA and holds it as a balanced `quote_hold` entry in a double-entry ledger in the `fare` PostgreSQL schema, then on completion reverses the hold and settles the quoted amount into `driver_payable` and `platform_revenue`; `GET /v1/rides/{ride_id}/ledger` (Java 21, Spring Boot); optional `fare` Compose profile | PostgreSQL, Redis |
-| `analytics-service` | 8086 | Optional Kafka consumer; latest location per driver at `GET /v1/analytics/drivers` | Kafka |
-
-### Streams
-
-| Stream | Producer | Consumer | Published via |
-| --- | --- | --- | --- |
-| `events.ride.requests` | rider-service | dispatch-service (group) | outbox relay |
-| `events.driver.locations` | driver-service | routing-service (group) | direct `XADD` |
-| `events.ride.assignments` | dispatch-service | fare-service (group, optional `fare` profile) | outbox relay |
-| `events.ride.notifications` | dispatch-service | notification-service (group) | outbox relay |
-| `events.ride.completions` | rider-service | fare-service (group, optional `fare` profile) | outbox relay |
-| `events.traffic.updates` | traffic-service | none yet | direct `XADD` |
-| `events.dead_letter` | dispatch-service, fare-service | none (inspection) | direct `XADD`; dispatch 3 attempts, fare-service one per delivery of the failed entry |
-
-## Quick start
-
-Prerequisites: Docker with Compose, `curl`. Go 1.22 is needed only for the Go test commands.
+Prerequisites: Docker with Compose and curl. Go 1.22 is needed for Go tests; Java 21 is needed for local Maven commands.
 
 ```bash
 docker compose up --build -d
-bash scripts/smoke-test.sh          # waits for /healthz + /readyz on all six, creates a ride, waits for "assigned"
+bash scripts/smoke-test.sh
 ```
 
-Or by hand:
+The smoke test waits for health/readiness on all six core services, creates a ride, and waits for an assignment. For a manual request:
 
 ```bash
 curl -X POST http://localhost:8080/v1/rides \
   -H 'Content-Type: application/json' \
   -d '{"rider_id":"rider-42","pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}'
-
-curl http://localhost:8080/v1/rides/<ride_id>
 ```
 
-Also running: PostgreSQL `localhost:5432`, Redis `localhost:6379`, Prometheus `http://localhost:9090`, Grafana `http://localhost:3000` (`admin` / `admin`, dashboard provisioned). `docker compose down` stops the stack and keeps the named volumes; `docker compose down -v` removes them.
+Copy the returned `ride_id` into a shell variable and poll until `status` is `assigned`:
 
-Optional Kafka telemetry (single KRaft broker, topic `metroride.driver.location.v1` with 3 partitions keyed by `driver_id`, a second `driver-service` process producing every 10 s, `analytics-service` consuming):
+```bash
+RIDE_ID='paste-returned-ride-id-here'
+curl "http://localhost:8080/v1/rides/$RIDE_ID"
+```
+
+To include the fare workflow, enable its profile **before creating a new demo ride**:
+
+```bash
+docker compose --profile fare up --build -d
+```
+
+After that ride is assigned, inspect its quote hold, complete it, and poll its ledger for settlement:
+
+```bash
+curl "http://localhost:8087/v1/rides/$RIDE_ID/ledger"
+curl -X POST "http://localhost:8080/v1/rides/$RIDE_ID/complete"
+curl "http://localhost:8087/v1/rides/$RIDE_ID/ledger"
+```
+
+Completion returns `202` when the ride changes to `completed`; the ledger updates asynchronously. A second completion returns `409`. Creating another ride requires another `POST /v1/rides` request; the API does not deduplicate client create requests.
+
+Prometheus runs at `http://localhost:9090`, Grafana at `http://localhost:3000` with local demo credentials `admin` / `admin`, PostgreSQL on `5432`, and Redis on `6379`. `docker compose --profile fare down` stops the core/fare stack and preserves named data volumes; add `--profile kafka` if that extension is running too.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[API client] -->|Create or complete ride| Rider[rider-service / Go]
+    Rider -->|Ride state + outbox in one transaction| DB[(PostgreSQL)]
+    DB -->|Rider relay| Requests[events.ride.requests]
+    Requests --> Dispatch[dispatch-service / Go]
+    Driver[driver-service / Go] --> Locations[events.driver.locations]
+    Locations --> Routing[routing-service / Go]
+    Dispatch -->|Nearest-driver HTTP call| Routing
+    Dispatch -->|Assignment + outbox in one transaction| DB
+    DB -->|Dispatch relay| Assignments[events.ride.assignments]
+    DB -->|Dispatch relay| Notifications[events.ride.notifications]
+    Notifications --> Notify[notification-service / Go]
+    DB -->|Rider relay| Completions[events.ride.completions]
+    Assignments --> Fare[Optional fare-service / Java]
+    Completions --> Fare
+    Fare -->|Event deduplication + ledger transaction| DB
+    Dispatch -.-> DLQ[events.dead_letter]
+    Fare -.-> DLQ
+```
+
+The core data path uses HTTP/JSON, PostgreSQL, and Redis Streams. The repository's `shared/proto` directory is not evidence of an implemented gRPC transport. Traffic simulation and optional Kafka telemetry are separate from the dispatch path shown above.
+
+| Service | Port | Responsibility | Default stack |
+| --- | ---: | --- | --- |
+| `rider-service` | 8080 | Create/read rides, complete assigned rides, publish through its outbox relay | Yes |
+| `driver-service` | 8081 | Publish locations for four simulated drivers every two seconds | Yes |
+| `dispatch-service` | 8082 | Consume requests, call routing, persist assignment and two outbox destinations | Yes |
+| `routing-service` | 8083 | Maintain an in-memory driver view; select nearest available driver | Yes |
+| `traffic-service` | 8084 | Publish simulated congestion every ten seconds; currently no consumer | Yes |
+| `notification-service` | 8085 | Log and count notification deliveries | Yes |
+| `analytics-service` | 8086 | Expose latest driver locations consumed from Kafka | Optional `kafka` profile |
+| `fare-service` | 8087 | Consume assignments/completions; quote, hold, settle, and expose the ledger | Optional `fare` profile |
+
+## A ride from request to settlement
+
+1. **Accept.** `POST /v1/rides` inserts a `requested` ride and its `ride_requested` outbox envelope in one PostgreSQL transaction. HTTP `202` means acceptance, not assignment. Rider readiness checks PostgreSQL, allowing intake to continue while Redis is unavailable.
+2. **Publish.** The rider relay publishes the committed envelope to `events.ride.requests`. Dispatch reads it through a consumer group.
+3. **Select.** Routing scans available drivers with Haversine distance, using driver ID for deterministic ties. Complexity is O(n); ETA assumes 32 km/h with a 60-second minimum.
+4. **Assign.** Dispatch updates the ride only if it is still `requested`, inserts the assignment, and enqueues the assignment envelope for both `events.ride.assignments` and `events.ride.notifications` in one transaction. Replayed requests cannot repeat that state transition.
+5. **Hold.** If enabled, fare-service records the assignment envelope ID and a balanced `quote_hold` in its own PostgreSQL transaction. Notifications independently log/count the event.
+6. **Complete.** `POST /v1/rides/{ride_id}/complete` changes only an `assigned` ride, requires exactly one assignment row, and enqueues `ride_completed` atomically. Unknown rides return `404`, other statuses return `409`, and inconsistent assignment state returns `500` with the transaction rolled back.
+7. **Settle.** Fare-service deduplicates the completion event, locks the existing hold, reverses it, and writes the settlement in one transaction before acknowledging the message.
+
+## Fare ledger and pricing boundary
+
+The Java service uses Spring Boot, JPA for processed-event records, JDBC for ledger operations, Flyway migrations in the `fare` schema, and `BigDecimal` money values rounded once to two decimal places.
+
+```text
+quote = 2.50 + 1.20 × distance_km + 0.30 × eta_seconds / 60
+driver share = round_to_cents(quote × 0.80)
+platform share = quote − driver share
+```
+
+These are the default configurable rates. **The current assignment distance/ETA describe the selected driver travelling to the pickup point.** Drop-off coordinates are accepted by rider-service but are not used by nearest-driver routing or fare calculation. The ledger demonstrates settlement by the stored quote; it does not meter the passenger trip or collect real payments.
+
+For an illustrative quote of `10.00`, entries use positive debit and negative credit amounts:
+
+| Entry | Postings | Sum |
+| --- | --- | ---: |
+| `quote_hold` | `rider_receivable +10.00`, `fare_hold -10.00` | 0.00 |
+| `hold_reversal` | `rider_receivable -10.00`, `fare_hold +10.00` | 0.00 |
+| `settlement` | `rider_receivable +10.00`, `driver_payable -8.00`, `platform_revenue -2.00` | 0.00 |
+
+The immutable `JournalEntry` constructor enforces balance. PostgreSQL transactions keep event deduplication and ledger writes together; unique indexes enforce one quote hold and one settlement per ride. There is no database trigger independently enforcing the sum of all postings, and no payment gateway, payout, refund, or trip adjustment workflow.
+
+Failure classification matters because assignments and completions travel through different relays/streams:
+
+| Condition | Fare-service behavior |
+| --- | --- |
+| Same envelope delivered again | Event-ID conflict; skip ledger mutation and acknowledge |
+| Completion arrives before its hold | Roll back and leave pending for retry |
+| Retryable failure reaches 25 deliveries | Dead-letter, then acknowledge only after confirmed publication |
+| Malformed/poison payload | Dead-letter immediately, then acknowledge |
+| Corrupt hold, duplicate hold, or already-settled ride | Quarantine through a reason-labelled dead letter |
+| Multiple holds despite the unique index, or fatal schema/code failure | Halt consumer, leave the entry pending, fail readiness |
+
+Pending recovery uses `XAUTOCLAIM` with a retained cursor, a five-second reclaim interval, and five-second minimum idle time by default. A missing hold can still exhaust the delivery budget during a prolonged outage. [Full service design and recovery runbook](services/fare-service/README.md).
+
+## Reliability and operational limits
+
+**Outbox delivery is at-least-once.** Relays poll every 250 ms, lock up to 25 eligible rows using `FOR UPDATE SKIP LOCKED`, publish, and mark them published. Failed rows receive exponential backoff capped at 30 seconds, with no attempt ceiling. Locks remain held while publishing. If Redis accepts an event and the relay crashes before recording publication, the envelope can be published again.
+
+**Idempotency is scoped to side effects.** Dispatch guards assignment, rider-service guards completion, and fare-service deduplicates ledger events. Notification logs/counters repeat on redelivery. The Go stream consumers read new entries only and do not reclaim abandoned pending entries; the Java fare consumer implements that recovery. Dead-letter replay tooling is not included.
+
+**Timeouts apply per operation.** Core Redis, PostgreSQL, and routing operations use two-second deadlines. Retry helpers use three attempts with 150 ms initial backoff, doubling. Dispatch has both an outer message retry and an inner routing-call retry: an unavailable routing dependency can receive up to nine HTTP attempts for one message. This is not a two-second end-to-end dispatch deadline. Deferred Go transaction rollbacks use a background context.
+
+**Routing is a simulation.** It seeds three placeholder drivers in addition to four simulated drivers, stores locations in process memory, and does not reserve a driver on assignment. Consumer-group delivery does not broadcast a complete location view to every routing replica. CI uses one replica; the chart's two-replica defaults do not establish correct multi-replica routing.
+
+Services expose `/healthz`, `/readyz`, and `/metrics`; JSON logs include identifiers useful for following a ride. Compose provisions Prometheus and Grafana. The project does not include authentication, TLS, rate limiting, distributed tracing, production secrets management, or a measured end-to-end capacity target.
+
+## Verification
+
+| Check | Command | What it exercises |
+| --- | --- | --- |
+| Go unit tests | `go test -race ./...` | Event/config/HTTP contracts, retries, routing selection, outbox backoff, completion response mapping, cancellation |
+| Core smoke | `bash scripts/smoke-test.sh` | Health/readiness, metrics, ride acceptance and assignment |
+| Running-stack integration | `go test -race -count=1 -tags=integration ./tests/integration` | Seven test functions covering assignment, duplicate delivery, outbox progress, completion rejection, single/concurrent completion, rollback |
+| Redis outage | `bash scripts/outbox-recovery-test.sh` | Intake accepts a ride while Redis is down; relay delivers after recovery |
+| Process kill | `bash scripts/process-kill-recovery-test.sh` | Persisted outbox work survives rider-service `SIGKILL` and is relayed after restart |
+| Routing outage | `bash scripts/failure-integration-test.sh` | Failed dispatch produces the expected dead letter and leaves the ride unassigned |
+| Fare unit tests | `cd services/fare-service && ./mvnw -B test` | Pricing, money, ledger invariants, event contracts, failure policy |
+| Fare integration | `cd services/fare-service && ./mvnw -B verify` | Unit tests plus real PostgreSQL/Redis Testcontainers tests, deduplication, settlement races, lock waits, pending recovery |
+
+Stack integration and outage scripts require the local Compose stack. Fare `verify` needs Java 21 and Docker. The Go race detector instruments Go test processes; it does not instrument the independently running service containers.
+
+Optional selection microbenchmark:
+
+```bash
+go test -run '^$' -bench BenchmarkSelectNearestDriver10000 -benchmem ./services/routing-service/cmd
+```
+
+This times a 10,000-driver in-process scan, not end-to-end ride throughput.
+
+## Delivery pipeline and optional Kafka
+
+[CI](.github/workflows/ci.yml) validates Go formatting, vet/tests, Compose, smoke/integration, and outage recovery. A separate Java job runs Maven `verify`. Six core images are built as distroless, non-root containers.
+
+- **Pull requests:** build images in the runner, load them into KinD, install the Helm release, and run deployment smoke checks without publishing service images.
+- **Main, release tags, manual runs:** publish core images tagged with the full commit SHA to GHCR, pull those artifacts into the deployment-validation job, and run the same KinD checks. No `latest` tag is used.
+- **Scope:** the publish job depends on Go backend validation; fare validation is a separate job and is not a dependency of image publication. Fare and analytics are outside the six-image release/Helm smoke path. KinD clusters are removed after validation.
+
+The [Helm chart](infrastructure/helm/metro-ride) includes probes, resource settings, bounded dependency waits, and optional `ServiceMonitor` rendering. Default dependencies are external PostgreSQL/Redis; KinD profiles use disposable `emptyDir`-backed instances. Local deployment validation needs Docker, kind, kubectl, Helm, and Bash 4+; see [CI/CD documentation](docs/cicd.md).
+
+The optional Kafka profile runs a non-persistent single KRaft broker, a three-partition driver-location topic keyed by `driver_id`, a separate telemetry producer, and the analytics consumer:
 
 ```bash
 docker compose --profile kafka up --build -d
 ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 ```
 
-## Reliability design
+Kafka is a telemetry extension; Redis Streams remains the ride workflow transport.
 
-**Transactional outbox, at-least-once.** `outbox.Enqueue` inserts the full event envelope inside the caller's transaction. Each service's relay polls every 250 ms, locks up to 25 unpublished rows with `FOR UPDATE SKIP LOCKED`, publishes each to its stream, and records `published_at`. A failed row gets `publish_attempts`, `last_error`, and a `next_attempt_at` set by exponential backoff capped at 30 s; eligible rows are ordered by that time so a poison row cannot monopolise a batch. There is no attempt ceiling and no outbox dead-letter path: a permanently undeliverable row retries forever at the 30 s cap. A crash between Redis accepting an event and PostgreSQL recording it republishes the same envelope ID, so any consumer with a non-repeatable side effect has to be idempotent; today only dispatch's state transition is. This is idempotent state mutation on top of at-least-once delivery.
+## Repository guide
 
-**Idempotent dispatch.** Before routing, dispatch reads the ride; if it is no longer `requested` or already has a driver, the event is skipped. The write is `update rides set ... where id = $1 and status = 'requested'`; zero rows affected means another worker won, and the transaction rolls back without an assignment row. Tests run a single dispatch replica; the guard is designed to hold for competing workers but that case is not exercised.
+[Architecture](docs/architecture.md) · [API](docs/api.md) · [Reliability](docs/reliability.md) · [Fare service](services/fare-service/README.md) · [Observability](docs/observability.md) · [Testing](docs/testing-and-ci.md) · [Deployment](docs/cicd.md) · [Kafka extension](docs/kafka-lightweight-extension.md)
 
-**Bounded dependency work.** Redis, PostgreSQL and routing contexts: 2 s. Readiness checks: 1.5 s. `reliability.Retry`: 3 attempts, 150 ms initial delay, doubling, cancellable. HTTP servers set read-header/read/write/idle timeouts (5/10/15/60 s) and drain on `SIGINT`/`SIGTERM`.
-
-**Consumers.** Dispatch is the idempotent consumer; notification-service logs and counts every delivery, so a redelivered assignment produces a second log line and count. When dispatch exhausts its retries, it publishes a `dead_lettered` envelope (original event ID and type, ride ID, error, service, timestamp) to `events.dead_letter`, retrying that publish up to 3 times, and acknowledges the original only if it succeeded. The Go consumers read new entries only and do not reclaim abandoned pending entries (`XAUTOCLAIM`/`XCLAIM` is future work there); `fare-service` reclaims its own with `XAUTOCLAIM` and dead-letters an entry after 25 failed deliveries.
-
-**Operability.** Every service serves `GET /healthz`, `GET /readyz` (named checks for the service's PostgreSQL, Redis and routing dependencies; rider-service deliberately depends only on PostgreSQL so intake stays up during a Redis outage; the optional Kafka producer is not probed), and `GET /metrics`. Logs are JSON with `service`, `ride_id`, `driver_id`, `event_type`, and `error` fields. Metrics: `metroride_ride_requests_total`, `metroride_rides_assigned_total`, `metroride_dispatch_latency_seconds`, `metroride_assignment_failures_total`, `metroride_stream_consume_errors_total`, `metroride_dependency_errors_total`, `metroride_outbox_events_published_total`, `metroride_outbox_publish_failures_total`, `metroride_routing_computation_seconds`, `metroride_active_drivers`.
-
-## Verification
-
-`go test -race ./...` compiles all 15 Go packages and runs 35 unit tests across 9 of them (event envelopes, config, HTTP/readiness helpers, retry and timeout helpers, the dispatch-to-routing client, nearest-driver selection and tie-breaking, outbox backoff, rider readiness, and the routing and notification consume loops returning once their context is cancelled). The other 6 packages have no unit tests. The race detector is a guard for future concurrent code: the only goroutines in the unit tests are the two cancellation tests, which run a consume loop against an unreachable Redis, and the services under test run uninstrumented in containers, so it says nothing about relay or consumer concurrency. Running-stack tests need the Compose stack up:
-
-| Check | Command | Asserts |
-| --- | --- | --- |
-| Smoke | `bash scripts/smoke-test.sh` | `/healthz` and `/readyz` on all six services, selected metrics, HTTP 202 on create, ride reaches `assigned` with a driver |
-| Integration (3 tests) | `go test -race -count=1 -tags=integration ./tests/integration` | happy path; duplicate `ride_requested` keeps one assignment and the same driver; outbox relay makes progress past 25 real Redis `WRONGTYPE` failures without replaying delivered rows |
-| Redis outage | `bash scripts/outbox-recovery-test.sh` | rider stays ready, ride accepted with 202, one unpublished outbox row in PostgreSQL, automatic relay and assignment after Redis restarts |
-| Process kill | `bash scripts/process-kill-recovery-test.sh` | with Redis stopped, ride accepted with 202 and one unpublished outbox row; rider-service killed with SIGKILL; after `docker compose up -d redis rider-service` the restarted relay publishes that row exactly once and dispatch assigns the ride, with no client retry |
-| Routing outage (1 test) | `bash scripts/failure-integration-test.sh` | dead-letter entry matches the ride and original event ID; ride stays `requested` with zero assignment rows |
-| Kubernetes (needs Docker, kind, kubectl, Helm and Bash 4+ for `mapfile`; macOS ships Bash 3.2) | `bash scripts/build-images.sh && bash scripts/kind-up.sh && bash scripts/kind-load-images.sh && bash scripts/kind-deploy.sh && bash scripts/kind-smoke-test.sh` | same smoke test through `kubectl port-forward`, then `rides`/`ride_assignments` checked with `psql` and the notification counter checked over HTTP; `bash scripts/kind-down.sh` deletes the cluster |
-
-Opt-in benchmark for the 10,000-driver selection scan: `go test -run '^$' -bench BenchmarkSelectNearestDriver10000 -benchmem ./services/routing-service/cmd`. No end-to-end latency or throughput numbers are claimed.
-
-## Delivery pipeline
-
-One GitHub Actions workflow (`.github/workflows/ci.yml`) plus a reusable deployment job (`deploy-validation.yml`). Triggers: pull requests, pushes to `main`, `v*` tags, manual dispatch.
-
-1. **`backend`** (every event): `gofmt -l`, `go vet`, `go test -race ./...`, `docker compose config`, build and start the stack, then the smoke, integration, Redis-outage, process-kill and routing-outage checks above; Compose logs on failure; `docker compose down -v` always.
-2. **Pull requests**: build the six images in the runner, create a single-node KinD cluster (`kindest/node:v1.34.0`; kind, kubectl and Helm versions pinned), side-load the images with `kind load docker-image`, `helm upgrade --install --wait`, run the Kubernetes smoke test, collect diagnostics on failure, delete the cluster unconditionally. The job has `contents: read` only, never logs in to GHCR, and neither pushes nor pulls MetroRide service images; base images, the KinD node image, PostgreSQL and Redis are still pulled from public registries.
-3. **`main`, tags, manual runs**: a six-way matrix publishes `ghcr.io/96528025/metroride-<service>:<full-commit-sha>` (plus the `v*` tag when present; never `latest`), then the same KinD job pulls those exact images back, logs out of GHCR before the cluster exists, and runs the identical deployment and smoke test.
-
-The Helm chart (`infrastructure/helm/metro-ride`) packages the six core services with resource requests/limits, liveness/readiness probes, bounded init-container waits (`redis-cli ping`, `pg_isready`, 180 s), a config-checksum annotation that rolls pods on config change, and a `ServiceMonitor` rendered only when the Prometheus Operator CRD is present. Its defaults expect external PostgreSQL and Redis; the KinD profile enables chart-owned, `emptyDir`-backed test instances, one replica per service, and omits Prometheus and Grafana. The image list loaded into KinD is derived from the rendered manifests, and the database schema (`infrastructure/docker/postgres/init.sql`) is shared between Compose and the chart. This is deployment validation inside a CI runner, not hosting: nothing persists after the job.
-
-## Limitations
-
-- Outbox delivery is at-least-once with no attempt ceiling and no outbox dead-letter path; the relay holds row locks while publishing.
-- The Go stream consumers do not reclaim pending entries after a crash; `fare-service` reclaims its own with `XAUTOCLAIM` and dead-letters after 25 failed deliveries. Dead-letter replay tooling does not exist.
-- Routing state is process-local. CI runs one routing replica; the chart's untested defaults set two, which this design does not support without partitioned or shared driver state.
-- Routing seeds three static placeholder drivers at startup in addition to the four simulated ones; availability is never reserved on assignment; traffic events are produced but unused; notifications are a log line and a counter.
-- Distance is Haversine, not road routing. There is a 10,000-driver in-process benchmark and no load test.
-- No authentication, TLS, rate limiting, secrets management, persistent Kubernetes storage, autoscaling, tracing, or hosted deployment.
-- The Kafka profile is a non-persistent single broker outside the CI-gated release.
-
-## Documentation
-
-[Architecture](docs/architecture.md) · [System design](docs/system-design.md) · [Architecture decisions](docs/architecture-decisions.md) · [API](docs/api.md) · [Reliability](docs/reliability.md) · [Observability](docs/observability.md) · [Testing and CI](docs/testing-and-ci.md) · [CI/CD pipeline](docs/cicd.md) · [Performance](docs/performance.md) · [Kafka extension](docs/kafka-lightweight-extension.md)
+The root README describes the combined current workflow. Service-specific source, migrations, and tests provide the detailed behavioral contracts.
 
 ## License
 
