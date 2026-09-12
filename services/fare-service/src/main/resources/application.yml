@@ -59,7 +59,10 @@ metroride:
     per-minute: 0.30
     # Driver's share of a settled fare: on ride_completed, driver_payable is credited
     # quote * driver-share (rounded once, in Money) and platform_revenue the remainder.
-    driver-share: 0.80
+    # Quoted so the value reaches FareProperties with the scale written here: the
+    # fare_settled event echoes it as a decimal string, and 0.80 unquoted would bind as
+    # the double 0.8 and be published as "0.8".
+    driver-share: "0.80"
   consumer:
     # Both streams are read by one XREADGROUP under the same group and consumer name,
     # and both get their own XGROUP CREATE and their own reclaim pass. Envelopes are
@@ -99,6 +102,16 @@ metroride:
     # relay that stays down longer delays its event for as long as it is down, so the
     # window is a margin for the ordinary case, not a bound.
     max-deliveries: 25
+  outbox:
+    # Relay for fare.event_outbox, the counterpart of shared/pkg/outbox in the Go services
+    # and tuned to its constants: every poll-interval one pass takes up to batch-size
+    # unpublished rows whose retry time has come, XADDs each, and records success or a
+    # capped exponential retry (poll-interval doubling up to max-retry-backoff) in one
+    # transaction. Each statement and each XADD has its own 2s timeout; the transaction
+    # has no overall budget, on purpose (see OutboxRelay).
+    poll-interval: 250ms
+    batch-size: 25
+    max-retry-backoff: 30s
 
 logging:
   structured:

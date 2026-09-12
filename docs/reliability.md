@@ -36,13 +36,16 @@ This protects the PostgreSQL state transition when the same logical ride request
 
 ## Transactional Outbox
 
-Both state-changing workflow steps use a PostgreSQL outbox:
+Every state-changing workflow step uses a PostgreSQL outbox:
 
-1. `rider-service` commits the new ride and its `ride_requested` event in one transaction.
+1. `rider-service` commits the new ride and its `ride_requested` event in one transaction, and later the completed ride and its `ride_completed` event.
 2. `dispatch-service` commits the assignment and both downstream `ride_assigned` deliveries in one transaction.
-3. A relay scoped to each service selects unpublished rows with `FOR UPDATE SKIP LOCKED`, publishes them to Redis Streams, and records `published_at`.
+3. `fare-service` (Java) commits the settlement's two journal entries and its `fare_settled` event in one transaction, into `fare.event_outbox` in its own schema rather than the shared `public.event_outbox`.
+4. A relay scoped to each service selects unpublished rows with `FOR UPDATE SKIP LOCKED`, publishes them to Redis Streams, and records `published_at`. The Java relay runs the same statements and the same capped exponential backoff as `shared/pkg/outbox`; it differs in bounding each statement and each publish separately rather than the batch as a whole, so a slow Redis cannot cancel the update that records a failure.
 
 Delivery is intentionally at-least-once. If Redis accepts an event and the relay crashes before PostgreSQL records the publication, the same envelope may be published again. The envelope ID remains stable across attempts, and the authoritative assignment transition is idempotent. This avoids the state/event dual-write gap without claiming exactly-once delivery across PostgreSQL and Redis.
+
+The Java relay shares that window, and one more: a timed-out `XADD` may still have reached Redis, so after a Redis fault the same envelope can appear twice on `events.ride.fares`. The crash window is exercised by the process-kill test for the Go relay only; the Java side is covered by that service's integration tests for the business transaction with Redis away, the relay's backoff and recovery, and the whole chain, not for process termination.
 
 Relay progress is isolated per row. When one event cannot be published, the relay records that attempt, assigns a capped exponential retry time, and continues through the batch. Eligible rows are ordered by retry time so poison rows cannot monopolize every batch while retries still make progress during sustained new traffic. The relay-progress integration test creates real Redis `WRONGTYPE` failures and verifies both that an earlier delivery is not replayed and that a healthy event behind a full batch of poison rows is still published.
 

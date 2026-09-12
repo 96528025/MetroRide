@@ -19,6 +19,7 @@ import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.ledger.LedgerRepository;
 import com.metroride.fare.ledger.Money;
 import com.metroride.fare.ledger.StoredJournalEntry;
+import com.metroride.fare.outbox.OutboxRepository;
 import com.metroride.fare.pricing.FareCalculator;
 import com.metroride.fare.pricing.FareProperties;
 import java.math.BigDecimal;
@@ -29,6 +30,9 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
 
 /**
@@ -44,7 +48,9 @@ class ProcessedEventRecorderTest {
 
     private final ProcessedEventRepository events = mock(ProcessedEventRepository.class);
     private final LedgerRepository ledger = mock(LedgerRepository.class);
-    private final EnvelopeCodec codec = new EnvelopeCodec(Jackson2ObjectMapperBuilder.json().build());
+    private final ObjectMapper mapper = Jackson2ObjectMapperBuilder.json().build();
+    private final EnvelopeCodec codec = new EnvelopeCodec(mapper);
+    private final OutboxRepository outbox = mock(OutboxRepository.class);
     private final FareProperties rates = new FareProperties(
             new BigDecimal("2.50"), new BigDecimal("1.20"), new BigDecimal("0.30"), new BigDecimal("0.80"));
     private ProcessedEventRecorder recorder;
@@ -53,7 +59,53 @@ class ProcessedEventRecorderTest {
     void recorder() {
         when(events.insertIfAbsent(anyString(), anyString(), anyString(), any())).thenReturn(1);
         recorder = new ProcessedEventRecorder(events, ledger, codec, new FareCalculator(rates), rates,
-                Clock.fixed(NOW, ZoneOffset.UTC));
+                outbox, mapper, Clock.fixed(NOW, ZoneOffset.UTC));
+    }
+
+    /**
+     * A settlement enqueues exactly one {@code fare_settled} for {@code events.ride.fares}, with the
+     * figures of the settlement entry it was written with: the quote, the driver's rounded share,
+     * the platform's remainder, and the completion event's ID as {@code settlement_event_id}.
+     */
+    @Test
+    void aSettlementEnqueuesOneFareSettledEventWithTheLedgerFigures() {
+        when(ledger.lockQuoteHolds(RIDE)).thenReturn(List.of(
+                new StoredJournalEntry(1, NOW, JournalEntry.quoteHold(RIDE, "assigned-1", Money.of("5.85")))));
+        when(ledger.hasSettlement(RIDE)).thenReturn(false);
+        when(ledger.append(any(), any())).thenReturn(7L);
+
+        recorder.record("events.ride.completions", completion("completed-1"));
+
+        ArgumentCaptor<Envelope> envelope = ArgumentCaptor.forClass(Envelope.class);
+        verify(outbox).enqueue(eq(Envelope.STREAM_RIDE_FARES), envelope.capture(), eq(NOW));
+        Envelope published = envelope.getValue();
+        assertThat(published.type()).isEqualTo(Envelope.TYPE_FARE_SETTLED);
+        assertThat(published.source()).isEqualTo("fare-service");
+        assertThat(published.correlationId()).isEqualTo(RIDE);
+        assertThat(published.id()).isNotEqualTo("completed-1");
+        assertThat(published.occurredAt()).isEqualTo(NOW);
+        JsonNode payload = published.payload();
+        assertThat(payload.get("ride_id").asText()).isEqualTo(RIDE);
+        assertThat(payload.get("rider_id").asText()).isEqualTo("rider-42");
+        assertThat(payload.get("driver_id").asText()).isEqualTo("driver-2");
+        assertThat(payload.get("assignment_id").asText()).isEqualTo("a-1");
+        assertThat(payload.get("settlement_event_id").asText()).isEqualTo("completed-1");
+        assertThat(payload.get("quote").asText()).isEqualTo("5.85");
+        assertThat(payload.get("driver_amount").asText()).isEqualTo("4.68");
+        assertThat(payload.get("platform_amount").asText()).isEqualTo("1.17");
+        assertThat(payload.get("driver_share").asText()).isEqualTo("0.80");
+        assertThat(payload.get("settled_at").asText()).isEqualTo(NOW.toString());
+    }
+
+    /** Nothing is enqueued for a settlement that did not happen. */
+    @Test
+    void aRefusedSettlementEnqueuesNothing() {
+        when(ledger.lockQuoteHolds(RIDE)).thenReturn(List.of());
+
+        assertThatThrownBy(() -> recorder.record("events.ride.completions", completion("completed-1")))
+                .isInstanceOf(SettlementException.class);
+
+        verify(outbox, never()).enqueue(anyString(), any(), any());
     }
 
     /**

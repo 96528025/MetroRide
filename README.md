@@ -80,7 +80,8 @@ flowchart LR
     DB -->|Rider relay| Completions[events.ride.completions]
     Assignments --> Fare[Optional fare-service / Java]
     Completions --> Fare
-    Fare -->|Event deduplication + ledger transaction| DB
+    Fare -->|Event deduplication + ledger + outbox in one transaction| DB
+    DB -->|Fare relay| Fares[events.ride.fares]
     Dispatch -.-> DLQ[events.dead_letter]
     Fare -.-> DLQ
 ```
@@ -96,7 +97,7 @@ The core data path uses HTTP/JSON, PostgreSQL, and Redis Streams. The repository
 | `traffic-service` | 8084 | Publish simulated congestion every ten seconds; currently no consumer | Yes |
 | `notification-service` | 8085 | Log and count notification deliveries | Yes |
 | `analytics-service` | 8086 | Expose latest driver locations consumed from Kafka | Optional `kafka` profile |
-| `fare-service` | 8087 | Consume assignments/completions; quote, hold, settle, and expose the ledger | Optional `fare` profile |
+| `fare-service` | 8087 | Consume assignments/completions; quote, hold, settle, expose the ledger, and publish `fare_settled` through its own outbox relay | Optional `fare` profile |
 
 ## A ride from request to settlement
 
@@ -106,7 +107,8 @@ The core data path uses HTTP/JSON, PostgreSQL, and Redis Streams. The repository
 4. **Assign.** Dispatch updates the ride only if it is still `requested`, inserts the assignment, and enqueues the assignment envelope for both `events.ride.assignments` and `events.ride.notifications` in one transaction. Replayed requests cannot repeat that state transition.
 5. **Hold.** If enabled, fare-service records the assignment envelope ID and a balanced `quote_hold` in its own PostgreSQL transaction. Notifications independently log/count the event.
 6. **Complete.** `POST /v1/rides/{ride_id}/complete` changes only an `assigned` ride, requires exactly one assignment row, and enqueues `ride_completed` atomically. Unknown rides return `404`, other statuses return `409`, and inconsistent assignment state returns `500` with the transaction rolled back.
-7. **Settle.** Fare-service deduplicates the completion event, locks the existing hold, reverses it, and writes the settlement in one transaction before acknowledging the message.
+7. **Settle.** Fare-service deduplicates the completion event, locks the existing hold, reverses it, writes the settlement, and enqueues a `fare_settled` envelope in `fare.event_outbox`, all in one transaction, before acknowledging the message.
+8. **Announce.** The fare relay publishes that envelope to `events.ride.fares` (ride, rider, driver and assignment IDs, the completion event ID, quote, driver and platform amounts as decimal strings). Nothing in this repository consumes it yet.
 
 ## Fare ledger and pricing boundary
 
@@ -145,7 +147,7 @@ Pending recovery uses `XAUTOCLAIM` with a retained cursor, a five-second reclaim
 
 ## Reliability and operational limits
 
-**Outbox delivery is at-least-once.** Relays poll every 250 ms, lock up to 25 eligible rows using `FOR UPDATE SKIP LOCKED`, publish, and mark them published. Failed rows receive exponential backoff capped at 30 seconds, with no attempt ceiling. Locks remain held while publishing. If Redis accepts an event and the relay crashes before recording publication, the envelope can be published again.
+**Outbox delivery is at-least-once.** Relays poll every 250 ms, lock up to 25 eligible rows using `FOR UPDATE SKIP LOCKED`, publish, and mark them published. Failed rows receive exponential backoff capped at 30 seconds, with no attempt ceiling. Locks remain held while publishing. If Redis accepts an event and the relay crashes before recording publication, the envelope can be published again. The Java fare relay runs the same statements and backoff against `fare.event_outbox` in its own schema, bounds each statement, the commit and each publish separately rather than the batch as a whole, and shares the same crash window, which no test on either side automates.
 
 **Idempotency is scoped to side effects.** Dispatch guards assignment, rider-service guards completion, and fare-service deduplicates ledger events. Notification logs/counters repeat on redelivery. The Go stream consumers read new entries only and do not reclaim abandoned pending entries; the Java fare consumer implements that recovery. Dead-letter replay tooling is not included.
 
