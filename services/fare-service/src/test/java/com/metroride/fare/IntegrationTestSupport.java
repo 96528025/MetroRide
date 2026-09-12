@@ -21,8 +21,12 @@ import org.testcontainers.utility.DockerImageName;
  * entries by hand: the consumer's reclaim pass claims a pending entry within seconds, so a test
  * that leaves one pending must either release what blocks it and assert the reclaim, or expect
  * the dead letter. A test that needs different consumer settings gets its own Spring context
- * through {@code @TestPropertySource} and must also set its own {@code metroride.consumer.stream},
- * or its consumer competes with this context's for the same entries.
+ * through {@code @TestPropertySource} and must also set its own {@code metroride.consumer.streams},
+ * or its consumer competes with this context's for the same entries, and must set
+ * {@code metroride.outbox.enabled=false}, or its relay publishes this context's outbox rows and the
+ * counters {@code OutboxIT} asserts on land in the wrong registry (the rows and the stream would
+ * still be right; the attribution would not). Cached contexts keep their threads alive for the
+ * whole JVM, so this matters whatever order the classes run in.
  *
  * <p>{@code @AutoConfigureObservability} is required by every {@code @SpringBootTest} in this
  * service: Spring Boot switches metrics export off in tests, and {@code MetricsController} needs the

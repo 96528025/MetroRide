@@ -351,13 +351,19 @@ per previous attempt, 30s once the doubled value would reach 15s, pinned to the 
 `RetryBackoffTest`); commit the batch. A failed destination does not stop the batch, and ordering
 by retry time keeps retries and new rows both moving. Metrics carry the Go names.
 
-**Timeouts are per statement, not per transaction.** The Go relay bounds each statement and each
-publish with its own 2s context and nothing else. Here each statement runs with a 2s query
-timeout (`OutboxRepository`) and each `XADD` under the 2s Redis command timeout, and the relay's
-transaction has no overall budget on purpose. The consumer's transaction timeout would be wrong
-here: with Redis slow, one 2s `XADD` would exhaust the batch's budget, the update that records
-that failure would be cancelled, the transaction and the backoff with it would roll back, and the
-row would be retried every poll.
+**Timeouts are per statement, not per transaction.** The Go relay bounds each statement, the
+commit and each publish with its own 2s context and nothing else. Here each statement runs with
+a 2s query timeout (`OutboxRepository`), each `XADD` under the 2s Redis command timeout, and the
+relay's transaction has no overall budget on purpose. The consumer's transaction timeout would be
+wrong here: with Redis slow, one 2s `XADD` would exhaust the batch's budget, the update that
+records that failure would be cancelled, the transaction and the backoff with it would roll back,
+and the row would be retried every poll. A query timeout covers neither `COMMIT` nor `ROLLBACK`
+nor a server that has stopped answering; the datasource's pgjdbc `socketTimeout` (5s, in
+`application.yml`) does, for every connection of this service. It is larger than every statement
+budget so a statement is always cancelled by its own timeout first; when it fires the connection
+is dead, Hikari discards it, and the relay counts a failed pass (`metroride_fare_outbox_pass_failures_total`)
+and retries the batch. A commit cut off this way may still complete on the server, in which case
+the rows are marked and not published again.
 
 **At-least-once, in the same words as the Go relays.** If the process dies after Redis accepted
 an entry and before the transaction recording `published_at` commits, the row is published again
@@ -379,9 +385,12 @@ downstream would act on, and this event defines that boundary. No event marks th
 outbox dead letter, as in the Go relays; a row that can never be published is retried every 30s
 for as long as it exists, and the operational answer to that is the `unpublished` gauge and the
 row's `last_error`, not a second table. No consumer of `events.ride.fares` exists in this
-repository, so the downstream loop is not demonstrated. The relay-crash window is not exercised
-by an automated test on the Java side: this PR's verification covers the business transaction
-with Redis away, the relay's recovery, and the whole chain, not process termination.
+repository, so the downstream loop is not demonstrated. The relay-crash window (Redis has the
+entry, `published_at` is not yet committed) is not exercised by an automated test on either side:
+the Go process-kill test kills `rider-service` while Redis is stopped, i.e. with a committed row
+that has not been published at all, and verifies the restart publishes it once; this service's
+tests cover the business transaction with Redis away, the relay's backoff and recovery, a commit
+cut off by the socket timeout, and the whole chain, not process termination.
 
 ### Ledger endpoint
 
@@ -426,6 +435,7 @@ The relay is tuned under `metroride.outbox`, defaults being the constants of `sh
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `enabled` | `true` | Whether this instance runs the relay; rows are always enqueued. Off only in tests that start a second context on the same database |
 | `poll-interval` | `250ms` | How often the relay thread runs one pass; also the first retry delay |
 | `batch-size` | `25` | Rows taken per pass with `for update skip locked` |
 | `max-retry-backoff` | `30s` | Cap on the delay between attempts of one failed row |
@@ -455,6 +465,7 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | `metroride_outbox_events_published_total` | `service`, `stream` | Outbox rows published to their stream, counted after the batch's commit (same name as the Go relays' counter) |
 | `metroride_outbox_publish_failures_total` | `service`, `stream` | Failed `XADD` attempts, counted after the batch's commit (same name as the Go relays' counter) |
 | `metroride_fare_outbox_unpublished` | `service` | Gauge, rows of `fare.event_outbox` with `published_at` null, refreshed after every pass; no Go counterpart |
+| `metroride_fare_outbox_pass_failures_total` | `service` | Relay passes whose transaction failed as a whole (a statement or commit timed out, the connection dropped, a row could not be marked); the batch is retried; no Go counterpart |
 | `metroride_stream_consume_errors_total` | `service`, `stream` | Failed reads and undecodable entries (same name as the Go shared counter) |
 | `metroride_dependency_errors_total` | `service`, `dependency=postgres\|redis` | Failed dependency calls (same name as the Go shared counter) |
 
@@ -562,7 +573,9 @@ still commit their entries and rows, the relay records each failure with the bac
 published and marked; the stream is then asserted to hold at least one copy per ride, all
 identical, because a timed-out `XADD` may have reached Redis), a settlement rolled back by a
 lock leaving no row until its reclaimed delivery succeeds, and thirty settlements published with
-thirty distinct envelope IDs.
+thirty distinct envelope IDs, and a commit that hangs on the server (a deferred trigger sleeping
+in the commit of a private stream's row) being cut off by the socket timeout at about 5s while the
+row is still unmarked, with the row marked exactly once afterwards.
 
 ## Run in Compose
 

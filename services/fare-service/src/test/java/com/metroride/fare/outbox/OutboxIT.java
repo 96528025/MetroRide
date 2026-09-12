@@ -123,7 +123,8 @@ class OutboxIT extends IntegrationTestSupport {
         assertThat(payload.get("platform_amount").asText()).isEqualTo("1.17");
         assertThat(payload.get("driver_share").asText()).isEqualTo("0.80");
         assertThat(Instant.parse(payload.get("settled_at").asText())).isBetween(before, Instant.now());
-        assertThat(published()).isEqualTo(publishedBefore + 1);
+        // The counter moves after the commit the row assertion saw, so it is awaited, not read once.
+        await().atMost(TIMEOUT).untilAsserted(() -> assertThat(published()).isEqualTo(publishedBefore + 1));
 
         // A redelivery of the completion and a second, distinct completion add no row.
         publish(completionsStream(), completion(completionId, rideId));
@@ -253,6 +254,62 @@ class OutboxIT extends IntegrationTestSupport {
         await().atMost(TIMEOUT).untilAsserted(() -> assertThat(http.getForEntity("/readyz", String.class).getStatusCode().value()).isEqualTo(200));
     }
 
+    /**
+     * The commit is bounded too. Query timeouts do not cover {@code COMMIT}; the datasource's
+     * socket timeout (5s) does. A deferred constraint trigger makes the commit of any pass that
+     * marks a row of a private stream sleep on the server for 10s. Without the socket timeout the
+     * relay thread would sit in that commit for 10s and then succeed, and no failure would ever be
+     * counted; with it the pass fails at about 5s, while the server is still sleeping and the row
+     * is still unmarked. The server finishes its commit regardless (a cut-off commit is not a
+     * rolled-back commit), so the row ends up marked exactly once and the entry is on the stream.
+     */
+    @Test
+    void aCommitThatHangsIsCutOffByTheSocketTimeoutAndTheRelayGoesOn() throws Exception {
+        String stream = "events.ride.fares.commit-delay-test";
+        String eventId = UUID.randomUUID().toString();
+        double passFailuresBefore = passFailures();
+        jdbc.execute("""
+                create or replace function fare.commit_delay_for_test() returns trigger language plpgsql as $$
+                begin
+                    if new.stream = 'events.ride.fares.commit-delay-test' and new.published_at is not null then
+                        perform pg_sleep(10);
+                    end if;
+                    return null;
+                end $$
+                """);
+        jdbc.execute("""
+                create constraint trigger event_outbox_commit_delay_for_test
+                after update on fare.event_outbox deferrable initially deferred
+                for each row execute function fare.commit_delay_for_test()
+                """);
+        try {
+            jdbc.update("""
+                    insert into fare.event_outbox (id, source_service, aggregate_id, event_type, stream, envelope, created_at)
+                    values (?, 'fare-service', ?, 'fare_settled', ?, cast(? as jsonb), now())
+                    """,
+                    eventId, "ride-commit-delay", stream,
+                    "{\"id\":\"" + eventId + "\",\"type\":\"fare_settled\",\"source\":\"fare-service\","
+                            + "\"correlation_id\":\"ride-commit-delay\",\"occurred_at\":\"2026-09-12T10:00:00Z\",\"payload\":{}}");
+
+            // Between the socket timeout (5s) and the end of the server's sleep (10s): the pass has
+            // failed and the row is still unmarked.
+            await().atMost(Duration.ofSeconds(9)).pollInterval(Duration.ofMillis(200)).untilAsserted(() -> {
+                assertThat(passFailures()).isGreaterThanOrEqualTo(passFailuresBefore + 1);
+                assertThat(publishedAt(eventId, stream)).as("the server is still in its commit").isNull();
+            });
+        } finally {
+            jdbc.execute("drop trigger if exists event_outbox_commit_delay_for_test on fare.event_outbox");
+            jdbc.execute("drop function if exists fare.commit_delay_for_test()");
+        }
+
+        // The server's commit lands (or, had it not, the next pass republishes): marked once, on the stream.
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> assertThat(publishedAt(eventId, stream)).isNotNull());
+        Long count = redisTemplate.opsForStream().size(stream);
+        assertThat(count).isNotNull().isGreaterThanOrEqualTo(1);
+        assertThat(((Number) jdbc.queryForMap("select publish_attempts from fare.event_outbox where id = ? and stream = ?",
+                eventId, stream).get("publish_attempts")).intValue()).isEqualTo(1);
+    }
+
     @Test
     void metricsExposeTheOutboxSeries() {
         ResponseEntity<String> metrics = http.getForEntity("/metrics", String.class);
@@ -260,7 +317,8 @@ class OutboxIT extends IntegrationTestSupport {
                 .contains("metroride_outbox_events_published_total{")
                 .contains("metroride_outbox_publish_failures_total{")
                 .contains("stream=\"events.ride.fares\"")
-                .contains("metroride_fare_outbox_unpublished{");
+                .contains("metroride_fare_outbox_unpublished{")
+                .contains("metroride_fare_outbox_pass_failures_total{");
     }
 
     // ---- helpers ---------------------------------------------------------------------------
@@ -317,6 +375,15 @@ class OutboxIT extends IntegrationTestSupport {
 
     private double publishFailures() {
         return meterRegistry.get("metroride.outbox.publish.failures").tag("stream", Envelope.STREAM_RIDE_FARES).counter().count();
+    }
+
+    private Object publishedAt(String eventId, String stream) {
+        return jdbc.queryForMap("select published_at from fare.event_outbox where id = ? and stream = ?", eventId, stream)
+                .get("published_at");
+    }
+
+    private double passFailures() {
+        return meterRegistry.get("metroride.fare.outbox.pass.failures").counter().count();
     }
 
     private double unpublishedGauge() {

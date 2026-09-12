@@ -41,7 +41,7 @@ class OutboxRelayTest {
 
     @BeforeEach
     void relay() {
-        OutboxProperties properties = new OutboxProperties(Duration.ofMillis(250), 25, Duration.ofSeconds(30));
+        OutboxProperties properties = new OutboxProperties(true, Duration.ofMillis(250), 25, Duration.ofSeconds(30));
         relay = new OutboxRelay(properties, repository, TransactionOperations.withoutTransaction(),
                 mock(LettuceConnectionFactory.class), registry, Duration.ofSeconds(10));
     }

@@ -51,11 +51,12 @@ import org.springframework.transaction.support.TransactionOperations;
  *       Consumers deduplicate on the envelope ID, as this service does for its own streams.</li>
  * </ul>
  *
- * <p>What is deliberately not mirrored: the Go relay bounds each statement and each publish with
- * its own 2s context and nothing else; here each statement carries a 2s query timeout and each
- * {@code XADD} the 2s Redis command timeout, and the transaction has no overall budget. Putting the
- * batch under the consumer's transaction timeout would cancel the update that records a slow
- * publish's failure, roll back the backoff with it, and retry the row every poll.
+ * <p>What is deliberately not mirrored: the Go relay bounds each statement, the commit and each
+ * publish with its own 2s context and nothing else; here each statement carries a 2s query
+ * timeout, each {@code XADD} the 2s Redis command timeout, the commit and rollback (which no query
+ * timeout covers) the datasource's 5s socket timeout, and the transaction has no overall budget.
+ * Putting the batch under the consumer's transaction timeout would cancel the update that records
+ * a slow publish's failure, roll back the backoff with it, and retry the row every poll.
  *
  * <p>Own thread and own Lettuce connection, so publishing never competes with the consumer's
  * blocking read or with the readiness check. Shutdown lets the current pass finish and exits;
@@ -74,6 +75,7 @@ public class OutboxRelay implements SmartLifecycle {
     private final MeterRegistry meterRegistry;
     private final Duration shutdownTimeout;
     private final AtomicLong unpublished = new AtomicLong();
+    private final Counter passFailures;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private ExecutorService executor;
@@ -100,6 +102,8 @@ public class OutboxRelay implements SmartLifecycle {
         Gauge.builder("metroride.fare.outbox.unpublished", unpublished, AtomicLong::get)
                 .tag("service", FareServiceApplication.SERVICE_NAME)
                 .register(meterRegistry);
+        this.passFailures = meterRegistry.counter("metroride.fare.outbox.pass.failures",
+                "service", FareServiceApplication.SERVICE_NAME);
     }
 
     private Counter published(String stream) {
@@ -116,6 +120,10 @@ public class OutboxRelay implements SmartLifecycle {
 
     @Override
     public void start() {
+        if (!properties.enabled()) {
+            log.warn("outbox relay disabled by metroride.outbox.enabled; rows are enqueued but not published by this instance");
+            return;
+        }
         if (!running.compareAndSet(false, true)) {
             return;
         }
@@ -169,10 +177,14 @@ public class OutboxRelay implements SmartLifecycle {
                 publishPending(commands);
             } catch (DataAccessException | TransactionException e) {
                 // The batch's transaction failed as a whole (a statement timed out, the connection
-                // dropped, or a published row could not be marked): nothing was committed, every
-                // row of it is eligible again on the next pass.
+                // dropped or hit its socket timeout, or a published row could not be marked):
+                // nothing was committed, every row of it is eligible again on the next pass. A
+                // commit that was cut off by the socket timeout may still have completed on the
+                // server; then the rows are marked and are not published again.
+                passFailures.increment();
                 log.atError().setCause(e).log("outbox relay pass failed; batch will be retried");
             } catch (RuntimeException e) {
+                passFailures.increment();
                 log.atError().setCause(e).log("outbox relay pass failed unexpectedly; batch will be retried");
             }
             try {

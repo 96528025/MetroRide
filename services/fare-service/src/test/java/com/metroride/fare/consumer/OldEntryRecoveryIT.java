@@ -33,6 +33,7 @@ import org.springframework.test.context.TestPropertySource;
  * the first entry of the stream, which is why this class has a single test.
  */
 @TestPropertySource(properties = {
+        "metroride.outbox.enabled=false",
         "metroride.consumer.streams[0]=events.ride.assignments.old-entry-test",
         "metroride.consumer.streams[1]=events.ride.completions.old-entry-test",
         "metroride.consumer.reclaim-interval=1s",

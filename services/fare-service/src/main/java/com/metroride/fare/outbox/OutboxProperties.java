@@ -8,12 +8,15 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * {@code application.yml}. The defaults are the constants of {@code shared/pkg/outbox} in the Go
  * services, so the three relays in the system behave alike.
  *
+ * @param enabled         whether this instance runs the relay at all; rows are always enqueued. Off only
+ *                        in tests that start a second application context on the same database and
+ *                        would otherwise publish (and count) each other's rows
  * @param pollInterval    how often the relay thread looks for publishable rows ({@code defaultPollInterval})
  * @param batchSize       rows taken per pass with {@code for update skip locked} ({@code defaultBatchSize})
  * @param maxRetryBackoff cap on the delay between attempts of one failed row ({@code maxRetryBackoff})
  */
 @ConfigurationProperties(prefix = "metroride.outbox")
-public record OutboxProperties(Duration pollInterval, int batchSize, Duration maxRetryBackoff) {
+public record OutboxProperties(boolean enabled, Duration pollInterval, int batchSize, Duration maxRetryBackoff) {
 
     public OutboxProperties {
         if (pollInterval == null || pollInterval.isZero() || pollInterval.isNegative()) {

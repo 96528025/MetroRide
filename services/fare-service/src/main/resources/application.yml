@@ -16,6 +16,16 @@ spring:
       maximum-pool-size: 5
       connection-timeout: 2000   # ms; reliability.PostgresTimeout in the Go services is 2s
       validation-timeout: 1500   # ms; reliability.ReadinessTimeout in the Go services is 1.5s
+      data-source-properties:
+        # pgjdbc socket read timeout, seconds. Query timeouts cancel a statement the server
+        # is still working on; they do not cover COMMIT, ROLLBACK, or a server that has
+        # stopped answering. The Go services put a 2s context around every call including
+        # tx.Commit; this is the JDBC counterpart for that remainder. Larger than every
+        # statement budget in this service (2s), so a statement is always cancelled by its
+        # own timeout first and this only fires when the connection is dead or a commit
+        # hangs. A read that hits it breaks the connection; Hikari discards it and the
+        # transaction is lost, which for the outbox relay means the batch is retried.
+        socketTimeout: 5
   jpa:
     open-in-view: false
     hibernate:
@@ -109,6 +119,7 @@ metroride:
     # capped exponential retry (poll-interval doubling up to max-retry-backoff) in one
     # transaction. Each statement and each XADD has its own 2s timeout; the transaction
     # has no overall budget, on purpose (see OutboxRelay).
+    enabled: true
     poll-interval: 250ms
     batch-size: 25
     max-retry-backoff: 30s

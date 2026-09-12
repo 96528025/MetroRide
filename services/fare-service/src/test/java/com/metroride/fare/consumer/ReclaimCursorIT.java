@@ -35,6 +35,7 @@ import org.springframework.test.context.TestPropertySource;
  * locked entries are not dead-lettered during the test.
  */
 @TestPropertySource(properties = {
+        "metroride.outbox.enabled=false",
         "metroride.consumer.streams[0]=events.ride.assignments.reclaim-cursor-test",
         "metroride.consumer.streams[1]=events.ride.completions.reclaim-cursor-test",
         "metroride.consumer.batch-size=2",
