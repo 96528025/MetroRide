@@ -169,8 +169,9 @@ Services expose `/healthz`, `/readyz`, and `/metrics`; JSON logs include identif
 | Routing outage | `bash scripts/failure-integration-test.sh` | Failed dispatch produces the expected dead letter and leaves the ride unassigned |
 | Fare unit tests | `cd services/fare-service && ./mvnw -B test` | Pricing, money, ledger invariants, event contracts, failure policy |
 | Fare integration | `cd services/fare-service && ./mvnw -B verify` | Unit tests plus real PostgreSQL/Redis Testcontainers tests, deduplication, settlement races, lock waits, pending recovery |
+| Ride-to-fare-settlement flow | `bash scripts/fare-e2e-test.sh` | One ride through the real rider, dispatch, routing, driver and fare services: assignment, quote hold, completion, hold reversal and settlement in the ledger, `fare_settled` on `events.ride.fares` with its outbox row, and a refused second completion |
 
-Stack integration and outage scripts require the local Compose stack. Fare `verify` needs Java 21 and Docker. The Go race detector instruments Go test processes; it does not instrument the independently running service containers.
+Stack integration and outage scripts require the local Compose stack. Fare `verify` needs Java 21 and Docker. The fare flow script needs only Docker: it starts its own isolated Compose project (unique name, own volumes, refuses to run if the stack's ports are busy), removes it afterwards, and runs `go test` from a `golang` container when Go is not installed. The Go race detector instruments Go test processes; it does not instrument the independently running service containers.
 
 Optional selection microbenchmark:
 
@@ -182,11 +183,11 @@ This times a 10,000-driver in-process scan, not end-to-end ride throughput.
 
 ## Delivery pipeline and optional Kafka
 
-[CI](.github/workflows/ci.yml) validates Go formatting, vet/tests, Compose, smoke/integration, and outage recovery. A separate Java job runs Maven `verify`. Six core images are built as distroless, non-root containers.
+[CI](.github/workflows/ci.yml) validates Go formatting, vet/tests, Compose, smoke/integration, and outage recovery. A separate Java job runs Maven `verify`, and a third job runs the ride-to-fare-settlement flow against a Compose stack with the `fare` profile. Six core images are built as distroless, non-root containers.
 
 - **Pull requests:** build images in the runner, load them into KinD, install the Helm release, and run deployment smoke checks without publishing service images.
 - **Main, release tags, manual runs:** publish core images tagged with the full commit SHA to GHCR, pull those artifacts into the deployment-validation job, and run the same KinD checks. No `latest` tag is used.
-- **Scope:** the publish job depends on Go backend validation; fare validation is a separate job and is not a dependency of image publication. Fare and analytics are outside the six-image release/Helm smoke path. KinD clusters are removed after validation.
+- **Scope:** the publish job depends on Go backend validation; fare validation and the fare flow job are separate jobs and not dependencies of image publication. Fare and analytics are outside the six-image release/Helm smoke path: the flow job proves the Go-to-Java chain works in Compose, it does not put fare-service into GHCR, the Helm chart or KinD. KinD clusters are removed after validation.
 
 The [Helm chart](infrastructure/helm/metro-ride) includes probes, resource settings, bounded dependency waits, and optional `ServiceMonitor` rendering. Default dependencies are external PostgreSQL/Redis; KinD profiles use disposable `emptyDir`-backed instances. Local deployment validation needs Docker, kind, kubectl, Helm, and Bash 4+; see [CI/CD documentation](docs/cicd.md).
 

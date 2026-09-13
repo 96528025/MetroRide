@@ -1,0 +1,15 @@
+# Test-only Compose overlay for scripts/fare-e2e-test.sh. It is loaded explicitly after
+# docker-compose.yml (`-f docker-compose.yml -f tests/fareintegration/compose.fare-e2e.yml`)
+# and changes nothing about the everyday stack or the `fare` profile.
+#
+# Its one job is to make the driver share an input of the run: the script exports
+# FARE_DRIVER_SHARE, this overlay hands it to fare-service, and the Go test reads the same
+# variable to compute the expected split. Without it the service would use the default in
+# application.yml and the test would only be checking that two defaults agree.
+#
+# METRORIDE_FARE_DRIVERSHARE is the environment spelling of `metroride.fare.driver-share`
+# under Spring Boot's relaxed binding (dots become underscores, dashes are dropped).
+services:
+  fare-service:
+    environment:
+      METRORIDE_FARE_DRIVERSHARE: ${FARE_DRIVER_SHARE:?FARE_DRIVER_SHARE must be set; run through scripts/fare-e2e-test.sh}

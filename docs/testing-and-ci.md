@@ -1,6 +1,6 @@
 # MetroRide Testing and CI
 
-MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, process-kill recovery of a committed outbox row, outbox relay progress, and a real routing-outage dead-letter path.
+MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, process-kill recovery of a committed outbox row, outbox relay progress, a real routing-outage dead-letter path, and the ride-to-fare-settlement flow across the Go services and the Java fare-service.
 
 ## CI Pipeline
 
@@ -44,8 +44,22 @@ Maven cache, and runs `./mvnw -B verify` in `services/fare-service`: the unit
 tests through surefire, then the Testcontainers integration test through failsafe
 against real `postgres:16-alpine` and `redis:7-alpine` containers on the runner.
 The `backend` job does not build or start fare-service: it sits behind the
-optional `fare` Compose profile and is not yet part of the smoke test, the
-published image set, or the Helm chart.
+optional `fare` Compose profile and is not part of the smoke test, the
+published image set, or the Helm chart. The cross-service check lives in the
+next job.
+
+### Ride-to-fare-settlement flow job (every event)
+
+`fare-end-to-end` runs `bash scripts/fare-e2e-test.sh`, the same entry point
+used locally. The script starts its own Compose project (core Go services plus
+the `fare` profile, no Prometheus/Grafana), runs the `fareintegration` Go test
+against it, writes every service log to a directory that is uploaded as a
+workflow artifact when the job fails, and removes the project's containers,
+volumes and built images whether the test passed or not. It is a separate job so
+its stack is never shared with the backend job's outage tests, which stop Redis
+and kill rider-service. Like the `fare-service` job it is not a dependency of
+image publication or deployment validation: it proves the Go-to-Java chain in
+Compose and does not add fare-service to GHCR, the Helm chart or KinD.
 
 ### Deployment-validation job (every event)
 
@@ -179,6 +193,70 @@ Stopping Redis first makes the kill window deterministic instead of racing a rel
 
 This covers one relay crash window: termination after the PostgreSQL commit and before any publication. The other window, termination after Redis has accepted the event but before the transaction recording `published_at` commits, is the one that produces the documented at-least-once duplicate and is not tested. A `dispatch-service` restart while a consumed request is still unacknowledged is not tested either: consumers read with `>` and never reclaim pending entries, so that entry would stay pending by design (see [reliability.md](reliability.md)).
 
+### Ride-to-Fare-Settlement Flow
+
+```bash
+bash scripts/fare-e2e-test.sh
+```
+
+Prerequisites: Docker with Compose v2 and free host ports 5432, 6379, 8080–8083
+and 8087. Go is optional; without it the test runs from a `golang:1.22`
+container against the published ports. The script refuses to start while those
+ports are in use, so stop a running MetroRide stack first (`docker compose
+--profile fare down` keeps its volumes; the flow never touches them because it
+uses a Compose project name unique to the run).
+
+The script builds and starts rider, driver, routing, dispatch and fare-service
+with PostgreSQL and Redis, waits for every `/readyz`, and runs one Go test,
+`TestRideToFareSettlement` in `tests/fareintegration`. Business actions use only
+the public HTTP APIs; PostgreSQL and Redis are read to check results and never
+written to skip a step. Stage by stage:
+
+1. Create a ride with a unique `rider_id` through rider-service (`202`, a UUID
+   `ride_id`).
+2. Poll the ride until it is `assigned`; read the single `ride_assignments` row
+   and the `ride_assigned` envelope on `events.ride.assignments` to learn this
+   run's driver, assignment ID and assignment event ID.
+3. Poll the fare ledger until the `quote_hold` exists, and require that it is the
+   only entry: `rider_receivable +quote`, `fare_hold -quote`, quote positive,
+   `source_event_id` equal to the assignment envelope. The hold is observed
+   before the completion is requested, so the settlement is a reaction to it.
+4. Complete the ride through rider-service (`202` with the `ride_completed`
+   envelope ID).
+5. Poll the ledger until it holds exactly one `quote_hold`, one `hold_reversal`
+   and one `settlement`. Every entry sums to zero, the reversal is the hold
+   negated posting for posting, the settlement debits the held quote, credits the
+   driver `quote × share` rounded half up once and the platform the remainder
+   (a zero share is omitted), and both new entries carry the completion envelope
+   as `source_event_id`. The share is `FARE_DRIVER_SHARE`, which the script passes
+   both to fare-service (through the test overlay
+   `tests/fareintegration/compose.fare-e2e.yml`) and to the test.
+6. Wait for `fare_settled` on `events.ride.fares`: envelope type, source and
+   correlation ID; ride, rider, driver and assignment IDs; `settlement_event_id`
+   equal to the completion envelope; quote, driver and platform amounts equal to
+   the ledger; `driver_share` equal to the configured value; the amounts and the
+   share are JSON strings and `settled_at` parses as RFC 3339. `fare.event_outbox`
+   holds exactly one `fare_settled` row for the ride, `published_at` set, whose
+   stored envelope equals the published one (compared as decoded JSON, because
+   `jsonb` does not keep key order). Several stream copies are accepted only if
+   they are the same envelope ID and content: the relay is at-least-once.
+7. Complete the ride again: `409 {"error":"ride is completed"}`, the ledger's
+   entry IDs are unchanged, there is still one `ride_completed` outbox row and one
+   distinct `ride_completed` envelope, and still one `fare_settled` row and one
+   distinct `fare_settled` envelope.
+
+Amounts are compared as integer cents parsed from the two-decimal strings, never
+as floating point. Nothing is asserted from a demo value such as `2.85`: the quote
+is whatever fare-service held for the driver dispatch chose, and the split is
+computed from that quote and the configured share. Every wait is bounded polling
+(45 s per stage, 5 s per request), and a failure prints the stage, the ride,
+rider, driver, assignment and event IDs, and the last state observed.
+
+What the flow does not claim: the quote is still fare-service's current model,
+base fare plus the assigned driver's distance and ETA to the pickup point, not a
+metered passenger trip; and the flow does not exercise fault injection, load, or
+any payment.
+
 ## Running Everything Locally
 
 ```bash
@@ -194,6 +272,7 @@ bash scripts/outbox-recovery-test.sh
 bash scripts/process-kill-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
+bash scripts/fare-e2e-test.sh   # after the stack is down: it needs the same host ports
 ```
 
 To also reproduce the Kubernetes deployment validation locally, see the
@@ -203,7 +282,7 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, and preservation of unassigned PostgreSQL state. It does not claim to cover PostgreSQL outages, a relay crash after Redis has accepted an event but before `published_at` is recorded (the at-least-once duplicate window), a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, preservation of unassigned PostgreSQL state, and one ride settled end to end through the Java fare-service (hold, reversal, settlement, `fare_settled` and its outbox row, refused second completion). It does not claim to cover PostgreSQL outages, a relay crash after Redis has accepted an event but before `published_at` is recorded (the at-least-once duplicate window), a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 

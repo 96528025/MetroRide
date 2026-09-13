@@ -24,6 +24,7 @@ few minutes inside one runner and is then destroyed.
 flowchart TD
     A[backend<br/>gofmt, go vet, go test, Compose build,<br/>smoke, integration, failure-path] --> B{event}
     F[fare-service<br/>./mvnw verify: unit + Testcontainers tests]
+    G[fare-end-to-end<br/>Compose stack with the fare profile:<br/>ride → hold → completion → settlement → fare_settled]
 
     B -->|pull_request| C[Deploy validation: pr<br/>contents: read]
     C --> C1[build 6 images in the runner]
@@ -251,6 +252,7 @@ if it fails.
 | `publish-images` | `contents: read`, `packages: write` | The only job that writes packages. |
 | `deploy-validation-release` | `contents: read`, `packages: read` | Pulls published images back onto the runner. |
 | `fare-service` | `contents: read` (workflow default) | Runs `./mvnw -B verify` for the Java service with Testcontainers on the runner's Docker daemon; no registry access. |
+| `fare-end-to-end` | `contents: read` (workflow default) | Runs `scripts/fare-e2e-test.sh`: builds the core Go images and the fare-service image in the runner, drives one ride through the Compose stack, uploads service logs on failure; no registry access, and not a dependency of publication or deployment validation. |
 
 `deploy-validation.yml` declares no permissions of its own, so it inherits
 exactly what the calling job grants.

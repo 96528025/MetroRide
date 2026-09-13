@@ -577,6 +577,29 @@ thirty distinct envelope IDs, and a commit that hangs on the server (a deferred 
 in the commit of a private stream's row) being cut off by the socket timeout at about 5s while the
 row is still unmarked, with the row marked exactly once afterwards.
 
+### The whole chain through the Compose stack
+
+`OutboxIT` feeds `ride_assigned` and `ride_completed` into the streams itself. The check that the
+Go services really produce what this service consumes, and that what this service publishes is
+what the Go contract describes, is a Go test against a running stack:
+
+```bash
+bash scripts/fare-e2e-test.sh        # from the repository root; needs Docker, Go optional
+```
+
+It starts an isolated Compose project (core Go services plus this profile), creates a ride
+through rider-service, waits for dispatch's assignment and for this service's `quote_hold`,
+completes the ride through rider-service, and then checks the ledger (one hold, one reversal
+that negates it, one settlement by the held quote with the driver's share rounded once and the
+platform the remainder, both under the completion envelope's ID), `fare_settled` on
+`events.ride.fares` (IDs, `settlement_event_id`, the amounts as strings equal to the ledger,
+`driver_share` equal to the value the script configured with `FARE_DRIVER_SHARE`) and the
+`fare.event_outbox` row (one, published, same envelope). A second completion must be a `409`
+that adds nothing. Stages, assertions and limits are in
+[docs/testing-and-ci.md](../../docs/testing-and-ci.md#ride-to-fare-settlement-flow). CI runs
+it in the `fare-end-to-end` job; that job validates the chain in Compose and does not add this
+service to the published images, the Helm chart or the KinD validation.
+
 ## Run in Compose
 
 The service sits behind the optional `fare` Compose profile, so it is not part of the default stack:
