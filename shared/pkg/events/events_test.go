@@ -181,3 +181,45 @@ func TestPublishReturnsEnvelopeMarshalErrorBeforeRedisCall(t *testing.T) {
 		t.Fatalf("Publish() error = %q, want envelope marshal context", err)
 	}
 }
+
+// TestFareSettledJSONFieldNames pins the wire contract fare-service (Java) writes to
+// events.ride.fares: the Java record and this struct must agree name for name.
+func TestFareSettledJSONFieldNames(t *testing.T) {
+	body, err := json.Marshal(FareSettled{
+		RideID:            "ride-1",
+		RiderID:           "rider-1",
+		DriverID:          "driver-1",
+		AssignmentID:      "assignment-1",
+		SettlementEventID: "event-1",
+		Quote:             "5.85",
+		DriverAmount:      "4.68",
+		PlatformAmount:    "1.17",
+		DriverShare:       "0.80",
+		SettledAt:         "2026-09-12T12:00:00.123456789Z",
+	})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	want := []string{"ride_id", "rider_id", "driver_id", "assignment_id", "settlement_event_id",
+		"quote", "driver_amount", "platform_amount", "driver_share", "settled_at"}
+	if len(fields) != len(want) {
+		t.Fatalf("got %d fields %v, want %d", len(fields), fields, len(want))
+	}
+	for _, name := range want {
+		value, ok := fields[name]
+		if !ok {
+			t.Errorf("field %q missing", name)
+			continue
+		}
+		if _, isString := value.(string); !isString {
+			t.Errorf("field %q = %v (%T), want a string", name, value, value)
+		}
+	}
+	if StreamRideFares != "events.ride.fares" || TypeFareSettled != "fare_settled" {
+		t.Errorf("constants = %q/%q", StreamRideFares, TypeFareSettled)
+	}
+}

@@ -17,6 +17,7 @@ const (
 	StreamRideCompletions   = "events.ride.completions"
 	StreamTrafficUpdates    = "events.traffic.updates"
 	StreamDeadLetter        = "events.dead_letter"
+	StreamRideFares         = "events.ride.fares"
 )
 
 const (
@@ -26,6 +27,7 @@ const (
 	TypeRideCompleted         = "ride_completed"
 	TypeTrafficUpdated        = "traffic_updated"
 	TypeNotificationCreated   = "notification_created"
+	TypeFareSettled           = "fare_settled"
 )
 
 type Envelope struct {
@@ -79,6 +81,24 @@ type TrafficUpdated struct {
 	Region     string  `json:"region"`
 	Congestion float64 `json:"congestion"`
 	UpdatedAt  string  `json:"updated_at"`
+}
+
+// FareSettled is published by fare-service (Java) to StreamRideFares once a
+// ride's quote hold has been reversed and settled. Amounts and the share are
+// decimal strings with two (share: as configured) decimal places, never floats,
+// so no consumer turns money into floating point by accident. Nothing in this
+// repository publishes or consumes it in Go; the struct pins the contract.
+type FareSettled struct {
+	RideID            string `json:"ride_id"`
+	RiderID           string `json:"rider_id"`
+	DriverID          string `json:"driver_id"`
+	AssignmentID      string `json:"assignment_id"`
+	SettlementEventID string `json:"settlement_event_id"`
+	Quote             string `json:"quote"`
+	DriverAmount      string `json:"driver_amount"`
+	PlatformAmount    string `json:"platform_amount"`
+	DriverShare       string `json:"driver_share"`
+	SettledAt         string `json:"settled_at"`
 }
 
 type DeadLetter struct {

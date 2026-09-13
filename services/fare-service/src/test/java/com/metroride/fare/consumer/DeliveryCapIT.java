@@ -39,6 +39,7 @@ import org.springframework.test.context.TestPropertySource;
  * completion tests' entries.
  */
 @TestPropertySource(properties = {
+        "metroride.outbox.enabled=false",
         "metroride.consumer.streams[0]=events.ride.assignments.delivery-cap-test",
         "metroride.consumer.streams[1]=events.ride.completions.delivery-cap-test",
         "metroride.consumer.reclaim-interval=1s",

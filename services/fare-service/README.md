@@ -5,10 +5,11 @@ A Java service in the MetroRide monorepo. It consumes `events.ride.assignments` 
 every envelope it sees once in its own PostgreSQL schema, for each first-seen `ride_assigned`
 quotes the fare from the assignment's distance and ETA and holds that quote in a double-entry
 ledger, and for each first-seen `ride_completed` reverses that hold and settles the quoted
-amount between the driver and the platform. Settlement is by quote: the amount settled is the
-amount held, nothing is metered. An entry it cannot handle is retried from the consumer group's
-pending list, or written to `events.dead_letter`; see "Failure handling and pending-entry
-recovery".
+amount between the driver and the platform, and announces that settlement on
+`events.ride.fares` through a transactional outbox in its own schema. Settlement is by quote: the
+amount settled is the amount held, nothing is metered. An entry it cannot handle is retried from
+the consumer group's pending list, or written to `events.dead_letter`; see "Failure handling and
+pending-entry recovery". Nothing consumes `events.ride.fares` yet; see "Publication".
 
 ## What is here
 
@@ -28,7 +29,10 @@ recovery".
 | Failure handling | `consumer/FailureHandler`, `consumer/ConsumerHalt` | Leaves the entry pending, dead-letters it, or halts the consumer; owns the one `XACK` in the service; the halt fails `/readyz` |
 | Entry age | `consumer/StreamEntryAge` | Age of an entry from the millisecond timestamp in its stream ID; logged, never decided on |
 | Dead letters | `consumer/DeadLetterPublisher`, `events/DeadLetter` | `XADD` to `events.dead_letter` in the shape `publishDeadLetter` in dispatch-service writes; `DeadLetter` mirrors `events.DeadLetter` in `events.go` |
-| Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql`, `V3__one_hold_and_one_settlement_per_ride.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables and the V3 per-ride unique indexes are checked by the integration tests |
+| Outbox storage | `outbox/OutboxRepository` | The statements of `shared/pkg/outbox` against `fare.event_outbox`: `enqueue` in the settlement's transaction, then the relay's take-batch, mark-published and mark-failed |
+| Outbox relay | `outbox/OutboxRelay`, `outbox/RetryBackoff`, `outbox/OutboxProperties` | Own thread and connection; every `poll-interval` one batch under `for update skip locked`, `XADD` each row, record success or a capped exponential retry; at-least-once, like the Go relays |
+| Published contract | `events/FareSettled` | Field-for-field match with `events.FareSettled` in `events.go`; amounts as strings |
+| Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql`, `V3__one_hold_and_one_settlement_per_ride.sql`, `V4__event_outbox.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables, the V3 per-ride unique indexes and the outbox table are checked by the integration tests |
 | Endpoints | `web/HealthController`, `web/MetricsController`, `web/LedgerController` | `/healthz`, `/readyz`, `/metrics` with the same paths and JSON as `shared/pkg/httpx/httpx.go`; `GET /v1/rides/{ride_id}/ledger` |
 
 ### Processing rule
@@ -45,10 +49,12 @@ For each stream entry, from either stream (the type decides, never the stream it
    3. if the type is `ride_completed`, decode the payload, lock the ride's `quote_hold`
       (`select ... for update`), check that there is exactly one (two cannot exist since V3;
       finding two is fatal) and that it has the shape the service writes, check that the ride
-      has no `settlement` yet, and append a `hold_reversal` and a `settlement`, both with this
-      event's ID as `source_event_id` (see "Settlement");
+      has no `settlement` yet, append a `hold_reversal` and a `settlement`, both with this
+      event's ID as `source_event_id` (see "Settlement"), and insert one `fare_settled` row for
+      `events.ride.fares` into `fare.event_outbox` (see "Publication");
    4. any other type is only recorded.
-3. After the transaction commits, `XACK` the entry.
+3. After the transaction commits, `XACK` the entry. The outbox relay publishes the row on its
+   next pass.
 
 The transaction is limited to `metroride.postgres.timeout-seconds` (2s, the Go services'
 PostgreSQL deadline). Spring hands the remaining time to every statement in it, whether Hibernate
@@ -308,6 +314,84 @@ inserts. Reads go through the same
 constructor (the query is a left join, so an entry that lost its postings is not hidden), so a
 row set that no longer balances or has no postings is refused rather than served.
 
+### Publication
+
+A settled ride is announced with one `fare_settled` envelope on `events.ride.fares`:
+
+```json
+{"id":"<new uuid>","type":"fare_settled","source":"fare-service","correlation_id":"<ride_id>",
+ "occurred_at":"2026-09-12T10:05:00.123456Z",
+ "payload":{"ride_id":"...","rider_id":"rider-42","driver_id":"driver-2","assignment_id":"...",
+            "settlement_event_id":"<the ride_completed envelope id>",
+            "quote":"5.85","driver_amount":"4.68","platform_amount":"1.17","driver_share":"0.80",
+            "settled_at":"2026-09-12T10:05:00.123456Z"}}
+```
+
+The payload is `events.FareSettled` in `events.go`, pinned there by a Go test and here by
+`FareSettledContractTest`. Amounts are strings, as on the ledger endpoint, so no consumer turns
+money into floating point by accident. The figures are copied from the `settlement` entry that
+was just written, never recomputed; `settlement_event_id` is the `source_event_id` of both
+journal entries, so a consumer can join the event to the ledger.
+
+**Transactional outbox in the `fare` schema.** `settle()` inserts the envelope into
+`fare.event_outbox` in the same transaction as the two journal entries, so the event exists
+exactly when the entries exist and a rolled-back settlement leaves no event behind. The table has
+the columns, primary key `(id, stream)` and partial index of the Go services' `public.event_outbox`
+(`shared/pkg/outbox`), so both are inspected with the same SQL; it is a separate table because
+`public.event_outbox` belongs to `init.sql` and the Go relays, and this service touches only its
+own schema (V1). A Java relay is the price of that boundary.
+
+**The relay.** `OutboxRelay` runs on its own thread and connection, the same pattern as the
+consumer. Every `poll-interval` (250ms) it runs one pass in one transaction: take up to
+`batch-size` (25) rows with `published_at is null and next_attempt_at <= now()`, ordered by
+`next_attempt_at, created_at, id`, `for update skip locked`; `XADD` each to its stream; on
+success set `published_at = clock_timestamp()`; on failure add one to `publish_attempts`, set
+`last_error`, and push `next_attempt_at` back by the Go backoff (`RetryBackoff`: 250ms doubling
+per previous attempt, 30s once the doubled value would reach 15s, pinned to the Go table by
+`RetryBackoffTest`); commit the batch. A failed destination does not stop the batch, and ordering
+by retry time keeps retries and new rows both moving. Metrics carry the Go names.
+
+**Timeouts are per statement, not per transaction.** The Go relay bounds each statement, the
+commit and each publish with its own 2s context and nothing else. Here each statement runs with
+a 2s query timeout (`OutboxRepository`), each `XADD` under the 2s Redis command timeout, and the
+relay's transaction has no overall budget on purpose. The consumer's transaction timeout would be
+wrong here: with Redis slow, one 2s `XADD` would exhaust the batch's budget, the update that
+records that failure would be cancelled, the transaction and the backoff with it would roll back,
+and the row would be retried every poll. A query timeout covers neither `COMMIT` nor `ROLLBACK`
+nor a server that has stopped answering; the datasource's pgjdbc `socketTimeout` (5s, in
+`application.yml`) does, for every connection of this service. It is larger than every statement
+budget so a statement is always cancelled by its own timeout first; when it fires the connection
+is dead, Hikari discards it, and the relay counts a failed pass (`metroride_fare_outbox_pass_failures_total`)
+and retries the batch. A commit cut off this way may still complete on the server, in which case
+the rows are marked and not published again.
+
+**At-least-once, in the same words as the Go relays.** If the process dies after Redis accepted
+an entry and before the transaction recording `published_at` commits, the row is published again
+with the same envelope ID. A failure to mark a row published (a cancelled statement, a lost
+connection) aborts the batch's transaction for the same reason, and the rows Redis already has
+are published again on the next pass. A timed-out `XADD` may also have reached Redis, in which
+case the row is retried and the entry appears twice. None of this is deduplicated here: the
+envelope ID is stable across attempts, and a consumer of `events.ride.fares` must deduplicate on
+it, as this service does for its own streams. Neither the relay nor Redis is a readiness
+dependency of the settlement: with Redis away, `record()` still commits the entries and the row,
+`/readyz` answers 503 because the consumer's `redis` check fails (consumption is paused, work
+already in a transaction still commits), and the rows wait with their backoff until Redis is back.
+Shutdown lets the current pass finish and exits; rows still unpublished are published by the
+next start.
+
+**What this does not do.** Only `fare_settled` is published: the settlement is the result a
+downstream would act on, and this event defines that boundary. No event marks the hold
+(`fare_held` is an option if a consumer needs it, not a gap). There is no attempt ceiling and no
+outbox dead letter, as in the Go relays; a row that can never be published is retried every 30s
+for as long as it exists, and the operational answer to that is the `unpublished` gauge and the
+row's `last_error`, not a second table. No consumer of `events.ride.fares` exists in this
+repository, so the downstream loop is not demonstrated. The relay-crash window (Redis has the
+entry, `published_at` is not yet committed) is not exercised by an automated test on either side:
+the Go process-kill test kills `rider-service` while Redis is stopped, i.e. with a committed row
+that has not been published at all, and verifies the restart publishes it once; this service's
+tests cover the business transaction with Redis away, the relay's backoff and recovery, a commit
+cut off by the socket timeout, and the whole chain, not process termination.
+
 ### Ledger endpoint
 
 ```
@@ -347,6 +431,15 @@ batch size and block timeout:
 | `reclaim-min-idle` | `5s` | How long an entry must have gone without a delivery before that `XAUTOCLAIM` takes it; longer than `metroride.postgres.timeout-seconds` |
 | `max-deliveries` | `25` | A retryable failure on this delivery dead-letters the entry; with `reclaim-min-idle` 5s this guarantees at least 120s of retrying since the first delivery, four times the outbox relay's 30s maximum backoff |
 
+The relay is tuned under `metroride.outbox`, defaults being the constants of `shared/pkg/outbox`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Whether this instance runs the relay; rows are always enqueued. Off only in tests that start a second context on the same database |
+| `poll-interval` | `250ms` | How often the relay thread runs one pass; also the first retry delay |
+| `batch-size` | `25` | Rows taken per pass with `for update skip locked` |
+| `max-retry-backoff` | `30s` | Cap on the delay between attempts of one failed row |
+
 The rate card lives in `application.yml` under `metroride.fare`, not in the environment:
 
 | Key | Default | Meaning |
@@ -369,6 +462,10 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|max_deliveries_reached\|duplicate_hold\|corrupt_hold\|already_settled` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK`. The reason is only here: the dead letter JSON has no `reason` field, the specific cause is in its `error` text |
 | `metroride_fare_dead_letter_publish_failures_total` | `service`, `stream` | Dead-letter `XADD`s Redis did not confirm; the entry stayed pending |
 | `metroride_fare_consumer_halted` | `service` | Gauge, 1 once the consumer has stopped on a fatal failure |
+| `metroride_outbox_events_published_total` | `service`, `stream` | Outbox rows published to their stream, counted after the batch's commit (same name as the Go relays' counter) |
+| `metroride_outbox_publish_failures_total` | `service`, `stream` | Failed `XADD` attempts, counted after the batch's commit (same name as the Go relays' counter) |
+| `metroride_fare_outbox_unpublished` | `service` | Gauge, rows of `fare.event_outbox` with `published_at` null, refreshed after every pass; no Go counterpart |
+| `metroride_fare_outbox_pass_failures_total` | `service` | Relay passes whose transaction failed as a whole (a statement or commit timed out, the connection dropped, a row could not be marked); the batch is retried; no Go counterpart |
 | `metroride_stream_consume_errors_total` | `service`, `stream` | Failed reads and undecodable entries (same name as the Go shared counter) |
 | `metroride_dependency_errors_total` | `service`, `dependency=postgres\|redis` | Failed dependency calls (same name as the Go shared counter) |
 
@@ -392,7 +489,12 @@ empty and null posting lists are rejected; the list is copied and immutable) and
 settlement split at 5.85 and share 0.80, the remainder going to the platform, the three
 zero-posting cases, the reversal being the hold negated posting for posting), and
 `QuoteHoldShapeTest` (a missing, duplicated, wrong-account, wrong-side or unequal posting is a
-corrupt hold).
+corrupt hold). For publication: `RetryBackoffTest` (the delay after 0 to 100 attempts against the
+Go table), `FareSettledContractTest` (payload names against the `events.go` tags, `occurred_at`
+as a string), `OutboxRelayTest` (one pass against a mocked Redis: a timed-out `XADD` is recorded
+with the Go backoff and the batch goes on, a row that cannot be marked published aborts the pass
+and counts nothing), and in `ProcessedEventRecorderTest` that a settlement enqueues one
+`fare_settled` with the ledger's figures and a refused settlement enqueues nothing.
 
 The integration tests share one `postgres:16-alpine` and one `redis:7-alpine` container
 (`IntegrationTestSupport`). `RideEventConsumerIT` covers the consumer path: one row per
@@ -462,13 +564,25 @@ Not automated: a fatal failure end to end. Producing one against the real schema
 the schema for every other test in the JVM; the halt is covered by `FailureHandlerTest` and its
 readiness effect by `HealthControllerTest`.
 
+`OutboxIT` covers publication in three layers: the whole chain (`ride_assigned` and
+`ride_completed` in through the streams, one `fare_settled` out with the ledger's figures, no
+second row or entry for a redelivered or a second completion), the business transaction and the
+relay under a Redis fault (the Redis container is paused with the Docker API; three settlements
+still commit their entries and rows, the relay records each failure with the backoff and the
+`unpublished` gauge and `/readyz` reflect it, and after the container is unpaused every row is
+published and marked; the stream is then asserted to hold at least one copy per ride, all
+identical, because a timed-out `XADD` may have reached Redis), a settlement rolled back by a
+lock leaving no row until its reclaimed delivery succeeds, and thirty settlements published with
+thirty distinct envelope IDs, and a commit that hangs on the server (a deferred trigger sleeping
+in the commit of a private stream's row) being cut off by the socket timeout at about 5s while the
+row is still unmarked, with the row marked exactly once afterwards.
+
 ## Run in Compose
 
 The service sits behind the optional `fare` Compose profile, so it is not part of the default stack:
 
 ```bash
-docker compose --profile fare build fare-service
-docker compose --profile fare up -d
+docker compose --profile fare up -d --build      # --build so the image is the checkout, not a cached one
 curl -s localhost:8087/healthz   # {"status":"ok"}
 curl -s localhost:8087/readyz    # {"status":"ready"}
 curl -s localhost:8087/metrics | grep metroride_fare
@@ -496,6 +610,22 @@ docker compose logs fare-service | grep '"event recorded"'
 docker compose exec postgres psql -U metroride -d metroride \
   -c "select j.kind, p.account, p.amount from fare.journal_entries j join fare.postings p on p.journal_entry_id = j.id where j.ride_id = '$RIDE' order by j.id, p.id"
 ```
+
+```
+
+The settlement is also on `events.ride.fares` by then, and its outbox row is marked published:
+
+```bash
+docker compose exec -T redis redis-cli --raw XRANGE events.ride.fares - + | grep "$RIDE"   # one fare_settled
+docker compose exec postgres psql -U metroride -d metroride \
+  -c "select id, stream, publish_attempts, published_at, last_error from fare.event_outbox where aggregate_id = '$RIDE'"
+curl -s localhost:8087/metrics | grep outbox                          # published +1, failures unchanged, unpublished 0
+```
+
+Fault behaviour (Redis away while a settlement commits, the relay's backoff, recovery) is not
+demonstrated by hand: stopping Redis in Compose also stops the relay that carries the completion
+to this service, and pausing the container freezes the consumer's read as well, so neither lands
+between "consumed" and "published". `OutboxIT` arranges each of those states directly.
 
 The postings of the three entries sum to zero. Completion is a command on rider-service because,
 in this simplified architecture, rider-service is the aggregate owner of `rides`; in a real
@@ -540,7 +670,9 @@ curl -s localhost:8087/v1/rides/<ride uuid>/ledger                              
 
 - Settlement is by quote only. There is no metering of actual distance or time, no adjustment
   entry, and no cancellation flow (a `cancelled` ride keeps its hold).
-- No outbox and no publication to `events.ride.fares`.
+- Only `fare_settled` is published; no event marks the hold, and nothing in this repository
+  consumes `events.ride.fares`. See "Publication" for what the outbox does not do (no attempt
+  ceiling, no outbox dead letter, no deduplication, no process-kill test on the Java side).
 - Multi-instance protection covers exactly one case: two instances settling the same ride. Two
   instances quoting the same assignment are serialised by the `processed_events` primary key as
   before; nothing else is coordinated between instances.

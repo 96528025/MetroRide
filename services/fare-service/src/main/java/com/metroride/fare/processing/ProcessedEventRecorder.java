@@ -3,20 +3,27 @@ package com.metroride.fare.processing;
 import com.metroride.fare.events.Envelope;
 import com.metroride.fare.events.EnvelopeCodec;
 import com.metroride.fare.events.EnvelopeDecodeException;
+import com.metroride.fare.events.FareSettled;
 import com.metroride.fare.events.RideAssigned;
 import com.metroride.fare.events.RideCompleted;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.metroride.fare.ledger.Account;
 import com.metroride.fare.ledger.CorruptLedgerException;
 import com.metroride.fare.ledger.JournalEntry;
 import com.metroride.fare.ledger.LedgerConflictException;
 import com.metroride.fare.ledger.LedgerRepository;
 import com.metroride.fare.ledger.Money;
+import com.metroride.fare.ledger.Posting;
 import com.metroride.fare.ledger.StoredJournalEntry;
+import com.metroride.fare.outbox.OutboxRepository;
 import com.metroride.fare.pricing.FareCalculator;
 import com.metroride.fare.pricing.FareProperties;
 import com.metroride.fare.pricing.FareQuoteException;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -28,7 +35,8 @@ import org.springframework.transaction.annotation.Transactional;
  *   <li>{@code ride_assigned}: quote the fare and append the {@code quote_hold} entry;</li>
  *   <li>{@code ride_completed}: lock the ride's {@code quote_hold}, check that it is the one
  *       entry the service writes and that the ride is not settled yet, then append the
- *       {@code hold_reversal} and the {@code settlement};</li>
+ *       {@code hold_reversal} and the {@code settlement}, and enqueue the {@code fare_settled}
+ *       event for {@code events.ride.fares} in {@code fare.event_outbox};</li>
  *   <li>anything else: recorded, nothing more.</li>
  * </ul>
  *
@@ -76,6 +84,8 @@ public class ProcessedEventRecorder {
     private final EnvelopeCodec codec;
     private final FareCalculator calculator;
     private final FareProperties rates;
+    private final OutboxRepository outbox;
+    private final ObjectMapper mapper;
     private final Clock clock;
 
     public ProcessedEventRecorder(
@@ -84,12 +94,16 @@ public class ProcessedEventRecorder {
             EnvelopeCodec codec,
             FareCalculator calculator,
             FareProperties rates,
+            OutboxRepository outbox,
+            ObjectMapper mapper,
             Clock clock) {
         this.repository = repository;
         this.ledger = ledger;
         this.codec = codec;
         this.calculator = calculator;
         this.rates = rates;
+        this.outbox = outbox;
+        this.mapper = mapper;
         this.clock = clock;
     }
 
@@ -187,6 +201,9 @@ public class ProcessedEventRecorder {
      *       Should a second settlement slip past the check above, the per-ride unique index on
      *       settlements refuses it and the whole transaction, reversal included, rolls back; that
      *       is reported as {@code already_settled} too.</li>
+     *   <li>Enqueue one {@code fare_settled} envelope for {@code events.ride.fares} in
+     *       {@code fare.event_outbox}. Same transaction, so the event exists exactly when the two
+     *       entries exist; the relay publishes it after the commit.</li>
      * </ol>
      */
     private List<JournalEntry> settle(Envelope envelope) {
@@ -232,6 +249,39 @@ public class ProcessedEventRecorder {
                     "ride " + rideId + " was settled by another transaction; event " + envelope.id()
                             + " refused by " + conflict.conflict().indexName(), conflict);
         }
+        outbox.enqueue(Envelope.STREAM_RIDE_FARES, fareSettled(envelope, completion, quote, settlement, now), now);
         return List.of(reversal, settlement);
+    }
+
+    /** The {@code fare_settled} envelope: figures copied from the settlement entry, never recomputed. */
+    private Envelope fareSettled(Envelope completion, RideCompleted payload, Money quote, JournalEntry settlement, Instant now) {
+        FareSettled settled = new FareSettled(
+                payload.rideId(),
+                payload.riderId(),
+                payload.driverId(),
+                payload.assignmentId(),
+                completion.id(),
+                quote.toString(),
+                credited(settlement, Account.DRIVER_PAYABLE).toString(),
+                credited(settlement, Account.PLATFORM_REVENUE).toString(),
+                rates.driverShare().toPlainString(),
+                DateTimeFormatter.ISO_INSTANT.format(now));
+        return new Envelope(
+                UUID.randomUUID().toString(),
+                Envelope.TYPE_FARE_SETTLED,
+                com.metroride.fare.FareServiceApplication.SERVICE_NAME,
+                payload.rideId(),
+                now,
+                mapper.valueToTree(settled));
+    }
+
+    /** The amount credited to {@code account} in {@code entry}, as a positive figure; zero when there is no such posting. */
+    private static Money credited(JournalEntry entry, Account account) {
+        for (Posting posting : entry.postings()) {
+            if (posting.account() == account) {
+                return posting.amount().negate();
+            }
+        }
+        return Money.ZERO;
     }
 }
