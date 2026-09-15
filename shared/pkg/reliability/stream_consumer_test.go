@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"github.com/google/uuid"
+	"github.com/metroride/metroride/shared/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/redis/go-redis/v9"
 	"os"
 	"sync/atomic"
@@ -66,7 +69,7 @@ func TestRestartRecoversCommittedButUnacknowledgedDelivery(t *testing.T) {
 	}
 	go func() {
 		defer close(done)
-		Consume(ctx, r, s, g, "old", testOptions(), quietLog{}, handle, func(context.Context, redis.XMessage, error) error { return nil })
+		Consume(ctx, r, s, g, "old", "consumer-test", testOptions(), quietLog{}, handle, func(context.Context, redis.XMessage, error) error { return nil })
 	}()
 	<-done
 	if p := r.XPending(context.Background(), s, g).Val(); p.Count != 1 {
@@ -77,7 +80,7 @@ func TestRestartRecoversCommittedButUnacknowledgedDelivery(t *testing.T) {
 	defer func() { stop(); <-nextDone }()
 	go func() {
 		defer close(nextDone)
-		Consume(next, r, s, g, "new", testOptions(), quietLog{}, func(context.Context, redis.XMessage) error { attempts.Add(1); effects.CompareAndSwap(0, 1); return nil }, func(context.Context, redis.XMessage, error) error { return nil })
+		Consume(next, r, s, g, "new", "consumer-test", testOptions(), quietLog{}, func(context.Context, redis.XMessage) error { attempts.Add(1); effects.CompareAndSwap(0, 1); return nil }, func(context.Context, redis.XMessage, error) error { return nil })
 	}()
 	eventually(t, func() bool { return r.XPending(context.Background(), s, g).Val().Count == 0 })
 	if effects.Load() != 1 || attempts.Load() != 2 {
@@ -94,7 +97,7 @@ func TestFailedDeadLetterStaysPendingUntilPublicationSucceeds(t *testing.T) {
 	var allow atomic.Bool
 	go func() {
 		defer close(done)
-		Consume(ctx, r, s, g, "one", testOptions(), quietLog{}, func(context.Context, redis.XMessage) error { return Permanent(errors.New("bad payload")) }, func(context.Context, redis.XMessage, error) error {
+		Consume(ctx, r, s, g, "one", "consumer-test", testOptions(), quietLog{}, func(context.Context, redis.XMessage) error { return Permanent(errors.New("bad payload")) }, func(context.Context, redis.XMessage, error) error {
 			deadCalls.Add(1)
 			if !allow.Load() {
 				return errors.New("publisher unavailable")
@@ -118,7 +121,7 @@ func TestRetryableFailureUsesRedisDeliveryCount(t *testing.T) {
 	var attempts, dead atomic.Int32
 	go func() {
 		defer close(done)
-		Consume(ctx, r, s, g, "one", testOptions(), quietLog{}, func(context.Context, redis.XMessage) error { attempts.Add(1); return errors.New("offline") }, func(context.Context, redis.XMessage, error) error { dead.Add(1); return nil })
+		Consume(ctx, r, s, g, "one", "consumer-test", testOptions(), quietLog{}, func(context.Context, redis.XMessage) error { attempts.Add(1); return errors.New("offline") }, func(context.Context, redis.XMessage, error) error { dead.Add(1); return nil })
 	}()
 	eventually(t, func() bool { return dead.Load() == 1 && r.XPending(ctx, s, g).Val().Count == 0 })
 	if attempts.Load() != 3 {
@@ -161,7 +164,7 @@ func TestReclaimCursorReachesOldWorkBeyondFreshPendingEntries(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Consume(ctx, r, s, g, "new", o, quietLog{}, func(_ context.Context, m redis.XMessage) error {
+		Consume(ctx, r, s, g, "new", "consumer-test", o, quietLog{}, func(_ context.Context, m redis.XMessage) error {
 			if m.ID == target {
 				recovered.Store(true)
 			}
@@ -170,4 +173,40 @@ func TestReclaimCursorReachesOldWorkBeyondFreshPendingEntries(t *testing.T) {
 	}()
 	defer func() { cancel(); <-done; <-refreshDone }()
 	eventually(t, func() bool { return recovered.Load() })
+}
+
+func TestRedisConsumerFailureUpdatesMetrics(t *testing.T) {
+	r, stream, group := streamTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer cancel()
+	// A wrong-type key makes real Redis reject consumer-group creation.
+	if err := r.Set(ctx, stream, "not a stream", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); <-done }()
+	service := "consumer-test"
+	counter := metrics.StreamConsumeErrors.WithLabelValues(service, stream)
+	baseline := counterValue(counter)
+	go func() {
+		defer close(done)
+		Consume(ctx, r, stream, group, "worker", service, testOptions(), quietLog{},
+			func(context.Context, redis.XMessage) error { t.Error("processed an unavailable stream"); return nil },
+			func(context.Context, redis.XMessage, error) error {
+				t.Error("dead-lettered a transport error")
+				return nil
+			})
+	}()
+	eventually(t, func() bool { return counterValue(counter) > baseline })
+	if counterValue(metrics.DependencyErrors.WithLabelValues(service, "redis")) == 0 {
+		t.Fatal("Redis dependency failure was not counted")
+	}
+}
+
+func counterValue(counter prometheus.Counter) float64 {
+	value := &dto.Metric{}
+	if err := counter.Write(value); err != nil {
+		panic(err)
+	}
+	return value.GetCounter().GetValue()
 }

@@ -51,7 +51,7 @@ import org.springframework.stereotype.Component;
 /**
  * Consumer-group reader for {@code events.ride.assignments} and {@code events.ride.completions},
  * structured like {@code consume()} in {@code services/dispatch-service/cmd/main.go}, plus the
- * pending-entry recovery that the Go consumers do not have:
+ * pending-entry recovery also supported by the Go consumers:
  *
  * <ol>
  *   <li>{@code XGROUP CREATE ... 0 MKSTREAM} on every configured stream at startup; an existing

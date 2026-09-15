@@ -36,7 +36,7 @@ Completing or canceling an assigned ride releases its driver in the same transac
 
 Go PostgreSQL operations use two-second contexts, including commit and rollback. Redis operations use two-second budgets; readiness checks use 1.5 seconds. Routing provider calls have ten-second deadlines inside the sixty-second operation budget. A failed response does not prove an earlier commit was rolled back; inspect current ride state before retrying.
 
-Driver locations remain simulated. The notification endpoint counts processing attempts, so recovery may increase it more than once for the same assignment. There is no email/SMS delivery or payment gateway. Redis loss/retention, external provider availability, manual dead-letter replay, and client-create deduplication remain operational limits.
+Driver locations remain simulated. The notification endpoint counts successfully processed notifications, so recovery may increase it more than once for the same assignment. There is no email/SMS delivery or payment gateway. Redis loss/retention, external provider availability, manual dead-letter replay, and client-create deduplication remain operational limits.
 
 ## Verification
 

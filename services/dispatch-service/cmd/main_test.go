@@ -16,6 +16,9 @@ import (
 	"github.com/metroride/metroride/shared/pkg/config"
 	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/metroride/metroride/shared/pkg/reliability"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestFindNearestDriverReturnsRoutingResult(t *testing.T) {
@@ -173,4 +176,51 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func TestRoutingReadinessUsesShortDeadline(t *testing.T) {
+	var observed time.Duration
+	d := newRoutingTestDispatcher("http://routing.test", &http.Client{
+		Timeout: reliability.RoutingTimeout,
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			deadline, ok := r.Context().Deadline()
+			if !ok {
+				t.Fatal("readiness request has no deadline")
+			}
+			observed = time.Until(deadline)
+			return routingTestHTTPResponse(r, http.StatusOK, `{}`), nil
+		}),
+	})
+	if err := d.checkRoutingService(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if observed <= 0 || observed > reliability.ReadinessTimeout {
+		t.Fatalf("readiness deadline = %s, want at most %s", observed, reliability.ReadinessTimeout)
+	}
+}
+
+func TestDispatchDeadLetterFailureIsCounted(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{})
+	if err := rdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := &dispatcher{rdb: rdb}
+	before := counterValue(assignmentFailures)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := d.publishDeadLetter(ctx, redis.XMessage{ID: "1-0", Values: map[string]any{"event": "bad JSON"}}, errors.New("invalid event"))
+	if err == nil {
+		t.Fatal("closed Redis client unexpectedly published a dead letter")
+	}
+	if got := counterValue(assignmentFailures); got != before+1 {
+		t.Fatalf("terminal failure attempts = %g, want %g", got, before+1)
+	}
+}
+
+func counterValue(counter prometheus.Counter) float64 {
+	value := &dto.Metric{}
+	if err := counter.Write(value); err != nil {
+		panic(err)
+	}
+	return value.GetCounter().GetValue()
 }

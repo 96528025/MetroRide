@@ -10,7 +10,7 @@ MetroRide needs multiple lightweight backend services with clear concurrency, ne
 
 ### Decision
 
-Use Go as the primary backend language for all services.
+Use Go for the six core services and optional Kafka analytics. The optional fare service uses Java 21 and Spring Boot for its transactional ledger and consumer lifecycle.
 
 ### Alternatives Considered
 
@@ -110,7 +110,7 @@ Redis Streams can redeliver events, and dispatch workers may restart or process 
 
 ### Decision
 
-Make ride assignment idempotent by checking PostgreSQL state before assignment and only updating rides where `status = 'requested'`.
+Guard assignment with a conditional `requested → assigned` update. Commit the assignment, unique driver reservation, and outgoing outbox events in one PostgreSQL transaction; see [state guards](reliability.md#state-guards).
 
 ### Alternatives Considered
 
