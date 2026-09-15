@@ -316,3 +316,9 @@ zero-downtime deployment, canary rollout, autoscaling, automated rollback,
 security scanning, a public demo, a custom domain, public ingress, or any
 persistent or paid hosting. Kubernetes is used here strictly as ephemeral
 deployment validation.
+
+## Route fixture in deployment validation
+
+The ephemeral KinD profile enables a test-only `route-fixture` Deployment and Service, built locally from `tests/routingfixture/Dockerfile`. It is not part of the six published application images. The rendered ConfigMap explicitly selects its URL; ordinary chart defaults use the configurable road provider. Routing replicas share PostgreSQL driver state and reservations and wait for both PostgreSQL and Redis.
+
+The fixture verifies the deployed service chain without making a public route request. A successful KinD test does not establish live-provider availability. Smoke cleanup releases the ride's driver after SQL and notification checks.

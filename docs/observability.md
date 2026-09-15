@@ -107,3 +107,14 @@ Recommended production alerts:
 - Add a dead-letter counter. `metroride_assignment_failures_total` counts messages that exhausted their assignment retries and is incremented before the dead-letter publish is attempted, so the `events.dead_letter` stream is the only record of what was actually dead-lettered.
 - Add RED metrics for every REST endpoint: rate, errors, duration.
 - Add resource dashboards for CPU, memory, goroutines, and database pool utilization.
+
+## Recovery and optional targets
+
+CI validates the backend, the Java fare service, the Compose fare flow, and the six core services deployed into disposable KinD clusters. Fare-service and the optional analytics extension remain outside the six-image Helm delivery path. Passing deployment validation does not indicate a continuously hosted application.
+
+Prometheus scrapes the configured core services, including traffic-service. Optional fare and analytics targets appear unavailable when their profiles are not running. Notification counters count processing attempts rather than unique customer notifications.
+
+Go and Java consumers decode the JSON event payloads used by their workflows. Assignment contracts distinguish driver approach from passenger-trip estimates. Cancellation and completion events describe guarded ride state changes; fare events describe the resulting ledger operations.
+The routing microbenchmark measures only the in-process candidate-selection calculation over 10,000 driver records. It excludes database reads, road-route requests, reservation transactions, and the rest of the ride workflow. Its result is not an end-to-end dispatch capacity measurement.
+
+The Go consumer counters `metroride_stream_deliveries_total{stream,path}` and `metroride_stream_processing_failures_total{stream}` distinguish new and reclaimed deliveries and failures. They use fixed stream names and no ride IDs or coordinates as labels. Traffic-service is included in Prometheus scrapes. Fare and analytics targets show down when their optional profiles are not running. Notification counts represent processed deliveries, including repeats.

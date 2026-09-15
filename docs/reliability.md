@@ -1,120 +1,43 @@
-# MetroRide Reliability and Failure Handling
+# Reliability and Failure Recovery
 
-MetroRide uses dependency readiness, bounded foreground retries, explicit timeouts, idempotent assignment, transactional outbox delivery, and dead-letter handling around the core ride workflow.
+## Transactional outbox
 
-## Timeout Strategy
+Ride creation, assignment, completion, and cancellation commit their state change and outgoing events in one PostgreSQL transaction. The assignment transaction also acquires the driver's unique reservation. Outbox relays publish at least once, so consumers must tolerate redelivery. A confirmed database commit is separate from asynchronous event publication.
 
-All external dependency calls are bounded:
+## Consumer recovery
 
-- Redis operations use short request contexts and Redis client dial/read/write timeouts.
-- PostgreSQL reads and writes use bounded contexts around query and transaction calls.
-- `dispatch-service` calls `routing-service` through an HTTP client with an explicit timeout and per-request context.
-- Readiness checks use shorter timeouts so orchestration probes fail quickly instead of hanging.
+The Go consumers for dispatch, driver locations, and notifications read new deliveries and periodically reclaim eligible pending entries with `XAUTOCLAIM`. Each instance has its own consumer name, and reclaim scanning retains its cursor. Successful processing is acknowledged only after the relevant state change has completed.
 
-The goal is to fail fast, log clearly, and preserve the ability to retry transient failures without blocking worker loops indefinitely.
+Reclaiming does not make delivery exactly-once. Dispatch uses guarded database transitions and unique reservations; location updates reject older timestamps. Notification logs and delivery counters can repeat after redelivery and are not presented as unique notifications.
 
-## Retry Strategy
+Retryable failures remain pending. Malformed messages and exhausted delivery attempts are copied to the dead-letter stream before acknowledgment. If dead-letter publication fails, the original remains pending. Reclaim idle time must exceed the bounded processing budget; repeated delivery remains possible and is handled by the state guards.
 
-Foreground transient operations use bounded retries with exponential backoff:
+| Go setting | Default | Purpose |
+| --- | --- | --- |
+| `STREAM_PROCESS_TIMEOUT_SECONDS` | 60 | Overall processing budget per delivery |
+| `STREAM_MIN_IDLE_SECONDS` | 120 | Minimum idle time before reclaim; must exceed processing budget |
+| `STREAM_RECLAIM_INTERVAL_SECONDS` | 5 | Interval between cursor-based pending scans |
+| `STREAM_MAX_DELIVERIES` | 25 | Redis delivery-count limit for retryable failures |
+| `CONSUMER_NAME` | Service name plus a fresh UUID | Unique consumer identity unless explicitly configured |
 
-- Dispatch message processing retries before a ride request is considered failed.
-- Dispatch-to-routing calls retry because routing failures may be transient.
-- Dead-letter publication uses bounded retries before surfacing failure.
+The Go loop reads one message at a time, interleaves new reads and pending scans, and uses bounded Redis operations. Routing HTTP retries share the delivery deadline. A delivery exhausted after a prolonged dependency failure goes to `events.dead_letter`; restoration does not automatically replay that stream. Operators must inspect the recorded event and current ride state before deliberate replay.
 
-Those request and consumer retries are intentionally bounded. The durable outbox is the explicit exception: unpublished rows remain scheduled until delivery succeeds, using exponential backoff capped at 30 seconds. A failed row does not extend request latency or block other eligible rows, but there is not yet an attempt ceiling or outbox dead-letter path.
+Fare-service has its own Java consumer configuration and failure classes. See its [README](../services/fare-service/README.md) for poison, retryable, quarantine, and fatal failures. Its persistent ride-state lock serializes assignment, completion, and cancellation, including cancellation arriving before the hold.
 
-## Idempotency Design
+## State guards
 
-`dispatch-service` treats ride assignment as idempotent:
+Driver locations and active reservations are shared through PostgreSQL. A location update can refresh a driver's position without clearing an active reservation. Stale location reports are excluded from selection, and an older event cannot overwrite a newer position.
 
-1. Before routing, it checks the ride's persisted PostgreSQL state.
-2. If the ride is no longer `requested` or already has a `driver_id`, duplicate `ride_requested` delivery is skipped.
-3. Assignment updates are guarded with `where status = 'requested'`.
-4. If another worker already assigned the ride, the duplicate worker exits without creating another assignment.
+Dispatch considers available drivers with recent locations. It ranks a bounded shortlist using estimated road travel time to the pickup; the shortlist is not a global optimization across every driver. The assignment, exclusive driver reservation, ride state change, and outgoing events commit in one database transaction. If another ride reserves the candidate first, dispatch retries selection.
 
-This protects the PostgreSQL state transition when the same logical ride request reaches the handler more than once. It does not by itself recover work abandoned in a consumer group's pending-entry list: the current readers request only new stream entries and do not claim pending entries.
+Completing or canceling an assigned ride releases its driver in the same transaction as the ride state change and outgoing event. Conditional state changes prevent completion and cancellation from both succeeding for the same ride. A delayed duplicate request cannot reserve a driver again for an ended ride.
 
-## Transactional Outbox
+## Timeouts and boundaries
 
-Every state-changing workflow step uses a PostgreSQL outbox:
+Go PostgreSQL operations use two-second contexts, including commit and rollback. Redis operations use two-second budgets; readiness checks use 1.5 seconds. Routing provider calls have ten-second deadlines inside the sixty-second operation budget. A failed response does not prove an earlier commit was rolled back; inspect current ride state before retrying.
 
-1. `rider-service` commits the new ride and its `ride_requested` event in one transaction, and later the completed ride and its `ride_completed` event.
-2. `dispatch-service` commits the assignment and both downstream `ride_assigned` deliveries in one transaction.
-3. `fare-service` (Java) commits the settlement's two journal entries and its `fare_settled` event in one transaction, into `fare.event_outbox` in its own schema rather than the shared `public.event_outbox`.
-4. A relay scoped to each service selects unpublished rows with `FOR UPDATE SKIP LOCKED`, publishes them to Redis Streams, and records `published_at`. The Java relay runs the same statements and the same capped exponential backoff as `shared/pkg/outbox`; it differs in bounding each statement and each publish separately rather than the batch as a whole, so a slow Redis cannot cancel the update that records a failure.
+Driver locations remain simulated. The notification endpoint counts processing attempts, so recovery may increase it more than once for the same assignment. There is no email/SMS delivery or payment gateway. Redis loss/retention, external provider availability, manual dead-letter replay, and client-create deduplication remain operational limits.
 
-Delivery is intentionally at-least-once. If Redis accepts an event and the relay crashes before PostgreSQL records the publication, the same envelope may be published again. The envelope ID remains stable across attempts, and the authoritative assignment transition is idempotent. This avoids the state/event dual-write gap without claiming exactly-once delivery across PostgreSQL and Redis.
+## Verification
 
-The Java relay shares that window, and one more: a timed-out `XADD` may still have reached Redis, so after a Redis fault the same envelope can appear twice on `events.ride.fares`. Neither window is exercised by an automated test on either side. The process-kill test kills `rider-service` while Redis is stopped, with a committed row that has not been published at all, and verifies that the restarted relay publishes it exactly once; a crash after Redis accepted the entry and before `published_at` is committed is not automated for the Go relays or the Java one. The Java side is covered by that service's integration tests for the business transaction with Redis away, the relay's backoff and recovery, a commit cut off by the JDBC socket timeout, and the whole chain, not for process termination.
-
-Relay progress is isolated per row. When one event cannot be published, the relay records that attempt, assigns a capped exponential retry time, and continues through the batch. Eligible rows are ordered by retry time so poison rows cannot monopolize every batch while retries still make progress during sustained new traffic. The relay-progress integration test creates real Redis `WRONGTYPE` failures and verifies both that an earlier delivery is not replayed and that a healthy event behind a full batch of poison rows is still published.
-
-## Dead-Letter Stream
-
-Failed dispatch events are published to:
-
-```text
-events.dead_letter
-```
-
-After retries are exhausted, `dispatch-service` publishes a dead-letter event containing:
-
-- Original event ID.
-- Original event type.
-- Ride ID when available.
-- Error message.
-- Service name.
-- Failure timestamp.
-
-If dead-letter publication succeeds, the original stream message is acknowledged so it does not poison the consumer group indefinitely. If dead-letter publication fails, the original message remains pending. No Go consumer claims such a pending entry again. `fare-service` (Java) does: its consumer thread runs `XAUTOCLAIM` over its own group every 5 seconds, continuing from the cursor of the previous pass, retries entries that failed for a PostgreSQL reason up to 25 deliveries (at least 120 seconds of retrying, since consecutive deliveries are at least 5 seconds apart), and dead-letters those and every undecodable or unquotable entry to the same `events.dead_letter` stream in the same envelope shape, acknowledging only after the dead letter is confirmed. A failure that is the deployment's rather than the entry's (wrong SQL, a schema mismatch, a violated constraint) halts that consumer with the entry left pending and fails its readiness check instead of dead-lettering. Nothing consumes `events.dead_letter`; see `services/fare-service/README.md`.
-
-### Automated Verification Status
-
-The CI-required routing-outage integration test verifies this path across real components rather than mocks. It stops `routing-service`, creates a ride through `rider-service`, lets the running dispatch consumer exhaust bounded retries, reads the matching entry from the real Redis dead-letter stream, and confirms in PostgreSQL that the ride remains `requested` with no assignment row.
-
-The routing failure test validates that path specifically. A separate Redis-outage test proves that ride state and an unpublished event commit while Redis is stopped, then verifies automatic relay and assignment after Redis restarts. A process-kill test extends that to the relay boundary: `rider-service` is killed with `SIGKILL` while a committed ride's outbox row is unpublished, and after restart the relay publishes that row exactly once and dispatch assigns the ride. The other relay crash window, termination after Redis has accepted the event but before the transaction recording `published_at` commits, is the one that produces the at-least-once duplicate described above and is not tested. PostgreSQL outages, a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming by the Go consumers, and dead-letter replay also remain outside current automated coverage. Pending-entry claiming and dead-lettering by `fare-service` are covered by that service's own Testcontainers integration tests.
-
-## Failure Modes
-
-### Routing Service Unavailable
-
-If `routing-service` is unavailable, `dispatch-service` retries the route request. If all retries fail, the ride remains in `requested` state and the failed event is written to `events.dead_letter`. Operators can inspect the payload, but replay or repair is currently manual because no dead-letter replay tool is implemented.
-
-### Redis Unavailable
-
-If Redis is unavailable:
-
-- `rider-service` remains ready while PostgreSQL is healthy because accepting a ride only requires the database transaction that stores the ride and its outbox event. Redis is not a startup or readiness dependency for this service.
-- The rider outbox relay treats Redis loss as degraded delivery: it logs publication failures and increments `metroride_outbox_publish_failures_total` while retrying unpublished rows.
-- Readiness checks for services that must use Redis synchronously still fail.
-- Direct Redis operations increment dependency error metrics and log structured errors; outbox relays use their dedicated failure metric.
-- Stream consumers increment stream consume error metrics.
-- Ride creation commits both the ride and its outbox event, still returns `202`, and requires no client retry.
-- The relay retains the unpublished row, records failed attempts, and publishes it after Redis recovers.
-- Dispatch state changes use the same pattern, so an assignment cannot commit without durable publication intent.
-
-### PostgreSQL Unavailable
-
-If PostgreSQL is unavailable:
-
-- `rider-service` and `dispatch-service` readiness checks fail.
-- Ride creation and ride status reads fail fast with bounded query timeouts.
-- Dispatch assignment fails before mutating ride state and can be retried or dead-lettered.
-
-### Dispatch Service Restarts
-
-Redis Stream consumer groups preserve unacknowledged messages. If `dispatch-service` restarts before acknowledging one, the entry remains pending rather than disappearing. The current worker reads new messages with `>` and does not claim abandoned pending entries, so it will not resume that work automatically. `XAUTOCLAIM`/`XCLAIM` handling or dedicated replay tooling is required; if a request is later delivered again, the PostgreSQL guard prevents a second assignment state transition. The same gap applies to every Go consumer. `fare-service` closes it for its own group: on start and every 5 seconds afterwards it claims its pending entries with `XAUTOCLAIM` and pushes them through the normal handler, so an entry left behind by a restart or a failed transaction is retried, and dead-lettered after 25 deliveries if it keeps failing.
-
-## Metrics
-
-Reliability-related metrics include:
-
-- `metroride_rides_assigned_total`
-- `metroride_assignment_failures_total`
-- `metroride_stream_consume_errors_total`
-- `metroride_dependency_errors_total`
-- `metroride_outbox_events_published_total`
-- `metroride_outbox_publish_failures_total`
-- `metroride_dispatch_latency_seconds`
-
-These metrics are designed for alerting on dependency health, dispatch failure rate, and stream processing reliability.
+`stream_consumer_test.go` checks restart after a simulated durable effect before acknowledgment, retry caps, failed dead-letter publication, and timeout configuration against real Redis. Routing tests check shared persistence, stale updates, active reservations, response validation, and concurrent cache use. Full-stack tests and outage scripts are listed in [testing and CI](testing-and-ci.md).

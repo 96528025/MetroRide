@@ -19,12 +19,12 @@ pending-entry recovery". Nothing consumes `events.ride.fares` yet; see "Publicat
 | Consumer settings | `config/ConsumerProperties`, `application.yml` | Group and consumer name come from `CONSUMER_GROUP` and `CONSUMER_NAME` through the same post-processor; the `streams` list, batch size and block timeout live in `application.yml` |
 | Envelope contract | `events/Envelope`, `events/RideAssigned`, `events/RideCompleted`, `events/EnvelopeCodec` | Field-for-field match with `shared/pkg/events/events.go`; the stream entry field is `event`, as written by `events.Publish` |
 | Rate card | `pricing/FareProperties`, `application.yml` | `base-fare`, `per-km`, `per-minute`, `driver-share` as exact decimals under `metroride.fare` |
-| Fare calculation | `pricing/FareCalculator` | Pure function of distance, ETA and the rate card; no Spring dependency |
-| Ledger model | `ledger/Money`, `Account`, `JournalKind`, `Posting`, `JournalEntry` | Records and enums; the balance invariant is checked in the `JournalEntry` constructor; the `quoteHold`, `holdReversal` and `settlement` factories are the only three shapes written |
-| Ledger storage | `ledger/LedgerRepository` | Insert-only `JdbcClient` access to `fare.journal_entries` and `fare.postings`; reads rebuild entries through the constructor; `lockQuoteHolds` is the one `select ... for update` |
-| Settlement checks | `processing/QuoteHoldShape`, `processing/SettlementException`, `ledger/CorruptLedgerException` | The shape a hold must have to be settled, and the four settlement outcomes with the failure class each carries |
+| Fare calculation | `pricing/FareCalculator` | Pure function of passenger road distance, duration, and the rate card; no Spring dependency |
+| Ledger model | `ledger/Money`, `Account`, `JournalKind`, `Posting`, `JournalEntry` | Records and enums; the balance invariant is checked in the `JournalEntry` constructor; the `quoteHold`, `holdReversal` and `settlement` factories are the completion shapes; cancellation uses a separately named hold reversal |
+| Ledger storage | `ledger/LedgerRepository` | Insert-only `JdbcClient` access to `fare.journal_entries` and `fare.postings`; reads rebuild entries through the constructor; `lockQuoteHolds` validates a hold under the persistent per-ride state lock |
+| Settlement checks | `processing/QuoteHoldShape`, `processing/SettlementException`, `ledger/CorruptLedgerException` | The shape a hold must have to be settled, and the settlement and cancellation outcomes with the failure class each carries |
 | Idempotency record | `processing/ProcessedEvent`, `ProcessedEventRepository`, `ProcessedEventRecorder` | `insert ... on conflict (event_id) do nothing`, then by type the quote and hold or the reversal and settlement, in one transaction |
-| Consumer loop | `consumer/RideEventConsumer` | `XGROUP CREATE ... 0 MKSTREAM` on both streams at start, then on one dedicated thread and connection: `XAUTOCLAIM` per stream every `reclaim-interval`, one `XREADGROUP ... STREAMS s1 s2 > >`, `XACK` after commit or after a confirmed dead letter |
+| Consumer loop | `consumer/RideEventConsumer` | `XGROUP CREATE ... 0 MKSTREAM` on all three ride streams at start, then on one dedicated thread and connection: `XAUTOCLAIM` per stream every `reclaim-interval`, one `XREADGROUP ... STREAMS s1 s2 s3 > > >`, `XACK` after commit or after a confirmed dead letter |
 | Failure classes | `consumer/FailureClass`, `consumer/ClassifiedFailure` | Pure mapping from the exception `handle()` saw to `RETRYABLE`, `POISON`, `QUARANTINE` or `FATAL`; an exception that implements `ClassifiedFailure` names its own class and dead-letter reason |
 | Failure handling | `consumer/FailureHandler`, `consumer/ConsumerHalt` | Leaves the entry pending, dead-letters it, or halts the consumer; owns the one `XACK` in the service; the halt fails `/readyz` |
 | Entry age | `consumer/StreamEntryAge` | Age of an entry from the millisecond timestamp in its stream ID; logged, never decided on |
@@ -32,19 +32,19 @@ pending-entry recovery". Nothing consumes `events.ride.fares` yet; see "Publicat
 | Outbox storage | `outbox/OutboxRepository` | The statements of `shared/pkg/outbox` against `fare.event_outbox`: `enqueue` in the settlement's transaction, then the relay's take-batch, mark-published and mark-failed |
 | Outbox relay | `outbox/OutboxRelay`, `outbox/RetryBackoff`, `outbox/OutboxProperties` | Own thread and connection; every `poll-interval` one batch under `for update skip locked`, `XADD` each row, record success or a capped exponential retry; at-least-once, like the Go relays |
 | Published contract | `events/FareSettled` | Field-for-field match with `events.FareSettled` in `events.go`; amounts as strings |
-| Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql`, `V3__one_hold_and_one_settlement_per_ride.sql`, `V4__event_outbox.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables, the V3 per-ride unique indexes and the outbox table are checked by the integration tests |
+| Schema | `db/migration/V1__processed_events.sql`, `V2__ledger.sql`, `V3__one_hold_and_one_settlement_per_ride.sql`, `V4__event_outbox.sql`, `V5__quote_context.sql`, `V6__cancellation_state.sql` | Flyway owns the `fare` schema; Hibernate validates the `processed_events` mapping, the ledger tables, the V3 per-ride unique indexes and the outbox table are checked by the integration tests |
 | Endpoints | `web/HealthController`, `web/MetricsController`, `web/LedgerController` | `/healthz`, `/readyz`, `/metrics` with the same paths and JSON as `shared/pkg/httpx/httpx.go`; `GET /v1/rides/{ride_id}/ledger` |
 
 ### Processing rule
 
-For each stream entry, from either stream (the type decides, never the stream it came on):
+For each stream entry, from any configured ride stream (the type decides, never the stream it came on):
 
 1. Decode the `event` field into an `Envelope`.
 2. In one transaction:
    1. insert `(event_id, stream, event_type, processed_at)` into `fare.processed_events`
       with `ON CONFLICT DO NOTHING`; if nothing was inserted the envelope is a duplicate and
       the transaction ends here;
-   2. if the type is `ride_assigned`, decode the payload, compute the quote, and append a
+   2. if the type is `ride_assigned`, decode the payload, lock the persistent ride state, validate passenger route inputs, save quote context, and append a
       `quote_hold` journal entry with two postings;
    3. if the type is `ride_completed`, decode the payload, lock the ride's `quote_hold`
       (`select ... for update`), check that there is exactly one (two cannot exist since V3;
@@ -52,7 +52,8 @@ For each stream entry, from either stream (the type decides, never the stream it
       has no `settlement` yet, append a `hold_reversal` and a `settlement`, both with this
       event's ID as `source_event_id` (see "Settlement"), and insert one `fare_settled` row for
       `events.ride.fares` into `fare.event_outbox` (see "Publication");
-   4. any other type is only recorded.
+   4. if the type is `ride_cancelled`, lock its persistent ride state, reverse an existing hold without settlement, and retain a cancellation tombstone;
+   5. any other type is only recorded.
 3. After the transaction commits, `XACK` the entry. The outbox relay publishes the row on its
    next pass.
 
@@ -211,8 +212,8 @@ the same entry and halts again. The steps, in order:
 
 What is true after this:
 
-- fare-service reclaims its own pending entries and dead-letters what it gives up on. The Go
-  consumers still read only `>` and do not claim pending entries.
+- fare-service and the Go stream consumers reclaim eligible pending entries and dead-letter
+  malformed or exhausted deliveries before acknowledging them.
 - Nothing consumes `events.dead_letter`. The stream is the record; replay is manual.
 - A dead letter can appear twice for one entry; see above.
 - A second instance of this service can claim an entry its owner has not reached yet: Redis
@@ -222,27 +223,24 @@ What is true after this:
   `fare.processed_events` serialises the two writers (one records, the other sees a duplicate),
   and a poison entry may then be dead-lettered twice, which is accepted. Within one instance the
   reclaim pass and the read loop are the same thread and cannot overlap.
-- Two instances settling the same ride from two *different* completion events are serialised by
-  the `select ... for update` on the ride's `quote_hold`; the second sees the first's settlement
-  and quarantines its entry as `already_settled`. That lock cannot order a completion against a
-  second, distinct *assignment* for the same ride (the assignment never touches the locked row),
-  so the per-ride unique indexes of V3 do that: the second `quote_hold`, or a second `settlement`
-  that slipped past the check, is refused by the database and the transaction rolls back whole.
-  Together these cover one ride's hold and settlement across instances, and nothing else.
+- Different events for one ride serialize through the persistent `fare.ride_state` row lock,
+  including assignments, completions, and cancellations. The second completion sees completed
+  state and is quarantined; a cancellation tombstone blocks a late hold. Per-ride unique indexes
+  remain a database backstop.
 
 ### Fare and ledger
 
 The quote is
 
 ```
-quote = base_fare + per_km * distance_km + per_minute * eta_seconds / 60
+quote = base_fare + per_km * trip_distance_km + per_minute * trip_duration_seconds / 60
 ```
 
 computed exactly in `BigDecimal` and rounded to cents once, half up, inside `Money`. No other
 class rounds. With the default rate card (2.50 + 1.20/km + 0.30/min) the assignment
-`distance_km=1.8612, eta_seconds=223` quotes 5.85.
+`trip_distance_km=1.8612, trip_duration_seconds=223` quotes 5.85.
 
-Each `ride_assigned` produces one journal entry of kind `quote_hold` with two postings, debit
+Each valid version 2 `ride_assigned` without an earlier cancellation produces one journal entry of kind `quote_hold` with two postings, debit
 positive and credit negative:
 
 | Account | Amount |
@@ -259,7 +257,7 @@ never an update or delete.
 Each first-seen `ride_completed` produces two journal entries in the same transaction, both with
 the completion event's ID as `source_event_id`. The amount settled, `X`, is the debit on
 `rider_receivable` in the ride's `quote_hold`: settlement is by quote, and nothing recomputes a
-fare from what actually happened on the ride. The driver's share `D` is `X` times `driver-share`,
+fare from what actually happened on the ride. The driver's share `D` is `X` times the stored `driver-share`,
 rounded to cents once, half up, by `Money.times`; the platform's share is the remainder
 `X − D`, so the entry balances by construction and rounding can neither create nor lose a cent.
 With `driver-share` 0.80 and the quote above (5.85), `D` is 4.68 and the platform gets 1.17.
@@ -290,27 +288,14 @@ and classifies what it finds (see the failure table): none, retryable; more than
 quarantined as `corrupt_hold`; and, with the lock held, an existing `settlement` on the ride,
 quarantined as `already_settled`.
 
-`V3__one_hold_and_one_settlement_per_ride.sql` adds two partial unique indexes, one `quote_hold`
-and one `settlement` per `ride_id`. They exist because the checks above run inside one
-transaction and cannot see another transaction's uncommitted insert: a completion that has
-locked and read hold A cannot stop a second, distinct `ride_assigned` from inserting hold B for
-the same ride, and without the index both would commit and leave B un-reversed behind a settled
-ride. With it the second hold is refused at insert, the whole transaction (event row included)
-rolls back, and the assignment event is quarantined as `duplicate_hold`; a second settlement that
-slips past the checked path is refused the same way and reported as `already_settled`.
-`LedgerRepository.append` recognises the two indexes by the constraint name in the driver's
-error; any other integrity violation stays what Spring made of it and is fatal. The row lock is
-still what gives the second completion its clean `already_settled` before writing anything; the
-indexes are the backstop for the window the lock cannot close.
+`V3__one_hold_and_one_settlement_per_ride.sql` adds partial unique indexes for one hold and one settlement per ride. V6 adds one cancellation reversal per ride. The recorder first locks `fare.ride_state`, so assignments, completions, and cancellations serialize across instances even when no hold exists. The indexes remain a backstop for writers outside that guarded path. Duplicate holds are quarantined; a conflicting completion is classified as already settled or canceled.
 
 The balance rule (postings of one entry sum to zero, at least one posting, no zero posting) is
 enforced in the `JournalEntry` constructor and nowhere else. There is no database trigger on
 purpose: with a single writer, making the illegal state unrepresentable in the application is
 enough, and a trigger would duplicate the rule in a second language with its own tests. A
 trigger is defense in depth to add when a second writer appears. The per-ride *cardinality* rules
-(one hold, one settlement) are the exception and live in the database since V3, because two
-instances of this service are that second writer and no application check can order their
-inserts. Reads go through the same
+(one hold, one settlement) are the exception and live in the database since V3, as a backstop to the persistent ride-state lock. Reads go through the same
 constructor (the query is a left join, so an entry that lost its postings is not hidden), so a
 row set that no longer balances or has no postings is refused rather than served.
 
@@ -445,8 +430,8 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `base-fare` | `2.50` | Charged on every ride |
-| `per-km` | `1.20` | Per kilometre of `distance_km` |
-| `per-minute` | `0.30` | Per minute of `eta_seconds` |
+| `per-km` | `1.20` | Per kilometer of `trip_distance_km` |
+| `per-minute` | `0.30` | Per minute of `trip_duration_seconds` |
 | `driver-share` | `0.80` | Driver's fraction of a settled fare, between 0 and 1; `driver_payable` is credited `quote × driver-share` rounded once, `platform_revenue` the remainder |
 
 ### Metrics
@@ -680,7 +665,7 @@ start PostgreSQL, watch the reclaim pass record it.
 ```bash
 docker compose stop postgres
 docker compose exec -T redis redis-cli XADD events.ride.assignments '*' event \
-  '{"id":"<new uuid>","type":"ride_assigned","source":"dispatch-service","correlation_id":"<ride uuid>","occurred_at":"2026-09-08T12:00:00Z","payload":{"ride_id":"<ride uuid>","rider_id":"rider-42","driver_id":"driver-2","distance_km":1.8612,"eta_seconds":223,"assignment_id":"<uuid>"}}'
+  '{"id":"<new uuid>","type":"ride_assigned","source":"dispatch-service","correlation_id":"<ride uuid>","occurred_at":"2026-09-08T12:00:00Z","payload":{"ride_id":"<ride uuid>","rider_id":"rider-42","driver_id":"driver-2","schema_version":2,"trip_distance_km":1.8612,"trip_duration_seconds":223,"route_provider":"manual-test-fixture","route_calculated_at":"2026-09-08T12:00:00Z","distance_km":0.1,"eta_seconds":15,"assignment_id":"<uuid>"}}'
 docker compose logs fare-service | grep 'entry left pending'
 docker compose exec -T redis redis-cli XPENDING events.ride.assignments fare-service   # 1
 docker compose start postgres
@@ -692,13 +677,12 @@ curl -s localhost:8087/v1/rides/<ride uuid>/ledger                              
 ## Not in this service yet
 
 - Settlement is by quote only. There is no metering of actual distance or time, no adjustment
-  entry, and no cancellation flow (a `cancelled` ride keeps its hold).
+  entry, or real payment/refund flow. Cancellation reverses an existing hold without a fee.
 - Only `fare_settled` is published; no event marks the hold, and nothing in this repository
   consumes `events.ride.fares`. See "Publication" for what the outbox does not do (no attempt
   ceiling, no outbox dead letter, no deduplication, no process-kill test on the Java side).
-- Multi-instance protection covers exactly one case: two instances settling the same ride. Two
-  instances quoting the same assignment are serialised by the `processed_events` primary key as
-  before; nothing else is coordinated between instances.
+- Per-ride state locks serialize assignment, completion, and cancellation across instances; unrelated rides remain independent.
+
 - No database trigger for the ledger balance rule; see "Fare and ledger" for when to add one.
 - No consumer of `events.dead_letter` and no replay tool: a dead-lettered entry is inspected
   and replayed by hand (the original entry is still in its stream, acknowledged but not deleted).
@@ -706,3 +690,26 @@ curl -s localhost:8087/v1/rides/<ride uuid>/ledger                              
 - No pause while PostgreSQL is unreachable: deliveries keep accumulating during an outage, so
   one longer than the retry window ends with entries in the dead-letter stream.
 - No Helm chart entry. Compose is the only runtime for this service so far.
+
+## Passenger route quotes and cancellation
+
+A fare quote uses the estimated road distance and duration from the passenger's pickup point to the drop-off point. The driver's approach to the pickup is recorded separately and is not used as the passenger-trip distance.
+
+Routing requests use Valhalla's `auto` costing model through a configurable endpoint. The route provider, calculation time, distance, and duration are stored with the assignment. A routing failure leaves the ride unassigned for retry; the service does not substitute a straight-line distance and label it as a road route.
+
+Fare-service stores the resulting quote and pricing inputs when it creates the hold. Completion settles that stored quote, so a later route or rate change does not reprice an existing hold. These are upfront route-based estimates using configurable demonstration rates. The application does not measure the passenger's actual driven path, apply live traffic pricing, or collect payments.
+The default driver share is 0.80. The quote, rate version, and driver share are fixed when the hold is created. Money is represented with decimal arithmetic and rounded to cents at the documented calculation boundaries.
+
+### Cancel a ride
+
+`POST /v1/rides/{ride_id}/cancel`
+
+A requested or assigned ride can be canceled. A successful transition returns `202` with `ride_id`, `status: "cancelled"`, and the cancellation event's `event_id`. An unknown ride returns `404`; a completed or already canceled ride returns `409`.
+
+Cancellation releases any active driver reservation. If fare-service is enabled, it releases an existing quote hold without creating a settlement or cancellation fee. A cancellation received before the assignment event is recorded so that a late assignment cannot create a new hold for the canceled ride. Ledger changes and event deduplication commit together.
+
+Completion remains `POST /v1/rides/{ride_id}/complete` and requires an assigned ride. Completion and cancellation compete for the same guarded state transition; at most one succeeds.
+
+V5 stores `fare.quote_context` with `pricing_version: passenger-road-v2`, passenger route inputs, provider/time, rate card, and driver share. V6 adds `fare.ride_state` to serialize all three event types, and `cancellation_reversal` for free cancellation. Quote context is insert-only. A cancellation tombstone can exist before any hold; an assignment delivered later is recorded without creating a hold. Completed rides cannot be canceled in the ledger.
+
+Legacy holds keep their stored amount and use the configured driver share at settlement because no historical split was recorded. Version 2 holds always use the split stored with their quote. Legacy assignment events without a hold cannot create one from approach-only data; they are quarantined/dead-lettered as invalid quote input. See [routing and migration](../../docs/routing.md).

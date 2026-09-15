@@ -23,16 +23,17 @@ layers.
 8. Start the stack with `docker compose up -d`.
 9. Run `bash scripts/smoke-test.sh`.
 10. Run integration tests without the Go test cache using `go test -race -count=1 -tags=integration ./tests/integration`.
-11. Stop Redis, accept a ride durably, restart Redis, and verify automatic outbox recovery.
-12. Stop Redis, accept a ride durably, kill `rider-service` with SIGKILL while its
+11. Restart dispatch around an abandoned delivery and an already-assigned replay; verify recovery without a duplicate assignment or reservation.
+12. Stop Redis, accept a ride durably, restart Redis, and verify automatic outbox recovery.
+13. Stop Redis, accept a ride durably, kill `rider-service` with SIGKILL while its
     outbox row is unpublished, restart both, and verify the restarted relay
     publishes the row exactly once and dispatch assigns the ride.
-13. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
-14. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
+14. Stop `routing-service` and run `bash scripts/failure-integration-test.sh`.
+15. Verify retry exhaustion, the real Redis dead-letter entry, and unchanged
     PostgreSQL ride state.
-15. Print focused service and dependency logs if an outage test fails, plus
+16. Print focused service and dependency logs if an outage test fails, plus
     full Compose logs for any CI failure.
-16. Shut down the stack with `docker compose down -v`, even when an earlier
+17. Shut down the stack with `docker compose down -v`, even when an earlier
     step fails.
 
 Nothing is published and nothing is deployed unless this job passes.
@@ -84,17 +85,15 @@ delivery run is never interrupted mid-publish.
 go test -race ./...
 ```
 
-This command compiles all 15 Go packages and runs 38 untagged unit tests across nine packages under the Go race detector. They cover event-envelope encoding and decoding, configuration defaults and overrides, common HTTP and readiness behavior, retry and timeout helpers, the dispatch-to-routing request contract and failure paths, the API algorithm label, nearest-driver correctness, retry-delay capping, the rider service's PostgreSQL-only readiness contract, completion-rejection response mapping, the snake_case field names of the `ride_completed` and `fare_settled` events, and the routing and notification consume loops returning once their context is cancelled. The tests do not require Docker Compose or external services.
-
-The race detector is a guard for future concurrent code, not evidence about the current system: the only goroutines in the unit tests are the two consume-loop cancellation tests, which run a loop against an unreachable Redis until its context is cancelled, and there is no `t.Parallel`, so it is expected to report nothing. In the integration run it instruments the in-process relay used by the relay-progress test and the pgx and go-redis client internals, while the six services under test run uninstrumented in their containers. It therefore says nothing about relay or consumer concurrency in the running services.
-
-Seven packages still have no unit-test files: the analytics, driver, notification, and traffic service entry points, plus the Kafka, logging, and metrics helpers. The repository therefore makes no comprehensive unit-coverage claim.
-
-The routing benchmark is opt-in so ordinary test runs remain fast:
+This command compiles the Go packages and runs untagged tests under the race detector. Test output is the source of truth for counts. HTTP/event contracts, routing responses, candidate selection, timeouts, and cancellation of consumer loops are covered. Set `TEST_REDIS_ADDR` and `TEST_POSTGRES_DSN` to enable the additional tests against real dependencies:
 
 ```bash
-go test -run '^$' -bench BenchmarkSelectNearestDriver10000 -benchmem ./services/routing-service/cmd
+TEST_REDIS_ADDR=localhost:6379 \
+TEST_POSTGRES_DSN='postgres://metroride:metroride@localhost:5432/metroride?sslmode=disable' \
+go test -race ./shared/pkg/reliability ./services/routing-service/cmd
 ```
+
+Those checks cover pending recovery, delivery caps, failed dead-letter publication, shared route caching, and persistent driver state. The race detector instruments test processes; separately built service containers are not instrumented. Packages without test files are shown by Go's output; no comprehensive coverage percentage is claimed.
 
 ### Smoke Test
 
@@ -191,7 +190,7 @@ The script proves that a ride request committed to PostgreSQL survives a `SIGKIL
 
 Stopping Redis first makes the kill window deterministic instead of racing a relay that polls every 250 ms. Redis is stopped rather than removed because the dispatch consumer group lives in Redis and is only recreated at dispatch-service startup, and `dispatch-service` keeps running throughout because it exits at startup when Redis is unreachable. The recovery wait is bounded by `PROCESS_KILL_RECOVERY_TIMEOUT_SECONDS` (default 90): failed rows are rescheduled with a backoff capped at 30 seconds, and the row fails a few times while Redis is stopped, so publication after restart can legitimately lag by up to about 30 seconds.
 
-This covers one relay crash window: termination after the PostgreSQL commit and before any publication. The other window, termination after Redis has accepted the event but before the transaction recording `published_at` commits, is the one that produces the documented at-least-once duplicate and is not tested. A `dispatch-service` restart while a consumed request is still unacknowledged is not tested either: consumers read with `>` and never reclaim pending entries, so that entry would stay pending by design (see [reliability.md](reliability.md)).
+This covers one relay crash window: termination after the PostgreSQL commit and before any publication. The other window, termination after Redis has accepted the event but before the transaction recording `published_at` commits, is the one that produces the documented at-least-once duplicate and is not tested. The shared Go consumer separately tests restart after an effect but before acknowledgment and reclaims the pending delivery; service-level state guards and full-stack tests cover assignment idempotency (see [reliability.md](reliability.md)).
 
 ### Ride-to-Fare-Settlement Flow
 
@@ -282,13 +281,31 @@ If local ports are unavailable, stop the conflicting process or adjust the Compo
 
 ## Current Coverage Boundary
 
-The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, preservation of unassigned PostgreSQL state, and one ride settled end to end through the Java fare-service (hold, reversal, settlement, `fare_settled` and its outbox row, refused second completion). It does not claim to cover PostgreSQL outages, a relay crash after Redis has accepted an event but before `published_at` is recorded (the at-least-once duplicate window), a `dispatch-service` restart while a consumed request is still unacknowledged, abandoned Redis pending-entry claiming, dead-letter replay, or every malformed event.
+The automated suite covers the happy path, duplicate-event idempotency, Redis outage and recovery, a `SIGKILL` of `rider-service` between the PostgreSQL commit and Redis publication, outbox progress across full batches of poison rows, routing outage, retry exhaustion, dead-letter publication, preservation of unassigned PostgreSQL state, dispatch restart with an abandoned pending delivery and an already-assigned replay, cancellation and driver release, and one ride settled end to end through the Java fare-service (hold, reversal, settlement, `fare_settled` and its outbox row, refused second completion). It does not claim to cover PostgreSQL outages, a relay crash after Redis has accepted an event but before `published_at` is recorded (the at-least-once duplicate window), dead-letter replay, or every malformed event.
 
 ## Future Testing Improvements
 
-- Add focused tests for the seven remaining packages where their behavior warrants isolation.
+- Add focused tests for remaining packages where their behavior warrants isolation.
 - Add dead-letter replay tests.
-- Add stream lag assertions and pending-entry claiming tests.
+- Add stream lag assertions under sustained load.
 - Add Redis-backed publish/consume contract tests for event envelopes.
 - Add GitHub Actions matrix testing across Go versions.
 - Add Kubernetes failure-path validation (dependency outage inside the cluster).
+
+## Deterministic routing and new lifecycle checks
+
+Backend CI sets `COMPOSE_FILE=docker-compose.yml:tests/routingfixture/compose.yml`. The explicit overlay supplies a local Valhalla contract fixture and short test-only recovery settings. Export the same value before running the smoke and outage scripts locally; keep it set for teardown so the fixture is included. The isolated fare script and KinD profile also select the fixture explicitly. These tests establish integration behavior, not live route accuracy or public-provider availability.
+
+Fare-service's `RouteAndCancellationIT` checks passenger-route pricing, immutable quote/rate/share context, cancellation before assignment, duplicate cancellation, invalid legacy inputs, and a completion/cancellation race against PostgreSQL. Route tests retain separate driver-approach and passenger-trip values so confusing those inputs causes a failure.
+
+Smoke tests cancel their own rides after assertions so their driver reservations do not exhaust the four simulated drivers. The KinD smoke retains the ride for its SQL assertions and cancels it during cleanup.
+
+### Dispatch restart with an unacknowledged request
+
+On the disposable fixture stack, run the following with its exact Compose project name:
+
+```bash
+PENDING_RECOVERY_PROJECT=metroride-ci go test -race -count=1 -tags=pendingintegration ./tests/pendingintegration
+```
+
+The test stops that project's dispatch service, delivers an actual outbox event to an abandoned consumer, restarts dispatch, and waits for assignment and acknowledgment. It then repeats the restart with a replay of the same event after the assignment has committed, requiring exactly one assignment and one reservation. The test deliberately creates the pending delivery; it does not claim to interrupt the process at a precisely timed instruction. It restores dispatch and cancels its ride on exit. Backend CI uses the explicit project name `metroride-ci`.

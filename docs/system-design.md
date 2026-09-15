@@ -21,7 +21,7 @@ MetroRide models this workflow with six default core Go application services, Re
 ## Non-Goals
 
 - Full consumer mobile application or frontend experience.
-- Real maps, geocoding, payments, identity, or pricing.
+- A map frontend, geocoding, payment collection, identity, or commercial fare policies.
 - Globally distributed production deployment.
 - Exactly-once distributed transactions across PostgreSQL and Redis.
 - Production-grade route optimization or ML ETA prediction.
@@ -111,7 +111,7 @@ MetroRide includes production-oriented reliability controls:
 
 ## Idempotency Design
 
-Duplicate logical ride requests can occur, and multiple dispatch workers can race on the same ride. `dispatch-service` checks persisted ride state before routing and also guards the update with `status = 'requested'`, so only one worker can create the assignment state transition. The current stream reader does not reclaim abandoned pending entries after a consumer crash; pending recovery is a separate missing capability.
+Duplicate logical ride requests can occur, and multiple dispatch workers can race on the same ride. `dispatch-service` checks persisted ride state before routing and also guards the update with `status = 'requested'`, so only one worker can create the assignment state transition. The Go stream reader reclaims abandoned pending entries with a retained `XAUTOCLAIM` cursor; guarded state transitions prevent a duplicate assignment.
 
 ## Dead-Letter Stream Design
 
@@ -146,8 +146,8 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 
 ## Scalability Considerations
 
-- Redis consumer groups can divide new dispatch messages across multiple workers; production use still needs pending-entry recovery and load testing.
-- `routing-service` needs shared or explicitly partitioned driver state before multiple replicas can return a coherent view.
+- Redis consumer groups can divide new dispatch messages across multiple workers; eligible pending messages are reclaimed, while production capacity still needs load testing.
+- `routing-service` shares driver positions and reservations through PostgreSQL; regional partitioning remains future work.
 - Driver location processing can be partitioned by region or geohash.
 - PostgreSQL can be indexed and eventually partitioned by time or region.
 - Redis Streams can be replaced by Kafka for stronger partitioning, retention, and high-throughput fanout.
@@ -157,7 +157,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 - Redis Streams are simple and local-friendly, but Kafka would be more appropriate for very high event volume.
 - The dispatch-to-routing call is synchronous, which keeps assignment simple but adds routing availability to the critical path.
 - Outbox delivery is at-least-once, so consumers must remain idempotent when a relay repeats a stable event ID.
-- Routing state is in memory, which is acceptable for the simulation but would need partitioning or a shared location store at scale.
+- Routing reads shared PostgreSQL state; database latency and public route-provider limits constrain throughput.
 - The system prioritizes clear architecture and operational hooks over full domain completeness.
 
 ## Future Improvements
@@ -170,3 +170,20 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 - Add Kubernetes autoscaling based on stream lag and latency.
 - Partition drivers and rides by region.
 - Introduce ML-assisted ETA prediction and demand forecasting.
+
+## Passenger routes and shared driver state
+
+A fare quote uses the estimated road distance and duration from the passenger's pickup point to the drop-off point. The driver's approach to the pickup is recorded separately and is not used as the passenger-trip distance.
+
+Routing requests use Valhalla's `auto` costing model through a configurable endpoint. The route provider, calculation time, distance, and duration are stored with the assignment. A routing failure leaves the ride unassigned for retry; the service does not substitute a straight-line distance and label it as a road route.
+
+Fare-service stores the resulting quote and pricing inputs when it creates the hold. Completion settles that stored quote, so a later route or rate change does not reprice an existing hold. These are upfront route-based estimates using configurable demonstration rates. The application does not measure the passenger's actual driven path, apply live traffic pricing, or collect payments.
+The default driver share is 0.80. The quote, rate version, and driver share are fixed when the hold is created. Money is represented with decimal arithmetic and rounded to cents at the documented calculation boundaries.
+
+Driver locations and active reservations are shared through PostgreSQL. A location update can refresh a driver's position without clearing an active reservation. Stale location reports are excluded from selection, and an older event cannot overwrite a newer position.
+
+Dispatch considers available drivers with recent locations. It ranks a bounded shortlist using estimated road travel time to the pickup; the shortlist is not a global optimization across every driver. The assignment, exclusive driver reservation, ride state change, and outgoing events commit in one database transaction. If another ride reserves the candidate first, dispatch retries selection.
+
+Completing or canceling an assigned ride releases its driver in the same transaction as the ride state change and outgoing event. Conditional state changes prevent completion and cancellation from both succeeding for the same ride. A delayed duplicate request cannot reserve a driver again for an ended ride.
+
+See [routing](routing.md), [reliability](reliability.md), and [fare-service](../services/fare-service/README.md) for versioned events, cancellation, and migrations.
