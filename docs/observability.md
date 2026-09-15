@@ -107,3 +107,11 @@ Recommended production alerts:
 - Add a dead-letter counter. `metroride_assignment_failures_total` counts messages that exhausted their assignment retries and is incremented before the dead-letter publish is attempted, so the `events.dead_letter` stream is the only record of what was actually dead-lettered.
 - Add RED metrics for every REST endpoint: rate, errors, duration.
 - Add resource dashboards for CPU, memory, goroutines, and database pool utilization.
+
+## Recovery and optional targets
+
+The Go consumer counters `metroride_stream_deliveries_total{stream,path}` and `metroride_stream_processing_failures_total{stream}` separate new and reclaimed deliveries from failed processing attempts. Labels use fixed stream names, with no ride IDs or coordinates. See [recovery behavior](reliability.md#consumer-recovery) when interpreting retries.
+
+Prometheus includes traffic-service in its core targets. Fare and analytics targets appear down when their optional profiles are disabled. Notification counters measure processing attempts and can increase again on redelivery.
+
+The routing helper benchmark excludes database and provider latency; use the [performance notes](performance.md) for its scope. Deployment-check coverage is documented in [CI/CD](cicd.md).

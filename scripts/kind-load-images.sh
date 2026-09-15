@@ -22,9 +22,11 @@ source "${REPO_ROOT}/scripts/lib/images.sh"
 source "${REPO_ROOT}/scripts/lib/kind.sh"
 
 metroride_require_valid_image_source
-mapfile -t VALUE_ARGS < <(metroride_helm_value_args)
+VALUE_ARGS=()
+while IFS= read -r value; do VALUE_ARGS+=("${value}"); done < <(metroride_helm_value_args)
 
-mapfile -t IMAGES < <(
+IMAGES=()
+while IFS= read -r value; do IMAGES+=("${value}"); done < <(
   helm template "${HELM_RELEASE}" "${HELM_CHART}" "${VALUE_ARGS[@]}" \
     | grep -oE '^[[:space:]]*image:[[:space:]]*"?[^"[:space:]]+"?' \
     | sed -E 's/.*image:[[:space:]]*//; s/"//g' \
@@ -35,6 +37,8 @@ if [[ ${#IMAGES[@]} -eq 0 ]]; then
   echo "failed: rendered manifests contain no images" >&2
   exit 1
 fi
+
+docker build -f tests/routingfixture/Dockerfile -t metroride-route-fixture:validation .
 
 SERVICE_IMAGE_PREFIX="$(metroride_image_repository "")"
 

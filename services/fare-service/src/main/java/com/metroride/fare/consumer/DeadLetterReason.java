@@ -19,7 +19,8 @@ public enum DeadLetterReason {
     /** {@link FailureClass#QUARANTINE}: the ride's {@code quote_hold} rows do not form the entry the service writes. */
     CORRUPT_HOLD("corrupt_hold"),
     /** {@link FailureClass#QUARANTINE}: the ride already has a {@code settlement} from another event. */
-    ALREADY_SETTLED("already_settled");
+    ALREADY_SETTLED("already_settled"),
+    CANCELLED_RIDE("cancelled_ride");
 
     private final String label;
 

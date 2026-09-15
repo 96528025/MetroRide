@@ -81,6 +81,7 @@ metroride:
     streams:
       - events.ride.assignments
       - events.ride.completions
+      - events.ride.cancellations
     batch-size: 10         # COUNT for XREADGROUP and for XAUTOCLAIM
     block-timeout: 1s      # must stay below spring.data.redis.timeout
     error-backoff: 1s

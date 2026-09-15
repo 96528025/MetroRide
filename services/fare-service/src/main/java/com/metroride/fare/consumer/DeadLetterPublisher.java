@@ -9,6 +9,7 @@ import com.metroride.fare.events.EnvelopeCodec;
 import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.events.RideAssigned;
 import com.metroride.fare.events.RideCompleted;
+import com.metroride.fare.events.RideCancelled;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.StreamMessage;
 import io.lettuce.core.api.sync.RedisCommands;
@@ -125,6 +126,8 @@ public class DeadLetterPublisher {
         try {
             if (Envelope.TYPE_RIDE_ASSIGNED.equals(original.type())) {
                 fromPayload = codec.decodePayload(original, RideAssigned.class).rideId();
+            } else if (Envelope.TYPE_RIDE_CANCELLED.equals(original.type())) {
+                fromPayload = codec.decodePayload(original, RideCancelled.class).rideId();
             } else if (Envelope.TYPE_RIDE_COMPLETED.equals(original.type())) {
                 fromPayload = codec.decodePayload(original, RideCompleted.class).rideId();
             }

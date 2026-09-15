@@ -62,6 +62,9 @@ restore_services() {
   # Both names are explicit: rider-service's depends_on lists only postgres, so
   # `up -d rider-service` alone would leave Redis stopped.
   docker compose up -d redis rider-service >/dev/null || true
+  if [[ -n "${ride_id:-}" ]]; then
+    curl -sS --max-time 5 -X POST "http://${BASE_HOST}:8080/v1/rides/${ride_id}/cancel" >/dev/null || true
+  fi
   exit "${test_status}"
 }
 
@@ -171,5 +174,6 @@ if [[ "${published_entries}" != "1" ]]; then
 fi
 echo "ok: event ${event_id} was published exactly once"
 
+curl -fsS --max-time 5 -X POST "http://${BASE_HOST}:8080/v1/rides/${ride_id}/cancel" >/dev/null
 trap - EXIT
 echo "ok: process kill after commit lost nothing; the restarted relay delivered the event and the ride was assigned"

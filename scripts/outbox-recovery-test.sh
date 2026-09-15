@@ -18,6 +18,9 @@ restore_redis() {
     rm -f "${response_file}"
   fi
   docker compose up -d redis >/dev/null || true
+  if [[ -n "${ride_id:-}" ]]; then
+    curl -sS --max-time 5 -X POST "http://${BASE_HOST}:8080/v1/rides/${ride_id}/cancel" >/dev/null || true
+  fi
   exit "${test_status}"
 }
 
@@ -90,5 +93,6 @@ while true; do
   sleep 1
 done
 
+curl -fsS --max-time 5 -X POST "http://${BASE_HOST}:8080/v1/rides/${ride_id}/cancel" >/dev/null
 trap - EXIT
 echo "ok: Redis recovery relayed every event and assigned the ride without client retry"

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/google/uuid"
 	"os"
 	"strconv"
 	"time"
@@ -25,7 +26,7 @@ func Load(serviceName, defaultAddr string) Config {
 		RedisAddr:         getenv("REDIS_ADDR", "localhost:6379"),
 		RoutingServiceURL: getenv("ROUTING_SERVICE_URL", "http://localhost:8083"),
 		ConsumerGroup:     getenv("CONSUMER_GROUP", serviceName),
-		ConsumerName:      getenv("CONSUMER_NAME", serviceName+"-1"),
+		ConsumerName:      getenv("CONSUMER_NAME", serviceName+"-"+uuid.NewString()),
 		ShutdownTimeout:   time.Duration(getenvInt("SHUTDOWN_TIMEOUT_SECONDS", 10)) * time.Second,
 	}
 }
@@ -64,4 +65,14 @@ func serviceEnv(serviceName, suffix string) string {
 	out = append(out, '_')
 	out = append(out, suffix...)
 	return string(out)
+}
+
+// DriverMaxAge is shared by candidate selection and reservation validation.
+func DriverMaxAge() time.Duration {
+	raw := getenv("DRIVER_LOCATION_MAX_AGE_SECONDS", "15")
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		panic("invalid DRIVER_LOCATION_MAX_AGE_SECONDS")
+	}
+	return time.Duration(n) * time.Second
 }

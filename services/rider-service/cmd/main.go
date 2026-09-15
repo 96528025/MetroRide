@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,11 +38,11 @@ var (
 )
 
 type createRideRequest struct {
-	RiderID    string  `json:"rider_id"`
-	PickupLat  float64 `json:"pickup_lat"`
-	PickupLng  float64 `json:"pickup_lng"`
-	DropoffLat float64 `json:"dropoff_lat"`
-	DropoffLng float64 `json:"dropoff_lng"`
+	RiderID    string   `json:"rider_id"`
+	PickupLat  *float64 `json:"pickup_lat"`
+	PickupLng  *float64 `json:"pickup_lng"`
+	DropoffLat *float64 `json:"dropoff_lat"`
+	DropoffLng *float64 `json:"dropoff_lng"`
 }
 
 type service struct {
@@ -92,6 +93,7 @@ func main() {
 	mux.HandleFunc("POST /v1/rides", svc.createRide)
 	mux.HandleFunc("GET /v1/rides/{ride_id}", svc.getRide)
 	mux.HandleFunc("POST /v1/rides/{ride_id}/complete", svc.completeRide)
+	mux.HandleFunc("POST /v1/rides/{ride_id}/cancel", svc.cancelRide)
 
 	server := httpx.NewServer(cfg.HTTPAddr, mux)
 	go func() {
@@ -122,15 +124,23 @@ func (s *service) createRide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	valid := func(lat, lon *float64) bool {
+		return lat != nil && lon != nil && !math.IsNaN(*lat) && !math.IsNaN(*lon) && *lat >= -90 && *lat <= 90 && *lon >= -180 && *lon <= 180
+	}
+	if !valid(req.PickupLat, req.PickupLng) || !valid(req.DropoffLat, req.DropoffLng) {
+		httpx.RespondJSON(w, http.StatusBadRequest, map[string]string{"error": "valid pickup and dropoff coordinates are required"})
+		return
+	}
+
 	now := time.Now().UTC()
 	rideID := uuid.NewString()
 	payload := events.RideRequested{
 		RideID:      rideID,
 		RiderID:     req.RiderID,
-		PickupLat:   req.PickupLat,
-		PickupLng:   req.PickupLng,
-		DropoffLat:  req.DropoffLat,
-		DropoffLng:  req.DropoffLng,
+		PickupLat:   *req.PickupLat,
+		PickupLng:   *req.PickupLng,
+		DropoffLat:  *req.DropoffLat,
+		DropoffLng:  *req.DropoffLng,
 		RequestedAt: now.Format(time.RFC3339Nano),
 	}
 	envelope, err := events.NewEnvelope(uuid.NewString(), events.TypeRideRequested, "rider-service", rideID, payload)
@@ -147,7 +157,11 @@ func (s *service) createRide(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create ride"})
 		return
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() {
+		c, cancel := reliability.WithPostgresTimeout(context.Background())
+		defer cancel()
+		_ = tx.Rollback(c)
+	}()
 	_, err = tx.Exec(dbCtx, `
 		insert into rides (id, rider_id, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, status, created_at, updated_at)
 		values ($1, $2, $3, $4, $5, $6, 'requested', $7, $7)
@@ -223,7 +237,11 @@ func (s *service) completeRide(w http.ResponseWriter, r *http.Request) {
 		s.completionFailed(w, "begin ride completion transaction failed", err, rideID)
 		return
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() {
+		c, cancel := reliability.WithPostgresTimeout(context.Background())
+		defer cancel()
+		_ = tx.Rollback(c)
+	}()
 
 	tag, err := tx.Exec(dbCtx, `
 		update rides set status = 'completed', updated_at = $1
@@ -268,6 +286,10 @@ func (s *service) completeRide(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode event"})
 		return
 	}
+	if _, err := tx.Exec(dbCtx, `delete from driver_reservations where ride_id=$1`, rideID); err != nil {
+		s.completionFailed(w, "release reservation failed", err, rideID)
+		return
+	}
 	if err := outbox.Enqueue(dbCtx, tx, events.StreamRideCompletions, envelope); err != nil {
 		s.completionFailed(w, "enqueue ride completion failed", err, rideID)
 		return
@@ -295,7 +317,7 @@ var errAssignmentStateInconsistent = errors.New("ride assignment state inconsist
 // to surface, not to paper over.
 func (s *service) singleAssignment(ctx context.Context, tx pgx.Tx, rideID string) (assignmentID, riderID, driverID string, err error) {
 	rows, err := tx.Query(ctx, `
-		select a.id, r.rider_id, a.driver_id
+		select a.id, r.rider_id, a.driver_id, r.driver_id
 		from ride_assignments a
 		join rides r on r.id = a.ride_id
 		where a.ride_id = $1
@@ -310,8 +332,12 @@ func (s *service) singleAssignment(ctx context.Context, tx pgx.Tx, rideID string
 		if count > 1 {
 			continue
 		}
-		if err := rows.Scan(&assignmentID, &riderID, &driverID); err != nil {
+		var rideDriver *string
+		if err := rows.Scan(&assignmentID, &riderID, &driverID, &rideDriver); err != nil {
 			return "", "", "", err
+		}
+		if rideDriver == nil || *rideDriver != driverID {
+			return "", "", "", errAssignmentStateInconsistent
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -357,4 +383,72 @@ func waitForShutdown(cfg config.Config, log *slog.Logger, server *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	httpx.Shutdown(ctx, server, log)
+}
+
+func (s *service) cancelRide(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("ride_id")
+	if _, e := uuid.Parse(id); e != nil {
+		httpx.RespondJSON(w, 404, map[string]string{"error": "ride not found"})
+		return
+	}
+	ctx, cancel := reliability.WithPostgresTimeout(r.Context())
+	defer cancel()
+	tx, e := s.db.Begin(ctx)
+	if e != nil {
+		s.cancellationFailed(w, "begin cancellation failed", e, id)
+		return
+	}
+	defer func() {
+		rollback, c := reliability.WithPostgresTimeout(context.Background())
+		defer c()
+		_ = tx.Rollback(rollback)
+	}()
+	var status, rider string
+	var driverID *string
+	e = tx.QueryRow(ctx, `select status,rider_id,driver_id from rides where id=$1 for update`, id).Scan(&status, &rider, &driverID)
+	if e != nil {
+		code, body := completionRejection(status, e)
+		httpx.RespondJSON(w, code, body)
+		return
+	}
+	if status != "requested" && status != "assigned" {
+		httpx.RespondJSON(w, 409, map[string]string{"error": "ride is " + status})
+		return
+	}
+	payload := events.RideCancelled{RideID: id, RiderID: rider, CancelledAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if status == "assigned" {
+		assignmentID, _, driver, e := s.singleAssignment(ctx, tx, id)
+		if e != nil {
+			s.cancellationFailed(w, "inconsistent assignment", e, id)
+			return
+		}
+		payload.AssignmentID = assignmentID
+		payload.DriverID = driver
+	}
+	if _, e = tx.Exec(ctx, `update rides set status='cancelled',updated_at=now() where id=$1`, id); e != nil {
+		s.cancellationFailed(w, "cancel ride failed", e, id)
+		return
+	}
+	if _, e = tx.Exec(ctx, `delete from driver_reservations where ride_id=$1`, id); e != nil {
+		s.cancellationFailed(w, "release reservation failed", e, id)
+		return
+	}
+	env, e := events.NewEnvelope(uuid.NewString(), events.TypeRideCancelled, "rider-service", id, payload)
+	if e == nil {
+		e = outbox.Enqueue(ctx, tx, events.StreamRideCancellations, env)
+	}
+	if e == nil {
+		e = tx.Commit(ctx)
+	}
+	if e != nil {
+		s.cancellationFailed(w, "commit cancellation failed", e, id)
+		return
+	}
+	httpx.RespondJSON(w, 202, map[string]string{"ride_id": id, "status": "cancelled", "event_id": env.ID})
+}
+
+func (s *service) cancellationFailed(w http.ResponseWriter, message string, err error, rideID string) {
+	metrics.DependencyErrors.WithLabelValues("rider-service", "postgres").Inc()
+	s.log.Error(message, "error", err, "ride_id", rideID)
+	httpx.RespondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to cancel ride"})
 }

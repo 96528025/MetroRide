@@ -21,6 +21,9 @@ concurrency:
 jobs:
   backend:
     name: Backend validation
+    env:
+      COMPOSE_FILE: docker-compose.yml:tests/routingfixture/compose.yml
+      COMPOSE_PROJECT_NAME: metroride-ci
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -63,8 +66,17 @@ jobs:
       - name: Run smoke test
         run: bash scripts/smoke-test.sh
 
+      - name: Validate Go pending recovery and route caching
+        run: TEST_REDIS_ADDR=127.0.0.1:6379 TEST_POSTGRES_DSN='postgres://metroride:metroride@localhost:5432/metroride?sslmode=disable' go test -race ./shared/pkg/reliability ./services/routing-service/cmd ./services/dispatch-service/cmd
+
       - name: Run integration tests
         run: go test -race -count=1 -tags=integration ./tests/integration
+
+      - name: Verify dispatch restart and pending replay
+        timeout-minutes: 3
+        env:
+          PENDING_RECOVERY_PROJECT: metroride-ci
+        run: go test -race -count=1 -tags=pendingintegration ./tests/pendingintegration
 
       - name: Run Redis outage transactional outbox recovery test
         id: outbox-recovery
@@ -126,6 +138,40 @@ jobs:
       # the runner's Docker daemon.
       - name: Build and test fare-service
         run: ./mvnw -B --no-transfer-progress verify
+
+  fare-end-to-end:
+    name: Ride-to-fare-settlement flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # Its own job so the Compose stack it starts (core Go services plus the `fare`
+    # profile) is not shared with the backend job's outage tests, which stop Redis and
+    # kill rider-service. The script builds, starts, tests and removes the stack; it
+    # is the same entry point used locally. Nothing downstream depends on this job:
+    # fare-service is still outside the published image set, the Helm chart and KinD.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run the ride-to-fare-settlement flow
+        env:
+          FARE_E2E_PROJECT: fare-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          FARE_E2E_LOG_DIR: ${{ runner.temp }}/fare-e2e-logs
+        run: bash scripts/fare-e2e-test.sh
+
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fare-e2e-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fare-e2e-logs
+          if-no-files-found: ignore
 
   publish-images:
     name: Publish ${{ matrix.service }} to GHCR

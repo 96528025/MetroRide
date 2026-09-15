@@ -37,3 +37,8 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["analytics-service:8086"]
+
+  - job_name: traffic-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["traffic-service:8084"]

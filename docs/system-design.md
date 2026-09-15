@@ -1,6 +1,6 @@
 # MetroRide System Design
 
-MetroRide is a portfolio-scale local distributed-systems project that demonstrates backend infrastructure concepts through a ride dispatch domain. It is not deployed at real production scale; it is designed to show how a distributed backend can be decomposed, instrumented, and hardened for reliability.
+MetroRide is a small-scale local distributed-systems project that demonstrates backend infrastructure concepts through a ride dispatch domain. It is not deployed at real production scale; it is designed to show how a distributed backend can be decomposed, instrumented, and hardened for reliability.
 
 ## Problem Statement
 
@@ -21,45 +21,14 @@ MetroRide models this workflow with six default core Go application services, Re
 ## Non-Goals
 
 - Full consumer mobile application or frontend experience.
-- Real maps, geocoding, payments, identity, or pricing.
+- A map frontend, geocoding, payment collection, identity, or commercial fare policies.
 - Globally distributed production deployment.
 - Exactly-once distributed transactions across PostgreSQL and Redis.
 - Production-grade route optimization or ML ETA prediction.
 
-## High-Level Architecture
+## System Structure
 
-MetroRide uses a service-oriented architecture with asynchronous workflow coordination:
-
-- REST is used at API boundaries and for dispatch-to-routing lookup.
-- Redis Streams are used for durable event flow and consumer-group processing.
-- PostgreSQL stores authoritative ride and assignment state.
-- Prometheus and Grafana provide metrics and dashboards.
-- Docker Compose runs the default core local system. The Helm chart is deployed for real on every CI run, to a throwaway KinD cluster inside the runner that is validated end to end and then deleted; the raw Kubernetes manifests remain a scaffolded deployment direction.
-
-## Service Responsibilities
-
-| Service role | Startup | Responsibility |
-| --- | --- | --- |
-| `rider-service` | Default | Accepts ride requests, atomically stores ride state and a `ride_requested` outbox event, then relays it. |
-| `driver-service` | Default | Simulates driver location and availability updates. |
-| `dispatch-service` | Default | Consumes ride requests, coordinates routing, atomically persists assignments and downstream outbox events, then relays them. |
-| `routing-service` | Default | Maintains driver-location state and computes nearest-driver ETA. |
-| `traffic-service` | Default | Simulates congestion updates for future route weighting. |
-| `notification-service` | Default | Consumes assignment notifications and simulates delivery. |
-| `analytics-service` | Optional `kafka` profile | Consumes Kafka driver telemetry and exposes the latest per-driver analytics view. |
-
-## End-to-End Ride Request Flow
-
-1. A client sends `POST /v1/rides` to `rider-service`.
-2. `rider-service` atomically commits the `requested` ride and a pending `ride_requested` outbox event in PostgreSQL.
-3. Its relay publishes that event to `events.ride.requests` asynchronously.
-4. `dispatch-service` consumes the event through a Redis consumer group.
-5. `dispatch-service` checks PostgreSQL to avoid duplicate assignment.
-6. `dispatch-service` calls `routing-service` for nearest-driver selection.
-7. `routing-service` uses its driver-location view to return driver ID, distance, and ETA.
-8. `dispatch-service` atomically commits the `assigned` state and pending `ride_assigned` and notification outbox events.
-9. Its relay publishes both events asynchronously.
-10. `notification-service` consumes the notification event and logs simulated delivery.
+The [architecture guide](architecture.md) records service ownership and the runtime sequence. This document explains why those boundaries were chosen and what they cost.
 
 ## Why Microservices?
 
@@ -99,55 +68,19 @@ PostgreSQL is the system of record for ride and assignment state. Redis coordina
 
 Prometheus and Grafana are common infrastructure choices for service metrics and dashboards. MetroRide uses them to expose request volume, assignment latency, routing duration, active drivers, dependency errors, and stream consume errors. This makes system behavior inspectable during local development and gives a realistic observability story.
 
-## Reliability Design
+## Routing and Lifecycle Tradeoffs
 
-MetroRide includes production-oriented reliability controls:
+- **Compute routes before reserving.** External HTTP calls can be slow or unavailable. Keeping them outside the assignment transaction limits lock time, at the cost of rechecking the candidate and retrying if another ride takes that driver. See [routing](routing.md).
+- **Store reservations in the database.** A shared unique constraint arbitrates ownership across instances, while database availability and lock contention become part of the dispatch path. The [state guards](reliability.md#state-guards) describe the enforced transitions.
+- **Settle an upfront quote.** Persisting pricing inputs makes completion reproducible after configuration changes, but it cannot account for an unmeasured detour. The [fare guide](../services/fare-service/README.md#quote-context-and-legacy-holds) specifies that policy and its historical-data boundary.
+- **Coordinate through events.** Services can recover independently, but an HTTP response does not mean every consumer has processed the change. A cancellation can reach the ledger before its assignment, so per-ride ordering must be enforced at the consumer; see [cancellation](../services/fare-service/README.md#cancellation).
 
-- `/healthz` confirms each process is alive.
-- `/readyz` checks dependencies such as Redis, PostgreSQL, consumer groups, and routing readiness where applicable.
-- Redis, PostgreSQL, and routing calls use explicit timeouts.
-- Transient dispatch operations use bounded retries.
-- Failed dispatch events are moved to `events.dead_letter`.
-
-## Idempotency Design
-
-Duplicate logical ride requests can occur, and multiple dispatch workers can race on the same ride. `dispatch-service` checks persisted ride state before routing and also guards the update with `status = 'requested'`, so only one worker can create the assignment state transition. The current stream reader does not reclaim abandoned pending entries after a consumer crash; pending recovery is a separate missing capability.
-
-## Dead-Letter Stream Design
-
-If `dispatch-service` cannot process a `ride_requested` event after retries, it publishes a failure record to:
-
-```text
-events.dead_letter
-```
-
-The dead-letter event includes original event type, ride ID, error message, service name, and timestamp. This prevents a poison message from blocking the consumer group indefinitely and gives operators a place to inspect failed work.
-
-## Observability Strategy
-
-Every service exposes:
-
-- `GET /healthz`
-- `GET /readyz`
-- `GET /metrics`
-
-Key metrics include:
-
-- `metroride_ride_requests_total`
-- `metroride_rides_assigned_total`
-- `metroride_dispatch_latency_seconds`
-- `metroride_assignment_failures_total`
-- `metroride_stream_consume_errors_total`
-- `metroride_dependency_errors_total`
-- `metroride_routing_computation_seconds`
-- `metroride_active_drivers`
-
-Structured JSON logs include service names, event types, ride IDs, driver IDs, and errors where relevant.
+Operational failure behavior and observability settings are maintained in [reliability](reliability.md) and [observability](observability.md).
 
 ## Scalability Considerations
 
-- Redis consumer groups can divide new dispatch messages across multiple workers; production use still needs pending-entry recovery and load testing.
-- `routing-service` needs shared or explicitly partitioned driver state before multiple replicas can return a coherent view.
+- Redis consumer groups can divide new dispatch messages across multiple workers; eligible pending messages are reclaimed, while production capacity still needs load testing.
+- `routing-service` shares driver positions and reservations through PostgreSQL; regional partitioning remains future work.
 - Driver location processing can be partitioned by region or geohash.
 - PostgreSQL can be indexed and eventually partitioned by time or region.
 - Redis Streams can be replaced by Kafka for stronger partitioning, retention, and high-throughput fanout.
@@ -157,7 +90,7 @@ Structured JSON logs include service names, event types, ride IDs, driver IDs, a
 - Redis Streams are simple and local-friendly, but Kafka would be more appropriate for very high event volume.
 - The dispatch-to-routing call is synchronous, which keeps assignment simple but adds routing availability to the critical path.
 - Outbox delivery is at-least-once, so consumers must remain idempotent when a relay repeats a stable event ID.
-- Routing state is in memory, which is acceptable for the simulation but would need partitioning or a shared location store at scale.
+- Routing reads shared PostgreSQL state; database latency and public route-provider limits constrain throughput.
 - The system prioritizes clear architecture and operational hooks over full domain completeness.
 
 ## Future Improvements

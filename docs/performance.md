@@ -2,9 +2,9 @@
 
 MetroRide keeps performance claims reproducible and scoped. It does not claim production throughput from a local simulation.
 
-## Nearest-Driver Selection
+## In-process Candidate Scan
 
-Routing needs one minimum-distance driver, not a globally sorted candidate list. `routing-service` therefore scans the in-memory driver map once:
+The shortlist helper finds one minimum-distance driver by scanning the candidate map once. These costs describe one call to that helper:
 
 - Time complexity: `O(n)` for `n` drivers.
 - Additional space: `O(1)`.
@@ -27,3 +27,5 @@ One reference run on Darwin/arm64 with Go 1.22.12 selected from 10,000 simulated
 - Outbox backlog drain rate after a dependency outage.
 - Redis consumer lag as dispatch worker count changes.
 - CPU and memory profiles for routing with region-sized driver sets.
+
+The preserved benchmark measures only the in-memory straight-line candidate scan. Current road-time selection also queries PostgreSQL, takes a shortlist, and calls the configured route provider. These numbers do not measure that path or end-to-end dispatch throughput.

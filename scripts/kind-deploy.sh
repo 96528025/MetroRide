@@ -14,7 +14,8 @@ source "${REPO_ROOT}/scripts/lib/images.sh"
 source "${REPO_ROOT}/scripts/lib/kind.sh"
 
 metroride_require_valid_image_source
-mapfile -t VALUE_ARGS < <(metroride_helm_value_args)
+VALUE_ARGS=()
+while IFS= read -r value; do VALUE_ARGS+=("${value}"); done < <(metroride_helm_value_args)
 
 echo "installing release '${HELM_RELEASE}' (image source: ${IMAGE_SOURCE}, tag: ${IMAGE_TAG})"
 helm upgrade --install "${HELM_RELEASE}" "${HELM_CHART}" \

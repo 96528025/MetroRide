@@ -1,0 +1,18 @@
+# Explicit deterministic test mode. Omit this overlay to use the configured road provider.
+services:
+  route-fixture:
+    build:
+      context: .
+      dockerfile: tests/routingfixture/Dockerfile
+  routing-service:
+    environment:
+      VALHALLA_BASE_URL: http://route-fixture:8090
+    depends_on:
+      route-fixture:
+        condition: service_started
+  dispatch-service:
+    environment:
+      STREAM_PROCESS_TIMEOUT_SECONDS: "10"
+      STREAM_MIN_IDLE_SECONDS: "11"
+      STREAM_RECLAIM_INTERVAL_SECONDS: "1"
+      STREAM_MAX_DELIVERIES: "3"

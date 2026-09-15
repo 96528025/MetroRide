@@ -29,6 +29,7 @@ config:
   redisAddr: redis:6379
   postgresDsn: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
   routingServiceUrl: http://routing-service:8083
+  valhallaBaseUrl: https://valhalla1.openstreetmap.de
 
 # Sized for a single-node KinD cluster on a GitHub-hosted runner. The Go
 # services are small static binaries; the limits exist to keep one misbehaving
@@ -135,7 +136,7 @@ services:
   routing-service:
     port: 8083
     replicas: 2
-    dependsOn: [redis]
+    dependsOn: [postgres, redis]
   traffic-service:
     port: 8084
     replicas: 1
@@ -144,3 +145,8 @@ services:
     port: 8085
     replicas: 1
     dependsOn: [redis]
+
+# Built locally only for deterministic deployment validation.
+routingFixture:
+  enabled: false
+  image: metroride-route-fixture:validation

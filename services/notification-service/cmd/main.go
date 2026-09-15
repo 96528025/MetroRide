@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/google/uuid"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/metroride/metroride/shared/pkg/config"
 	"github.com/metroride/metroride/shared/pkg/events"
@@ -23,6 +23,7 @@ type notificationService struct {
 	cfg       config.Config
 	rdb       *redis.Client
 	processed atomic.Uint64
+	options   reliability.StreamOptions
 }
 
 func main() {
@@ -37,7 +38,7 @@ func main() {
 	})
 	defer func() { _ = rdb.Close() }()
 
-	svc := &notificationService{cfg: cfg, rdb: rdb}
+	svc := &notificationService{cfg: cfg, rdb: rdb, options: reliability.StreamOptionsFromEnv()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go svc.consume(ctx, log)
@@ -71,65 +72,40 @@ func (s *notificationService) consume(ctx context.Context, log interface {
 	Info(string, ...any)
 	Error(string, ...any)
 }) {
-	group := s.cfg.ConsumerGroup
-	consumer := s.cfg.ConsumerName
-	initCtx, initCancel := reliability.WithRedisTimeout(ctx)
-	err := ensureGroup(initCtx, s.rdb, events.StreamRideNotifications, group)
-	initCancel()
-	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-		log.Error("notification consumer group failed", "error", err)
+	cfg := s.cfg
+	if cfg.ConsumerGroup == "" {
+		cfg = config.Load("notification-service", ":8085")
 	}
-	for {
-		// Without this check a cancelled context makes every read fail at once
-		// with context.Canceled, and the loop spins until the process exits.
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		readCtx, readCancel := reliability.WithRedisTimeout(ctx)
-		result, err := s.rdb.XReadGroup(readCtx, &redis.XReadGroupArgs{
-			Group:    group,
-			Consumer: consumer,
-			Streams:  []string{events.StreamRideNotifications, ">"},
-			Count:    10,
-			Block:    time.Second,
-		}).Result()
-		readCancel()
-		if err != nil {
-			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
-				continue
-			}
-			metrics.StreamConsumeErrors.WithLabelValues("notification-service", events.StreamRideNotifications).Inc()
-			metrics.DependencyErrors.WithLabelValues("notification-service", "redis").Inc()
-			log.Error("notification stream read failed", "error", err)
-			continue
-		}
-		for _, stream := range result {
-			for _, message := range stream.Messages {
-				envelope, err := events.DecodeEnvelope(message)
-				if err != nil {
-					log.Error("decode notification event failed", "error", err)
-					continue
-				}
-				if envelope.Type == events.TypeRideAssigned {
-					payload, err := events.DecodePayload[events.RideAssigned](envelope)
-					if err != nil {
-						log.Error("decode assignment notification failed", "error", err)
-						continue
-					}
-					log.Info("notification simulated", "event_type", envelope.Type, "ride_id", payload.RideID, "rider_id", payload.RiderID, "driver_id", payload.DriverID)
-					s.processed.Add(1)
-				}
-				ackCtx, ackCancel := reliability.WithRedisTimeout(ctx)
-				if err := s.rdb.XAck(ackCtx, events.StreamRideNotifications, group, message.ID).Err(); err != nil {
-					metrics.DependencyErrors.WithLabelValues("notification-service", "redis").Inc()
-					log.Error("notification ack failed", "error", err)
-				}
-				ackCancel()
-			}
-		}
+	o := s.options
+	if o.MaxDeliveries == 0 {
+		o = reliability.DefaultStreamOptions()
 	}
+	reliability.Consume(ctx, s.rdb, events.StreamRideNotifications, cfg.ConsumerGroup, cfg.ConsumerName, o, log, func(ctx context.Context, m redis.XMessage) error {
+		env, e := events.DecodeEnvelope(m)
+		if e != nil {
+			return reliability.DecodeError(e)
+		}
+		if env.Type != events.TypeRideAssigned {
+			return reliability.Permanent(errors.New("unexpected notification event"))
+		}
+		p, e := events.DecodePayload[events.RideAssigned](env)
+		if e != nil {
+			return reliability.DecodeError(e)
+		}
+		if p.RideID == "" || p.DriverID == "" {
+			return reliability.Permanent(errors.New("incomplete assignment notification"))
+		}
+		log.Info("notification simulated", "ride_id", p.RideID, "rider_id", p.RiderID, "driver_id", p.DriverID)
+		s.processed.Add(1)
+		return nil
+	}, func(ctx context.Context, m redis.XMessage, cause error) error {
+		env, e := events.NewEnvelope(uuid.NewString(), "dead_lettered", "notification-service", "", events.NewDeadLetter("notification-service", events.StreamRideNotifications, m, cause))
+		if e != nil {
+			return e
+		}
+		_, e = events.Publish(ctx, s.rdb, events.StreamDeadLetter, env)
+		return e
+	})
 }
 
 func (s *notificationService) checkRedis(ctx context.Context) error {

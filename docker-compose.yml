@@ -92,7 +92,6 @@ services:
       REDIS_ADDR: redis:6379
       ROUTING_SERVICE_URL: http://routing-service:8083
       CONSUMER_GROUP: dispatch-service
-      CONSUMER_NAME: dispatch-service-1
     ports:
       - "8082:8082"
     depends_on:
@@ -111,10 +110,14 @@ services:
         SERVICE: routing-service
     environment:
       ROUTING_SERVICE_ADDR: ":8083"
+      POSTGRES_DSN: postgres://metroride:metroride@postgres:5432/metroride?sslmode=disable
+      VALHALLA_BASE_URL: ${VALHALLA_BASE_URL:-https://valhalla1.openstreetmap.de}
       REDIS_ADDR: redis:6379
     ports:
       - "8083:8083"
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -143,7 +146,6 @@ services:
       NOTIFICATION_SERVICE_ADDR: ":8085"
       REDIS_ADDR: redis:6379
       CONSUMER_GROUP: notification-service
-      CONSUMER_NAME: notification-service-1
     ports:
       - "8085:8085"
     depends_on:

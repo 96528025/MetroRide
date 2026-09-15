@@ -1,6 +1,6 @@
 # MetroRide Architecture
 
-MetroRide is a portfolio-scale distributed ride dispatch project focused on backend systems design. It models a real-time workflow where rider requests, driver locations, routing decisions, traffic updates, and notifications are owned by separate services and coordinated through asynchronous events.
+MetroRide is a small-scale distributed ride dispatch project focused on backend systems design. It models a real-time workflow where rider requests, driver locations, routing decisions, traffic updates, and notifications are owned by separate services and coordinated through asynchronous events.
 
 The default Docker Compose profile runs six core application service roles and 10 total Compose components after PostgreSQL, Redis, Prometheus, and Grafana are included. The optional `kafka` profile adds a seventh role, `analytics-service`, plus a second driver-service runtime instance, Kafka, and the one-shot Kafka init job, for 14 profile-expanded Compose components. The optional `fare` profile adds one more role, the Java `fare-service`, as a single Compose component. Runtime instances and infrastructure containers are not counted as new application service roles.
 
@@ -12,17 +12,9 @@ The default Docker Compose profile runs six core application service roles and 1
 - Expose health, readiness, metrics, and structured logs from every service.
 - Provide a clear path from Docker Compose to Kubernetes and Helm deployment.
 
-## Why Microservices?
+## Design Rationale
 
-The ride dispatch domain has naturally separate scaling and failure profiles:
-
-- Ride intake is request-driven and latency sensitive.
-- Driver location ingestion is high frequency and stream-oriented.
-- Dispatch assignment is workflow-oriented and benefits from consumer groups.
-- Routing is compute-heavy and can evolve independently.
-- Notifications are side effects that should not block ride creation.
-
-Separating these responsibilities makes the architecture easier to scale and reason about. It also prevents non-critical workflows, such as notification delivery, from directly impacting the rider request path.
+See [system design](system-design.md) for the tradeoffs behind service boundaries, asynchronous coordination, and the choice of PostgreSQL and Redis Streams.
 
 ## Service Boundaries
 
@@ -31,10 +23,10 @@ Separating these responsibilities makes the architecture easier to scale and rea
 | `rider-service` | Default | Ride request API and rider-facing ride status | PostgreSQL ride rows |
 | `driver-service` | Default | Simulated driver availability and coordinate updates | In-memory simulation, Redis Stream output |
 | `dispatch-service` | Default | Assignment workflow and ride state transition | PostgreSQL assignment rows, Redis Stream offsets |
-| `routing-service` | Default | Driver proximity and ETA calculation | In-memory driver cache hydrated from events |
+| `routing-service` | Default | Driver proximity and ETA calculation | PostgreSQL driver positions and reservations; configured road routes |
 | `traffic-service` | Default | Regional congestion simulation | In-memory traffic model, Redis Stream output |
 | `notification-service` | Default | Simulated rider/driver notification handling | Consumer group offsets |
-| `fare-service` | Optional `fare` profile | Consumes `events.ride.assignments` and `events.ride.completions`, records each envelope ID once, quotes the fare and holds it in a double-entry ledger, on completion reverses the hold and settles the quoted amount, and publishes `fare_settled` to `events.ride.fares` (Java) | PostgreSQL `fare.processed_events`, `fare.journal_entries`, `fare.postings`, `fare.event_outbox`, consumer group offsets |
+| `fare-service` | Optional `fare` profile | Consumes assignment, completion, and cancellation streams, records each envelope ID once, quotes the fare and holds it in a double-entry ledger, on completion reverses the hold and settles the quoted amount, and publishes `fare_settled` to `events.ride.fares` (Java) | PostgreSQL `fare.processed_events`, `fare.ride_state`, `fare.quote_context`, `fare.journal_entries`, `fare.postings`, `fare.event_outbox`, consumer group offsets |
 | `analytics-service` | Optional `kafka` profile | Driver-location telemetry analytics | In-memory view hydrated from a Kafka consumer group |
 
 ## Event-Driven Architecture
@@ -48,6 +40,7 @@ Streams (constants in `shared/pkg/events/events.go`):
 - `events.ride.assignments`
 - `events.ride.notifications`
 - `events.ride.completions`
+- `events.ride.cancellations`
 - `events.ride.fares`
 - `events.traffic.updates`
 - `events.dead_letter`
@@ -58,9 +51,10 @@ Event types that are emitted today:
 - `driver_location_updated` (driver-service, direct `XADD`)
 - `ride_assigned` (dispatch-service, via the outbox, to both the assignments and notifications streams)
 - `ride_completed` (rider-service, via the outbox, to `events.ride.completions`, when `POST /v1/rides/{ride_id}/complete` moves an `assigned` ride to `completed`)
+- `ride_cancelled` (rider-service, via its outbox, with the guarded cancellation and driver release)
 - `fare_settled` (fare-service, via its own outbox in the `fare` schema, to `events.ride.fares`, once a completion has been settled; nothing consumes it yet)
 - `traffic_updated` (traffic-service, direct `XADD`)
-- `dead_lettered` (dispatch-service, after retries are exhausted; direct `XADD`, not via the outbox, retried three times; if all publish attempts fail, no dead-letter record is persisted and the source message remains unacknowledged in the consumer group's pending list. Also fare-service, for an entry it cannot decode or quote, or one whose PostgreSQL write failed on 25 deliveries, or a completion whose ride's ledger cannot be settled (a malformed hold, or a ride already settled), or a second assignment for a ride that already has a hold (refused by a partial unique index); same envelope and payload shape, one `XADD` attempt per delivery, and the source entry is reclaimed and tried again if that `XADD` fails; label `reason=poison|max_deliveries_reached|duplicate_hold|corrupt_hold|already_settled`)
+- `dead_lettered` (Go consumers and fare-service, direct `XADD` before source acknowledgment; malformed or retry-exhausted messages and Java quarantine failures go here. Failed publication leaves the original pending. See [reliability](reliability.md) for limits and [fare-service](../services/fare-service/README.md) for failure classes.)
 
 `notification_created` is defined as a constant but nothing publishes it yet.
 
@@ -68,46 +62,31 @@ The shared event envelope includes event ID, type, source, correlation ID, times
 
 ## Runtime Workflow
 
-1. `rider-service` receives `POST /v1/rides`.
-2. The ride and a pending `ride_requested` outbox event are committed together in PostgreSQL.
-3. `rider-service` returns `202`; its relay publishes the pending event to Redis Streams asynchronously.
-4. `dispatch-service` consumes the request with a Redis consumer group.
-5. `dispatch-service` calls `routing-service` for nearest-driver selection.
-6. `routing-service` calculates distance and ETA from its driver-location view.
-7. `dispatch-service` commits the assignment, status update, and pending assignment and notification outbox events together.
-8. Its relay publishes both pending events to their Redis Streams asynchronously.
-9. `notification-service` consumes notification events and logs simulated delivery.
-10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and, in one transaction, records its envelope ID in `fare.processed_events`, quotes the fare from `distance_km` and `eta_seconds`, and appends a `quote_hold` journal entry with two postings that sum to zero; a redelivery is acknowledged without a second row or a second entry.
-11. `POST /v1/rides/{ride_id}/complete` on `rider-service` moves the ride from `assigned` to `completed` with a conditional update, requires exactly one `ride_assignments` row, and commits a `ride_completed` outbox event in the same transaction; its relay publishes it to `events.ride.completions`. `fare-service` consumes it and, in one transaction, locks the ride's `quote_hold` (`select ... for update`), refuses a malformed hold or an existing settlement (dead-lettered under its own reason; a second hold for a ride cannot exist, a partial unique index refuses it and the second assignment event is dead-lettered as `duplicate_hold`), and otherwise appends a `hold_reversal` and a `settlement` that splits the quoted amount between `driver_payable` (the configured driver share, rounded once) and `platform_revenue` (the remainder). A completion that arrives before its assignment stays pending and is retried by the reclaim pass until the hold exists. Settlement is by quote; no actual distance or time is metered.
-12. In the same transaction, `fare-service` inserts a `fare_settled` row into `fare.event_outbox`; its own relay (same statements, backoff and at-least-once semantics as `shared/pkg/outbox`) publishes it to `events.ride.fares`. Nothing consumes that stream yet.
+1. Rider-service commits the requested ride and its outbox event, then returns `202`.
+2. Its relay publishes to Redis; dispatch consumes the request and asks routing for a candidate and passenger-route estimate.
+3. Routing reads shared driver positions and calls the configured provider before dispatch opens the assignment transaction.
+4. Dispatch rechecks the candidate and commits the reservation, ride assignment, and both outgoing events in PostgreSQL.
+5. The dispatch relay publishes to the assignment and notification streams. Notification-service logs delivery; optional fare-service creates the quote hold.
+6. Rider-service handles completion or cancellation by updating the ride, releasing its reservation, and writing an event in one transaction.
+7. Fare-service processes that event in its own transaction. Completion also creates a `fare_settled` outbox row; cancellation reverses an existing hold. The fare relay publishes settlement events asynchronously.
 
-## Why Redis Streams?
-
-Redis Streams are a pragmatic transport for the MVP because they provide:
-
-- Durable append-only stream semantics.
-- Consumer groups for horizontal consumer scaling.
-- Explicit acknowledgements for retry and replay behavior.
-- Simple local operations through Docker Compose.
-- A clean bridge toward Kafka-style event logs.
-
-Kafka is the natural next transport when the system requires stronger partitioning semantics, longer retention, higher fanout, and broader ecosystem integration. MetroRide keeps event definitions transport-neutral to make that migration incremental.
+Each database transaction ends at its owning service. The event transport permits duplicate and out-of-order delivery between those transactions. The [reliability guide](reliability.md#state-guards) explains the state guards; the [fare guide](../services/fare-service/README.md#cancellation) covers ledger ordering. Field-level contracts are in the [event reference](../shared/events/README.md), and provider behavior is in [road routing](routing.md).
 
 ## Fault Tolerance Concepts
 
 MetroRide includes foundational production hooks:
 
-- Consumer groups keep unacknowledged dispatch or notification work pending rather than dropping it; the Go workers do not yet reclaim abandoned pending entries. `fare-service` reclaims its own with `XAUTOCLAIM` (see `docs/reliability.md`).
+- Go and Java consumers reclaim eligible pending deliveries with `XAUTOCLAIM`; processing and dead-letter failures keep the original pending until a durable outcome is confirmed (see [reliability](reliability.md)).
 - PostgreSQL is the authoritative store for ride status and assignment state.
 - Services expose `/healthz` and `/readyz` for orchestration and load balancer integration.
 - Structured logs include service names and workflow identifiers for cross-service debugging.
 - Docker Compose health checks gate Redis and PostgreSQL readiness before dependent services start.
 
-Dispatch uses bounded retries, an idempotent PostgreSQL state transition, a transactional outbox, and `events.dead_letter` for retry-exhausted failures. Automated outage tests validate both routing dead-letter behavior and Redis recovery without event loss. Next resilience steps include dead-letter replay tooling, abandoned pending-message claiming in the Go consumers (`fare-service` already claims its own), circuit breakers around routing calls, and stream lag alerting.
+Dispatch uses bounded retries, an idempotent PostgreSQL state transition, a transactional outbox, and `events.dead_letter` for retry-exhausted failures. Automated outage tests validate both routing dead-letter behavior and Redis recovery without event loss. Next resilience steps include dead-letter replay tooling, circuit breakers around routing calls, and stream lag alerting.
 
 ## Scalability Considerations
 
-Redis consumer groups can divide new dispatch messages across workers, but the current implementation still needs pending-entry recovery and load testing before making a horizontal-scale claim. Routing cannot safely share its current process-local driver view across replicas without a shared store or explicit regional partitioning. PostgreSQL can be indexed and eventually partitioned by region or creation time as ride volume grows.
+Redis consumer groups distribute new messages and reclaim eligible pending deliveries across workers. Routing replicas use shared PostgreSQL positions and reservations. These correctness mechanisms still require sustained load and failure testing before any capacity or production-scale claim. PostgreSQL can be indexed and eventually partitioned by region or creation time as ride volume grows.
 
 The architecture is intentionally region-aware in concept: future work can shard drivers and riders by city or geohash, then replicate cross-region events for failover and analytics.
 

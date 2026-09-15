@@ -121,6 +121,14 @@ Responses:
 500             {"error":"failed to complete ride"}
 ```
 
+### Cancel a ride
+
+`POST /v1/rides/{ride_id}/cancel`
+
+A requested or assigned ride can be canceled. A successful transition returns `202` with `ride_id`, `status: "cancelled"`, and the cancellation event's `event_id`. An unknown ride returns `404`; a completed or already canceled ride returns `409`.
+
+Cancellation commits the ride transition, driver release, and outgoing event together. With fare-service enabled, reversal of any existing quote hold happens asynchronously and carries no cancellation fee. See the [fare cancellation contract](../services/fare-service/README.md#cancellation) for event-ordering behavior. Completion and cancellation compete for one guarded ride transition; at most one succeeds.
+
 ## Dispatch Service
 
 Base URL: `http://localhost:8082`
@@ -142,37 +150,15 @@ Important metrics:
 
 ## Routing Service
 
-Base URL: `http://localhost:8083`
-
 ### Find Nearest Driver
 
-Calculates the nearest available driver using the routing service's current driver-location view. Distance is the Haversine great-circle distance rather than a road-network route, and ETA assumes a constant 32 km/h speed with a 60-second minimum.
-
-```http
-POST /v1/routes/nearest-driver
-Content-Type: application/json
-```
-
-Request:
+`POST /v1/routes/nearest-driver`
 
 ```json
-{
-  "pickup_lat": 37.775,
-  "pickup_lng": -122.419
-}
+{"pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}
 ```
 
-Response:
-
-```json
-{
-  "driver_id": "driver-1001",
-  "distance_km": 0.08,
-  "eta_seconds": 60,
-  "algorithm": "haversine-nearest",
-  "computed_at": "2026-05-19T20:00:02Z"
-}
-```
+All four coordinates are required and range-checked. A successful response contains `driver_id`, approach `distance_km` and `eta_seconds`, passenger `trip_distance_km` and `trip_duration_seconds`, `route_provider`, `route_calculated_at`, and `algorithm: "road-time-shortlist"`. The algorithm compares up to five candidates, not every possible road approach. Missing drivers, unavailable shared state, and unusable routes return `503`; invalid input returns `400`. Selection does not reserve the driver; dispatch rechecks and reserves inside its transaction.
 
 ## Driver Service
 

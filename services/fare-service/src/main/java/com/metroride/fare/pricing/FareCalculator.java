@@ -43,11 +43,20 @@ public final class FareCalculator {
         if (etaSeconds < 0) {
             throw new IllegalArgumentException("eta_seconds must not be negative, got " + etaSeconds);
         }
-        // 60 * quote, exact: BigDecimal.valueOf(double) uses the double's shortest decimal
-        // representation, so 1.8612 stays 1.8612 rather than its binary expansion.
+        return quote(BigDecimal.valueOf(distanceKm), BigDecimal.valueOf(etaSeconds));
+    }
+
+    /** Quotes the passenger's road distance and estimated duration, including fractional seconds. */
+    public Money quote(BigDecimal tripDistanceKm, BigDecimal tripDurationSeconds) {
+        if (tripDistanceKm == null || tripDistanceKm.signum() < 0) {
+            throw new IllegalArgumentException("trip_distance_km must be present and not negative");
+        }
+        if (tripDurationSeconds == null || tripDurationSeconds.signum() < 0) {
+            throw new IllegalArgumentException("trip_duration_seconds must be present and not negative");
+        }
         BigDecimal scaledBase = rates.baseFare().multiply(SECONDS_PER_MINUTE);
-        BigDecimal scaledDistance = rates.perKm().multiply(BigDecimal.valueOf(distanceKm)).multiply(SECONDS_PER_MINUTE);
-        BigDecimal scaledTime = rates.perMinute().multiply(BigDecimal.valueOf(etaSeconds));
+        BigDecimal scaledDistance = rates.perKm().multiply(tripDistanceKm).multiply(SECONDS_PER_MINUTE);
+        BigDecimal scaledTime = rates.perMinute().multiply(tripDurationSeconds);
         return Money.ofQuotient(scaledBase.add(scaledDistance).add(scaledTime), SECONDS_PER_MINUTE);
     }
 }

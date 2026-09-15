@@ -14,6 +14,7 @@ const (
 	StreamDriverLocations   = "events.driver.locations"
 	StreamRideAssignments   = "events.ride.assignments"
 	StreamRideNotifications = "events.ride.notifications"
+	StreamRideCancellations = "events.ride.cancellations"
 	StreamRideCompletions   = "events.ride.completions"
 	StreamTrafficUpdates    = "events.traffic.updates"
 	StreamDeadLetter        = "events.dead_letter"
@@ -24,6 +25,7 @@ const (
 	TypeRideRequested         = "ride_requested"
 	TypeDriverLocationUpdated = "driver_location_updated"
 	TypeRideAssigned          = "ride_assigned"
+	TypeRideCancelled         = "ride_cancelled"
 	TypeRideCompleted         = "ride_completed"
 	TypeTrafficUpdated        = "traffic_updated"
 	TypeNotificationCreated   = "notification_created"
@@ -58,12 +60,17 @@ type DriverLocationUpdated struct {
 }
 
 type RideAssigned struct {
-	RideID       string  `json:"ride_id"`
-	RiderID      string  `json:"rider_id"`
-	DriverID     string  `json:"driver_id"`
-	DistanceKM   float64 `json:"distance_km"`
-	ETASeconds   int     `json:"eta_seconds"`
-	AssignmentID string  `json:"assignment_id"`
+	SchemaVersion       int      `json:"schema_version"`
+	TripDistanceKM      *float64 `json:"trip_distance_km,omitempty"`
+	TripDurationSeconds *float64 `json:"trip_duration_seconds,omitempty"`
+	RouteProvider       string   `json:"route_provider,omitempty"`
+	RouteCalculatedAt   string   `json:"route_calculated_at,omitempty"`
+	RideID              string   `json:"ride_id"`
+	RiderID             string   `json:"rider_id"`
+	DriverID            string   `json:"driver_id"`
+	DistanceKM          float64  `json:"distance_km"`
+	ETASeconds          int      `json:"eta_seconds"`
+	AssignmentID        string   `json:"assignment_id"`
 }
 
 // RideCompleted is published by rider-service when a ride moves from
@@ -102,12 +109,14 @@ type FareSettled struct {
 }
 
 type DeadLetter struct {
-	OriginalEventID   string `json:"original_event_id"`
-	OriginalEventType string `json:"original_event_type"`
-	RideID            string `json:"ride_id,omitempty"`
-	Error             string `json:"error"`
-	Service           string `json:"service"`
-	FailedAt          string `json:"failed_at"`
+	OriginalStream    string         `json:"original_stream,omitempty"`
+	OriginalValues    map[string]any `json:"original_values,omitempty"`
+	OriginalEventID   string         `json:"original_event_id"`
+	OriginalEventType string         `json:"original_event_type"`
+	RideID            string         `json:"ride_id,omitempty"`
+	Error             string         `json:"error"`
+	Service           string         `json:"service"`
+	FailedAt          string         `json:"failed_at"`
 }
 
 func Publish(ctx context.Context, rdb *redis.Client, stream string, envelope Envelope) (string, error) {
@@ -165,4 +174,25 @@ func DecodePayload[T any](envelope Envelope) (T, error) {
 	var payload T
 	err := json.Unmarshal(envelope.Payload, &payload)
 	return payload, err
+}
+
+// RideCancelled permits an empty assignment for rides canceled before dispatch.
+type RideCancelled struct {
+	RideID       string `json:"ride_id"`
+	RiderID      string `json:"rider_id"`
+	DriverID     string `json:"driver_id,omitempty"`
+	AssignmentID string `json:"assignment_id,omitempty"`
+	CancelledAt  string `json:"cancelled_at"`
+}
+
+// NewDeadLetter preserves the source entry for inspection or deliberate replay.
+func NewDeadLetter(service, stream string, message redis.XMessage, cause error) DeadLetter {
+	p := DeadLetter{OriginalStream: stream, OriginalValues: message.Values, OriginalEventID: message.ID,
+		OriginalEventType: "decode_failed", Error: cause.Error(), Service: service, FailedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if env, err := DecodeEnvelope(message); err == nil {
+		p.OriginalEventID = env.ID
+		p.OriginalEventType = env.Type
+		p.RideID = env.CorrelationID
+	}
+	return p
 }

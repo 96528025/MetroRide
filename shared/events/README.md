@@ -9,12 +9,21 @@ Streams (see `shared/pkg/events/events.go`):
 - `events.ride.assignments` (`ride_assigned`, from the dispatch-service outbox)
 - `events.ride.notifications` (`ride_assigned`, from the dispatch-service outbox)
 - `events.ride.completions` (`ride_completed`, from the rider-service outbox when `POST /v1/rides/{ride_id}/complete` moves an `assigned` ride to `completed`; payload `RideCompleted`: `ride_id`, `rider_id`, `driver_id`, `assignment_id`, `completed_at` as RFC 3339 with nanoseconds)
+- `events.ride.cancellations` (`ride_cancelled`, from the rider-service outbox when a requested or assigned ride is canceled)
 - `events.ride.fares` (`fare_settled`, from the fare-service outbox (`fare.event_outbox`, a Java relay) once a ride's hold has been reversed and settled; payload `FareSettled`: `ride_id`, `rider_id`, `driver_id`, `assignment_id`, `settlement_event_id` (the `ride_completed` envelope ID), `quote`, `driver_amount`, `platform_amount`, `driver_share` as decimal strings, `settled_at` as RFC 3339 with fractional seconds; nothing consumes it yet; at-least-once, deduplicate on the envelope `id`)
 - `events.traffic.updates` (`traffic_updated`, direct from traffic-service)
-- `events.dead_letter` (`dead_lettered`, written with a direct `XADD`, not via the outbox, by dispatch-service after three failed attempts and by fare-service for an entry it cannot decode, quote or settle or that failed 25 deliveries; same envelope and payload shape; nothing consumes it yet)
+- `events.dead_letter` (`dead_lettered`, direct `XADD` by Go consumers for malformed or retry-exhausted deliveries, and by fare-service for poison, quarantined, or retry-exhausted events; the source is acknowledged only after successful publication; nothing consumes this stream yet)
 
 `notification_created` exists as a constant and is not published by any service.
 
 The optional `kafka` Compose profile already carries driver locations on Kafka, using a separate flat `DriverLocationEvent` (`shared/pkg/kafka/events.go`) rather than this envelope. Moving the Redis streams to Kafka would mean choosing between that flat shape and the envelope; the envelope itself is transport-neutral.
 
-`services/fare-service` (Java) runs under the optional `fare` Compose profile, consumes `events.ride.assignments` and `events.ride.completions` through the consumer group `fare-service` with one `XREADGROUP`, records each envelope ID once and, for `ride_assigned`, reads `distance_km` and `eta_seconds` from the payload to quote and hold the fare; for `ride_completed` it reverses that hold and settles the quoted amount between driver and platform. It decodes the same `event` field and envelope JSON the Go services publish, and is the first consumer that reads the payload fields rather than only the envelope. It is also the first non-Go publisher: `fare_settled` goes out through a transactional outbox in its own schema with the same statements, backoff and at-least-once semantics as `shared/pkg/outbox`, and `events.FareSettled` in `events.go` pins the payload for any Go consumer. The two streams come from two outbox relays, so the completion of a ride can reach fare-service before its assignment; fare-service treats that as a retryable failure and settles once the assignment has landed.
+The Java fare consumer reads the three ride-event streams using the `fare-service` group. Events from separate outbox relays may arrive out of order. Consumer transitions, quote validation, and ledger deduplication are documented in the [fare service guide](../../services/fare-service/README.md#processing-rule).
+
+Go dead letters retain `original_stream` and `original_values`, including the original encoded event when present. These optional fields support investigation and deliberate replay without treating a failure summary as the original payload. Default delivery limits and timeout settings are documented in [reliability](../../docs/reliability.md).
+
+## Assignment version 2 and cancellation
+
+`ride_assigned` sets `schema_version: 2`. `distance_km` / `eta_seconds` remain the driver's approach; `trip_distance_km` / `trip_duration_seconds` describe the passenger route. `route_provider` and `route_calculated_at` retain the source and calculation time. Missing passenger inputs cannot create a fare hold.
+
+`events.ride.cancellations` carries `ride_cancelled` from rider-service with `ride_id`, `rider_id`, `cancelled_at`, and optional `driver_id` / `assignment_id`. Cancellation of a requested ride has no assignment. Both release and outgoing event commit with the guarded ride transition. Fare consumers use the persistent cancellation state to handle assignment/cancellation arriving out of order.

@@ -9,7 +9,7 @@ import (
 const (
 	RedisTimeout      = 2 * time.Second
 	PostgresTimeout   = 2 * time.Second
-	RoutingTimeout    = 2 * time.Second
+	RoutingTimeout    = 60 * time.Second
 	ReadinessTimeout  = 1500 * time.Millisecond
 	MaxRetryAttempts  = 3
 	InitialRetryDelay = 150 * time.Millisecond

@@ -1,0 +1,29 @@
+{{- if .Values.routingFixture.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: route-fixture
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: route-fixture}
+  template:
+    metadata:
+      labels: {app: route-fixture}
+    spec:
+      containers:
+        - name: route-fixture
+          image: {{ .Values.routingFixture.image | quote }}
+          imagePullPolicy: Never
+          ports: [{containerPort: 8090}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8090}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: route-fixture
+spec:
+  selector: {app: route-fixture}
+  ports: [{port: 8090, targetPort: 8090}]
+{{- end }}

@@ -160,6 +160,6 @@ class DeliveryCapIT extends IntegrationTestSupport {
         return "{\"id\":\"" + eventId + "\",\"type\":\"ride_assigned\",\"source\":\"dispatch-service\","
                 + "\"correlation_id\":\"" + rideId + "\",\"occurred_at\":\"2026-09-05T21:12:34.293710969Z\","
                 + "\"payload\":{\"ride_id\":\"" + rideId + "\",\"rider_id\":\"rider-42\",\"driver_id\":\"driver-2\","
-                + "\"distance_km\":1.8612,\"eta_seconds\":223,\"assignment_id\":\"" + UUID.randomUUID() + "\"}}";
+                + "\"schema_version\":2,\"route_provider\":\"test-fixture\",\"route_calculated_at\":\"2026-09-11T10:00:00Z\",\"trip_distance_km\":1.8612,\"trip_duration_seconds\":223,\"distance_km\":1.8612,\"eta_seconds\":223,\"assignment_id\":\"" + UUID.randomUUID() + "\"}}";
     }
 }
