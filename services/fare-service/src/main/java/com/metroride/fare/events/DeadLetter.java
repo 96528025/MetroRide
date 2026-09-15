@@ -5,7 +5,8 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
  * Payload of a {@code dead_lettered} envelope, mirroring {@code events.DeadLetter} in
- * {@code shared/pkg/events/events.go} field for field. {@code ride_id} is omitted when empty, as
+ * {@code shared/pkg/events/events.go} for the common fields; Java omits the optional
+ * {@code original_stream} and {@code original_values}. {@code ride_id} is omitted when empty, as
  * the Go struct's {@code omitempty} tag does.
  *
  * @param originalEventId   ID of the envelope that failed, or the stream message ID when the entry

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/metroride/metroride/shared/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
@@ -67,10 +68,16 @@ type StreamLogger interface{ Error(string, ...any) }
 
 // Consume processes one delivery at a time. Acknowledgment follows the durable
 // effect or confirmed dead-letter publication; failures leave work pending.
-func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer string, o StreamOptions, log StreamLogger, handle func(context.Context, redis.XMessage) error, dead func(context.Context, redis.XMessage, error) error) {
+func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer, service string, o StreamOptions, log StreamLogger, handle func(context.Context, redis.XMessage) error, dead func(context.Context, redis.XMessage, error) error) {
 	if err := o.Validate(); err != nil {
 		log.Error("invalid consumer options", "error", err)
 		return
+	}
+	countRedisError := func() {
+		if ctx.Err() == nil {
+			metrics.StreamConsumeErrors.WithLabelValues(service, stream).Inc()
+			metrics.DependencyErrors.WithLabelValues(service, "redis").Inc()
+		}
 	}
 	cursor := "0-0"
 	nextClaim := time.Time{}
@@ -88,6 +95,7 @@ func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer str
 			pending, pErr := rdb.XPendingExt(check, &redis.XPendingExtArgs{Stream: stream, Group: group, Start: m.ID, End: m.ID, Count: 1}).Result()
 			c()
 			if pErr != nil {
+				countRedisError()
 				log.Error("read pending delivery count failed", "error", pErr)
 				return
 			}
@@ -109,6 +117,7 @@ func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer str
 		e := rdb.XAck(ack, stream, group, m.ID).Err()
 		c()
 		if e != nil {
+			countRedisError()
 			log.Error("acknowledgment failed", "error", e)
 		}
 	}
@@ -117,6 +126,7 @@ func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer str
 		err := rdb.XGroupCreateMkStream(init, stream, group, "0").Err()
 		c()
 		if err != nil && !strings.HasPrefix(err.Error(), "BUSYGROUP") {
+			countRedisError()
 			log.Error("ensure group failed", "error", err)
 			if !pause(ctx, 250*time.Millisecond) {
 				return
@@ -129,6 +139,7 @@ func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer str
 			c()
 			nextClaim = time.Now().Add(o.ReclaimInterval)
 			if e != nil {
+				countRedisError()
 				log.Error("pending recovery failed", "error", e)
 			} else {
 				cursor = next
@@ -142,6 +153,7 @@ func Consume(ctx context.Context, rdb *redis.Client, stream, group, consumer str
 		c()
 		if e != nil {
 			if !errors.Is(e, redis.Nil) && ctx.Err() == nil {
+				countRedisError()
 				log.Error("read stream failed", "error", e)
 				if !pause(ctx, 250*time.Millisecond) {
 					return

@@ -4,6 +4,8 @@ The Java fare service owns MetroRide's quote holds, settlement postings, and can
 
 For HTTP ride actions, use the [rider API](../../docs/api.md#rider-service). For route selection and provider configuration, see [road routing](../../docs/routing.md). This guide covers the ledger, consumer failure policy, schema, and service operation.
 
+[Processing](#processing-rule) · [Failure recovery](#failure-handling-and-pending-entry-recovery) · [Ledger](#fare-and-ledger) · [Cancellation](#cancellation) · [Configuration](#configuration) · [Tests](#build-and-test)
+
 ## What is here
 
 | Piece | Where | Notes |
@@ -21,7 +23,7 @@ For HTTP ride actions, use the [rider API](../../docs/api.md#rider-service). For
 | Failure classes | `consumer/FailureClass`, `consumer/ClassifiedFailure` | Pure mapping from the exception `handle()` saw to `RETRYABLE`, `POISON`, `QUARANTINE` or `FATAL`; an exception that implements `ClassifiedFailure` names its own class and dead-letter reason |
 | Failure handling | `consumer/FailureHandler`, `consumer/ConsumerHalt` | Leaves the entry pending, dead-letters it, or halts the consumer; owns the one `XACK` in the service; the halt fails `/readyz` |
 | Entry age | `consumer/StreamEntryAge` | Age of an entry from the millisecond timestamp in its stream ID; logged, never decided on |
-| Dead letters | `consumer/DeadLetterPublisher`, `events/DeadLetter` | `XADD` to `events.dead_letter` in the shape `publishDeadLetter` in dispatch-service writes; `DeadLetter` mirrors `events.DeadLetter` in `events.go` |
+| Dead letters | `consumer/DeadLetterPublisher`, `events/DeadLetter` | `XADD` to `events.dead_letter` in the shape `publishDeadLetter` in dispatch-service writes; `DeadLetter` uses the common fields of `events.DeadLetter` in `events.go` |
 | Outbox storage | `outbox/OutboxRepository` | The statements of `shared/pkg/outbox` against `fare.event_outbox`: `enqueue` in the settlement's transaction, then the relay's take-batch, mark-published and mark-failed |
 | Outbox relay | `outbox/OutboxRelay`, `outbox/RetryBackoff`, `outbox/OutboxProperties` | Own thread and connection; every `poll-interval` one batch under `for update skip locked`, `XADD` each row, record success or a capped exponential retry; at-least-once, like the Go relays |
 | Published contract | `events/FareSettled` | Field-for-field match with `events.FareSettled` in `events.go`; amounts as strings |
@@ -39,7 +41,7 @@ For each stream entry, from any configured ride stream (the type decides, never 
       the transaction ends here;
    2. if the type is `ride_assigned`, decode the payload, lock the persistent ride state, validate passenger route inputs, save quote context, and append a
       `quote_hold` journal entry with two postings;
-   3. if the type is `ride_completed`, decode the payload, lock the ride's `quote_hold`
+   3. if the type is `ride_completed`, decode the payload, lock the persistent ride state and then the ride's `quote_hold`
       (`select ... for update`), check that there is exactly one (two cannot exist since V3;
       finding two is fatal) and that it has the shape the service writes, check that the ride
       has no `settlement` yet, append a `hold_reversal` and a `settlement`, both with this
@@ -63,14 +65,11 @@ lands on the conflict clause and returns without touching the ledger. The unique
 not the mechanism the service relies on. It is a compound key, not `source_event_id` alone,
 because one completion event produces both a `hold_reversal` and a `settlement`.
 
-Two *different* completion events for one ride (a dead letter replayed by hand next to the
-original, or a relay duplicate that was given a new ID) are not caught by either of those keys:
-their event rows do not collide. What serialises them is the row lock the settlement takes on
-the ride's `quote_hold`: the second transaction waits on it until the first has committed, then
-finds the ride settled and is quarantined as `already_settled`. This is the one new protection
-this service has for running more than one instance, and it covers exactly one case, the
-settlement of one ride. Everything else about multiple instances is as before (see "What is true
-after this").
+Different event IDs for one ride do not collide in `processed_events`. The recorder
+serializes assignment, completion, and cancellation through a persistent `fare.ride_state`
+row, then locks any hold it reads. This also orders a cancellation that arrives before an
+assignment; see [Cancellation](#cancellation). Per-ride unique indexes remain a database
+backstop.
 
 ### Failure handling and pending-entry recovery
 
@@ -81,7 +80,7 @@ first and names its own class; the rules below apply to everything else.
 | Class | Exceptions | What happens to the entry |
 | --- | --- | --- |
 | `POISON` | `EnvelopeDecodeException` (the entry is not an envelope), `FareQuoteException` (the payload cannot be quoted), `SettlementException` with reason `payload` (a `ride_completed` whose payload is missing, undecodable or has no `ride_id`), `DataIntegrityViolationException` whose root SQLSTATE is class 22 (PostgreSQL or the driver refused a value: a NUL character in a text field, an invalid byte sequence, a numeric overflow) | Dead-lettered immediately, then acknowledged |
-| `QUARANTINE` | `SettlementException` with reason `already_settled` (the ride has a `settlement` from another event, found under the hold's lock or refused by the per-ride settlement index); `CorruptLedgerException` (the ride's hold rows are not the entry this service writes: no postings, unbalanced, an unknown account or kind, a wrong account or side); `LedgerConflictException` (a `ride_assigned` for a ride that already has a `quote_hold`, refused by the per-ride index `journal_entries_one_quote_hold_per_ride`; reason `duplicate_hold`) | As poison: dead-lettered immediately under the reason the exception names, then acknowledged. Settlement reasons and `corrupt_hold` are counted on `metroride_fare_settlement_failures_total`; `duplicate_hold` only on the dead-letter counter, since the failed event is an assignment |
+| `QUARANTINE` | `SettlementException` with reason `cancelled_ride` (completion after cancellation) or `already_settled` (completion or cancellation after settlement); `CorruptLedgerException` (the ride's hold rows are not the entry this service writes: no postings, unbalanced, an unknown account or kind, a wrong account or side); `LedgerConflictException` (a `ride_assigned` for a ride that already has a `quote_hold`, refused by the per-ride index `journal_entries_one_quote_hold_per_ride`; reason `duplicate_hold`) | As poison: dead-lettered immediately under the reason the exception names, then acknowledged. `already_settled` and `corrupt_hold` are counted on `metroride_fare_settlement_failures_total`; `duplicate_hold` appears only on the dead-letter counter; `cancelled_ride` is counted on the dead-letter and stream-consume-error counters |
 | `FATAL` | `InvalidDataAccessResourceUsageException` (bad SQL, wrong column type), `InvalidDataAccessApiUsageException` (a repository was misused, or a constructor threw inside one), any `DataIntegrityViolationException` other than the two per-ride indexes above (class 23, a constraint the writer cannot reach unless the schema or the data is already wrong), `SettlementException` with reason `ambiguous_hold` (two `quote_hold` rows for one ride, a state the V3 index makes unrepresentable, so the index is gone or the schema has drifted; the check stays so the service never settles against the first of several holds) | Left pending; the consumer halts and `/readyz` fails with the reason until the deployment is fixed and the service restarted |
 | `RETRYABLE` | `SettlementException` with reason `missing_hold` (the ride has no `quote_hold` yet), every other `DataAccessException` (cancelled lock wait, lost connection, deadlock), every `TransactionException`, and anything unforeseen | Left pending and delivered again by the reclaim pass; dead-lettered when its `max-deliveries`-th delivery fails |
 
@@ -169,12 +168,14 @@ while a duplicate can be dropped by whoever reads the stream. `payload.original_
 key to deduplicate on. The success path and the dead-letter path share the single `XACK` in
 `FailureHandler.acknowledge`.
 
-The dead letter is the envelope dispatch-service writes, field for field: a new UUID as `id`,
+The dead letter uses the common envelope and payload fields also written by dispatch-service: a new UUID as `id`,
 `type` `dead_lettered`, `source` `fare-service`, `correlation_id` the ride ID, `occurred_at` in UTC,
 and a payload with `original_event_id`, `original_event_type`, `ride_id` (omitted when unknown),
 `error`, `service` (`fare-service`) and `failed_at` (RFC 3339 with fractional seconds). An entry that
 is not a decodable envelope is dead-lettered under its stream message ID with type `decode_failed`.
-The contract is pinned by `DeadLetterPublisherTest` against the tag names in `events.go`.
+The common fields are pinned by `DeadLetterPublisherTest` against the tag names in `events.go`.
+Go consumers additionally include `original_stream` and `original_values`; Java dead letters
+omit those optional fields, so manual replay retrieves the original entry from its source stream.
 
 **Halt.** On a fatal failure the consumer thread logs the entry and the exception, records the
 reason in `ConsumerHalt`, and leaves its loop; the rest of the batch and everything else pending
@@ -229,8 +230,8 @@ The quote is
 quote = base_fare + per_km * trip_distance_km + per_minute * trip_duration_seconds / 60
 ```
 
-computed exactly in `BigDecimal` and rounded to cents once, half up, inside `Money`. No other
-class rounds. With the default rate card (2.50 + 1.20/km + 0.30/min) the assignment
+computed with exact `BigDecimal` arithmetic by scaling the numerator by 60, then divided
+and rounded to cents once, half up, inside `Money`. With the default rate card (2.50 + 1.20/km + 0.30/min) the assignment
 `trip_distance_km=1.8612, trip_duration_seconds=223` quotes 5.85.
 
 Each valid version 2 `ride_assigned` without an earlier cancellation produces one journal entry of kind `quote_hold` with two postings, debit
@@ -302,11 +303,10 @@ quarantined as `already_settled`.
 
 `V3__one_hold_and_one_settlement_per_ride.sql` adds partial unique indexes for one hold and one settlement per ride. V6 adds one cancellation reversal per ride. The recorder first locks `fare.ride_state`, so assignments, completions, and cancellations serialize across instances even when no hold exists. The indexes remain a backstop for writers outside that guarded path. Duplicate holds are quarantined; a conflicting completion is classified as already settled or canceled.
 
-The balance rule (postings of one entry sum to zero, at least one posting, no zero posting) is
-enforced in the `JournalEntry` constructor and nowhere else. There is no database trigger on
-purpose: with a single writer, making the illegal state unrepresentable in the application is
-enough, and a trigger would duplicate the rule in a second language with its own tests. A
-trigger is defense in depth to add when a second writer appears. The per-ride *cardinality* rules
+The `JournalEntry` constructor checks that postings sum to zero and that the entry has
+at least one posting and no zero amounts. All application ledger writes pass through it;
+the database has no equivalent balance trigger. Direct SQL writers can bypass that rule,
+so an additional writer would need the same validation or database enforcement. The per-ride *cardinality* rules
 (one hold, one settlement) are the exception and live in the database since V3, as a backstop to the persistent ride-state lock. Reads go through the same
 constructor (the query is a left join, so an entry that lost its postings is not hidden), so a
 row set that no longer balances or has no postings is refused rather than served.
@@ -452,11 +452,11 @@ The rate card lives in `application.yml` under `metroride.fare`, not in the envi
 | --- | --- | --- |
 | `metroride_fare_events_processed_total` | `service`, `stream`, `outcome=recorded\|duplicate` | Envelopes recorded or skipped as duplicates |
 | `metroride_fare_quotes_total` | `service`, `kind=quote_hold` | Quote holds written, counted after the commit; unchanged by settlement, which has its own counter below |
-| `metroride_fare_journal_entries_total` | `service`, `kind=quote_hold\|hold_reversal\|settlement` | Journal entries written by kind, counted after the commit; a settled ride adds one to each |
+| `metroride_fare_journal_entries_total` | `service`, `kind=quote_hold\|hold_reversal\|settlement\|cancellation_reversal` | Journal entries written by kind, counted after the commit; a settled ride adds a quote hold, hold reversal, and settlement; canceling a held ride adds a cancellation reversal |
 | `metroride_fare_quote_failures_total` | `service`, `reason=payload\|calculation` | `ride_assigned` envelopes whose payload did not decode or whose figures the calculator rejected; the transaction rolled back and the entry is dead-lettered as poison |
-| `metroride_fare_settlement_failures_total` | `service`, `reason=missing_hold\|ambiguous_hold\|corrupt_hold\|already_settled` | `ride_completed` envelopes that could not be settled, counted once per failed delivery, so `missing_hold` grows by one per retry of a completion that is waiting for its assignment |
+| `metroride_fare_settlement_failures_total` | `service`, `reason=missing_hold\|ambiguous_hold\|corrupt_hold\|already_settled` | Failures with these reasons, including cancellation conflicts, counted once per failed delivery; `missing_hold` grows per retry while waiting for assignment. `cancelled_ride` appears on the dead-letter and stream-consume-error counters instead |
 | `metroride_fare_events_reclaimed_total` | `service`, `stream` | Pending entries delivered again by the reclaim pass |
-| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|max_deliveries_reached\|duplicate_hold\|corrupt_hold\|already_settled` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK`. The reason is only here: the dead letter JSON has no `reason` field, the specific cause is in its `error` text |
+| `metroride_fare_dead_letters_total` | `service`, `stream`, `reason=poison\|max_deliveries_reached\|duplicate_hold\|corrupt_hold\|already_settled\|cancelled_ride` | Entries written to `events.dead_letter`; counted after Redis confirmed the `XADD`, before the `XACK`. The reason is only here: the dead letter JSON has no `reason` field, the specific cause is in its `error` text |
 | `metroride_fare_dead_letter_publish_failures_total` | `service`, `stream` | Dead-letter `XADD`s Redis did not confirm; the entry stayed pending |
 | `metroride_fare_consumer_halted` | `service` | Gauge, 1 once the consumer has stopped on a fatal failure |
 | `metroride_outbox_events_published_total` | `service`, `stream` | Outbox rows published to their stream, counted after the batch's commit (same name as the Go relays' counter) |
@@ -631,8 +631,6 @@ docker compose exec postgres psql -U metroride -d metroride \
   -c "select j.kind, p.account, p.amount from fare.journal_entries j join fare.postings p on p.journal_entry_id = j.id where j.ride_id = '$RIDE' order by j.id, p.id"
 ```
 
-```
-
 The settlement is also on `events.ride.fares` by then, and its outbox row is marked published:
 
 ```bash
@@ -642,7 +640,7 @@ docker compose exec postgres psql -U metroride -d metroride \
 curl -s localhost:8087/metrics | grep outbox                          # published +1, failures unchanged, unpublished 0
 ```
 
-Fault behaviour (Redis away while a settlement commits, the relay's backoff, recovery) is not
+Fault behavior (Redis away while a settlement commits, the relay's backoff, recovery) is not
 demonstrated by hand: stopping Redis in Compose also stops the relay that carries the completion
 to this service, and pausing the container freezes the consumer's read as well, so neither lands
 between "consumed" and "published". `OutboxIT` arranges each of those states directly.

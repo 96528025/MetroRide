@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +61,7 @@ func TestRoutingOutageDeadLettersRideRequest(t *testing.T) {
 		t.Fatalf("connect to Redis: %v", err)
 	}
 
+	failureCount := assignmentFailureCount(t, ctx)
 	baseline := deadLetterBaseline(t, ctx, rdb)
 	created := createRide(t, ctx, createRideRequest{
 		RiderID:    "failure-integration-" + uuid.NewString(),
@@ -70,6 +73,9 @@ func TestRoutingOutageDeadLettersRideRequest(t *testing.T) {
 
 	deadLetter := waitForDeadLetter(t, ctx, rdb, baseline, created.RideID)
 	assertDeadLetter(t, deadLetter, created)
+	if got := assignmentFailureCount(t, ctx); got <= failureCount {
+		t.Fatalf("routing outage was dead-lettered but assignment failure counter did not increase: before=%g after=%g", failureCount, got)
+	}
 	assertRideWasNotAssigned(t, ctx, created.RideID)
 }
 
@@ -253,4 +259,36 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func assignmentFailureCount(t *testing.T, ctx context.Context) float64 {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL("8082")+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status: %s", response.Status)
+	}
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "metroride_assignment_failures_total" {
+			value, err := strconv.ParseFloat(fields[1], 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+	}
+	t.Fatal("assignment failure metric missing")
+	return 0
 }

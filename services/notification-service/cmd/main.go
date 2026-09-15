@@ -80,7 +80,7 @@ func (s *notificationService) consume(ctx context.Context, log interface {
 	if o.MaxDeliveries == 0 {
 		o = reliability.DefaultStreamOptions()
 	}
-	reliability.Consume(ctx, s.rdb, events.StreamRideNotifications, cfg.ConsumerGroup, cfg.ConsumerName, o, log, func(ctx context.Context, m redis.XMessage) error {
+	reliability.Consume(ctx, s.rdb, events.StreamRideNotifications, cfg.ConsumerGroup, cfg.ConsumerName, "notification-service", o, log, func(ctx context.Context, m redis.XMessage) error {
 		env, e := events.DecodeEnvelope(m)
 		if e != nil {
 			return reliability.DecodeError(e)

@@ -21,8 +21,10 @@ type postgresDrivers struct {
 }
 
 func (s *postgresDrivers) Ready(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
 	var version int
-	return s.db.QueryRow(ctx, "select version from core_schema_migrations where version=1").Scan(&version)
+	return s.db.QueryRow(checkCtx, "select version from core_schema_migrations where version=1").Scan(&version)
 }
 func validPoint(lat, lon float64) bool {
 	return !math.IsNaN(lat) && !math.IsNaN(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
