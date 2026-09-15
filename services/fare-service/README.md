@@ -249,7 +249,7 @@ never an update or delete.
 
 Migration V5 adds insert-only `fare.quote_context`. Each new hold stores `pricing_version: passenger-road-v2`, passenger distance and duration, provider and calculation time, the rate card, and driver share (default 0.80). Completion uses the stored quote amount and share even if configuration has changed. The [event contract](../../shared/events/README.md#assignment-version-2-and-cancellation) defines the incoming route fields.
 
-A historical hold has an amount but no recorded rate or share context. It keeps that amount and uses the configured driver share when settled; the service does not infer a historical split. A legacy assignment that has not produced a hold cannot create one from driver-approach fields and is dead-lettered as invalid quote input. Apply the [core migration](../../docs/routing.md#event-version-and-existing-databases) separately; Flyway applies V5 and V6 for this service.
+A historical hold has an amount but no recorded rate or share context. It keeps that amount and uses the configured driver share when settled; the service does not infer a historical split. A legacy assignment that has not produced a hold cannot create one from driver-approach fields and is dead-lettered as `poison` (invalid quote input). Apply the [core migration](../../docs/routing.md#event-version-and-existing-databases) separately; Flyway applies V5 and V6 for this service.
 
 ### Cancellation
 

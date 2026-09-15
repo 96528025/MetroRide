@@ -6,7 +6,7 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis%20Streams-7-DC382D?logo=redis&logoColor=white)
 
-MetroRide is an event-driven ride-dispatch backend built with Go, PostgreSQL, and Redis Streams, with an optional Java/Spring Boot fare service. It uses road-route estimates for passenger-trip quotes, reserves drivers during active assignments, and recovers unfinished stream deliveries after a consumer restart.
+MetroRide is an event-driven ride-dispatch backend with six core Go services, PostgreSQL, and Redis Streams, plus an optional Java/Spring Boot fare service. It uses road-route estimates for passenger-trip quotes, reserves drivers during active assignments, and recovers unfinished stream deliveries after a consumer restart.
 
 The application models ride acceptance, assignment, completion, cancellation, and a double-entry fare ledger. Driver locations are simulated, and fare settlement records accounting entries without moving money. There is no rider or driver frontend; Grafana provides operational dashboards. The optional Kafka extension carries driver-location telemetry separately from the ride workflow.
 
@@ -19,6 +19,18 @@ The application models ride acceptance, assignment, completion, cancellation, an
 | Completion or settlement is attempted twice | Conditional `assigned → completed` update; fare event-ID deduplication, persistent per-ride row lock, per-ride unique indexes | [`rider-service`](services/rider-service/cmd/main.go), [`fare-service`](services/fare-service/README.md), concurrent completion/settlement tests |
 | A consumer crashes or receives unusable data | Go and Java consumers reclaim pending entries and dead-letter failed work before acknowledging | `RideEventConsumer`, `FailureHandler`, Testcontainers recovery tests |
 | Images build but fail when deployed | CI installs the six core images through Helm into KinD and drives a ride through the deployed stack | [Deployment workflow](.github/workflows/deploy-validation.yml) |
+
+## Quick check with local routing
+
+With Docker Compose, Bash, curl, and the application ports free, run:
+
+```bash
+bash scripts/fare-e2e-test.sh
+```
+
+The script builds and starts an isolated stack, checks settlement and free cancellation using fixed test routes, then removes its containers and volumes. It does not call a public routing provider. Initial image and dependency downloads still require network access. Go is optional because the script can run the test client in a Go container.
+
+For an interactive stack with the same fixture, see [local routing setup](docs/routing.md#explicit-local-test-fixture). The manual walkthrough below uses the configured road provider, which defaults to the public Valhalla endpoint.
 
 ## Run a ride through fare settlement
 
@@ -58,8 +70,6 @@ docker compose --profile fare down
 ```
 
 This stops the stack and preserves its data volumes.
-
-For the automated flow, run `bash scripts/fare-e2e-test.sh` with the application's ports free. It creates and removes its own Compose project, uses an explicit local route fixture, and checks the ledger and outgoing settlement event. Go is optional for this script because it can run the test client in a Go container.
 
 ## Architecture
 

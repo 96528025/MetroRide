@@ -206,10 +206,12 @@ ports are in use, so stop a running MetroRide stack first (`docker compose
 uses a Compose project name unique to the run).
 
 The script builds and starts rider, driver, routing, dispatch and fare-service
-with PostgreSQL and Redis, waits for every `/readyz`, and runs one Go test,
-`TestRideToFareSettlement` in `tests/fareintegration`. Business actions use only
+with PostgreSQL, Redis, and an explicit route fixture, waits for every `/readyz`,
+and runs both tests in `tests/fareintegration`. `TestRideToFareSettlement`
+checks completion; `TestRideCancellationReversesHoldWithoutSettlement` checks
+free cancellation and driver release. Business actions use only
 the public HTTP APIs; PostgreSQL and Redis are read to check results and never
-written to skip a step. Stage by stage:
+written to skip a step. The settlement test proceeds stage by stage:
 
 1. Create a ride with a unique `rider_id` through rider-service (`202`, a UUID
    `ride_id`).
@@ -220,6 +222,8 @@ written to skip a step. Stage by stage:
    only entry: `rider_receivable +quote`, `fare_hold -quote`, quote positive,
    `source_event_id` equal to the assignment envelope. The hold is observed
    before the completion is requested, so the settlement is a reaction to it.
+   Require version 2 passenger-route fields and compare the held quote with the
+   default rate card applied to `trip_distance_km` and `trip_duration_seconds`.
 4. Complete the ride through rider-service (`202` with the `ride_completed`
    envelope ID).
 5. Poll the ledger until it holds exactly one `quote_hold`, one `hold_reversal`
@@ -236,25 +240,30 @@ written to skip a step. Stage by stage:
    the ledger; `driver_share` equal to the configured value; the amounts and the
    share are JSON strings and `settled_at` parses as RFC 3339. `fare.event_outbox`
    holds exactly one `fare_settled` row for the ride, `published_at` set, whose
-   stored envelope equals the published one (compared as decoded JSON, because
-   `jsonb` does not keep key order). Several stream copies are accepted only if
+   stored envelope equals the published one (decoded JSON with envelope
+   `occurred_at` compared as an instant, allowing equivalent fractional-second
+   representations). Several stream copies are accepted only if
    they are the same envelope ID and content: the relay is at-least-once.
 7. Complete the ride again: `409 {"error":"ride is completed"}`, the ledger's
    entry IDs are unchanged, there is still one `ride_completed` outbox row and one
    distinct `ride_completed` envelope, and still one `fare_settled` row and one
    distinct `fare_settled` envelope.
 
-Amounts are compared as integer cents parsed from the two-decimal strings, never
-as floating point. Nothing is asserted from a demo value such as `2.85`: the quote
-is whatever fare-service held for the driver dispatch chose, and the split is
-computed from that quote and the configured share. Every wait is bounded polling
-(45 s per stage, 5 s per request), and a failure prints the stage, the ride,
-rider, driver, assignment and event IDs, and the last state observed.
+Amounts are compared as integer cents parsed from two-decimal strings. The test
+recomputes the expected quote from the assignment's passenger-route fields using
+rational arithmetic and the default fare rates, then rounds half up to cents.
+It verifies the settlement split against that held quote and `FARE_DRIVER_SHARE`.
+Every wait is bounded polling (45 s per stage, 5 s per request), and a failure
+prints the stage, workflow IDs, and last observed state.
 
-What the flow does not claim: the quote is still fare-service's current model,
-base fare plus the assigned driver's distance and ETA to the pickup point, not a
-metered passenger trip; and the flow does not exercise fault injection, load, or
-any payment.
+The cancellation test creates a separate ride, waits for its hold, cancels it,
+and verifies an equal reversal with no settlement, no remaining driver
+reservation, and a refused second cancellation.
+
+What the flow does not claim: the quote is an upfront estimate from the
+passenger route, not a metered trip. The fixed route fixture does not establish
+real-world travel times or public-provider availability. These two tests do not
+exercise fault injection, load, or actual payment processing.
 
 ## Running Everything Locally
 
