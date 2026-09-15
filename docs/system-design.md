@@ -1,6 +1,6 @@
 # MetroRide System Design
 
-MetroRide is a portfolio-scale local distributed-systems project that demonstrates backend infrastructure concepts through a ride dispatch domain. It is not deployed at real production scale; it is designed to show how a distributed backend can be decomposed, instrumented, and hardened for reliability.
+MetroRide is a small-scale local distributed-systems project that demonstrates backend infrastructure concepts through a ride dispatch domain. It is not deployed at real production scale; it is designed to show how a distributed backend can be decomposed, instrumented, and hardened for reliability.
 
 ## Problem Statement
 
