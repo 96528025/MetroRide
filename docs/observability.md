@@ -110,11 +110,8 @@ Recommended production alerts:
 
 ## Recovery and optional targets
 
-CI validates the backend, the Java fare service, the Compose fare flow, and the six core services deployed into disposable KinD clusters. Fare-service and the optional analytics extension remain outside the six-image Helm delivery path. Passing deployment validation does not indicate a continuously hosted application.
+The Go consumer counters `metroride_stream_deliveries_total{stream,path}` and `metroride_stream_processing_failures_total{stream}` separate new and reclaimed deliveries from failed processing attempts. Labels use fixed stream names, with no ride IDs or coordinates. See [recovery behavior](reliability.md#consumer-recovery) when interpreting retries.
 
-Prometheus scrapes the configured core services, including traffic-service. Optional fare and analytics targets appear unavailable when their profiles are not running. Notification counters count processing attempts rather than unique customer notifications.
+Prometheus includes traffic-service in its core targets. Fare and analytics targets appear down when their optional profiles are disabled. Notification counters measure processing attempts and can increase again on redelivery.
 
-Go and Java consumers decode the JSON event payloads used by their workflows. Assignment contracts distinguish driver approach from passenger-trip estimates. Cancellation and completion events describe guarded ride state changes; fare events describe the resulting ledger operations.
-The routing microbenchmark measures only the in-process candidate-selection calculation over 10,000 driver records. It excludes database reads, road-route requests, reservation transactions, and the rest of the ride workflow. Its result is not an end-to-end dispatch capacity measurement.
-
-The Go consumer counters `metroride_stream_deliveries_total{stream,path}` and `metroride_stream_processing_failures_total{stream}` distinguish new and reclaimed deliveries and failures. They use fixed stream names and no ride IDs or coordinates as labels. Traffic-service is included in Prometheus scrapes. Fare and analytics targets show down when their optional profiles are not running. Notification counts represent processed deliveries, including repeats.
+The routing helper benchmark excludes database and provider latency; use the [performance notes](performance.md) for its scope. Deployment-check coverage is documented in [CI/CD](cicd.md).

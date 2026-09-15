@@ -18,7 +18,7 @@ Streams (see `shared/pkg/events/events.go`):
 
 The optional `kafka` Compose profile already carries driver locations on Kafka, using a separate flat `DriverLocationEvent` (`shared/pkg/kafka/events.go`) rather than this envelope. Moving the Redis streams to Kafka would mean choosing between that flat shape and the envelope; the envelope itself is transport-neutral.
 
-`services/fare-service` (Java) runs under the optional `fare` Compose profile and consumes assignments, completions, and cancellations through its `fare-service` group. It deduplicates envelope IDs and serializes each ride's ledger transitions through `fare.ride_state`. Version 2 assignments quote passenger distance and duration, preserving immutable rate and driver-share context. Completion settles the stored quote; cancellation reverses an existing hold without a fee. A completion arriving before assignment remains retryable. A cancellation arriving first records a tombstone that prevents a later assignment from creating a hold. `fare_settled` is published through the Java transactional outbox with at-least-once delivery.
+The Java fare consumer reads the three ride-event streams using the `fare-service` group. Events from separate outbox relays may arrive out of order. Consumer transitions, quote validation, and ledger deduplication are documented in the [fare service guide](../../services/fare-service/README.md#processing-rule).
 
 Go dead letters retain `original_stream` and `original_values`, including the original encoded event when present. These optional fields support investigation and deliberate replay without treating a failure summary as the original payload. Default delivery limits and timeout settings are documented in [reliability](../../docs/reliability.md).
 

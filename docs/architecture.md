@@ -12,17 +12,9 @@ The default Docker Compose profile runs six core application service roles and 1
 - Expose health, readiness, metrics, and structured logs from every service.
 - Provide a clear path from Docker Compose to Kubernetes and Helm deployment.
 
-## Why Microservices?
+## Design Rationale
 
-The ride dispatch domain has naturally separate scaling and failure profiles:
-
-- Ride intake is request-driven and latency sensitive.
-- Driver location ingestion is high frequency and stream-oriented.
-- Dispatch assignment is workflow-oriented and benefits from consumer groups.
-- Routing is compute-heavy and can evolve independently.
-- Notifications are side effects that should not block ride creation.
-
-Separating these responsibilities makes the architecture easier to scale and reason about. It also prevents non-critical workflows, such as notification delivery, from directly impacting the rider request path.
+See [system design](system-design.md) for the tradeoffs behind service boundaries, asynchronous coordination, and the choice of PostgreSQL and Redis Streams.
 
 ## Service Boundaries
 
@@ -70,30 +62,15 @@ The shared event envelope includes event ID, type, source, correlation ID, times
 
 ## Runtime Workflow
 
-1. `rider-service` receives `POST /v1/rides`.
-2. The ride and a pending `ride_requested` outbox event are committed together in PostgreSQL.
-3. `rider-service` returns `202`; its relay publishes the pending event to Redis Streams asynchronously.
-4. `dispatch-service` consumes the request with a Redis consumer group.
-5. `dispatch-service` calls `routing-service` for nearest-driver selection.
-6. `routing-service` reads shared, fresh, unreserved driver positions and compares a bounded shortlist using road-route approach duration; it also obtains the passenger route.
-7. `dispatch-service` atomically acquires the exclusive driver reservation and commits the assignment, status update, and pending assignment and notification outbox events together.
-8. Its relay publishes both pending events to their Redis Streams asynchronously.
-9. `notification-service` consumes notification events and logs simulated delivery.
-10. When the `fare` profile is enabled, `fare-service` consumes the assignment event and, in one transaction, records its envelope ID in `fare.processed_events`, quotes the fare from `trip_distance_km` and `trip_duration_seconds`, and appends a `quote_hold` journal entry with two postings that sum to zero; a redelivery is acknowledged without a second row or a second entry.
-11. `POST /v1/rides/{ride_id}/complete` on `rider-service` moves the ride from `assigned` to `completed` with a conditional update, requires exactly one `ride_assignments` row, and commits a `ride_completed` outbox event in the same transaction; its relay publishes it to `events.ride.completions`. `fare-service` consumes it and, in one transaction, locks the persistent `fare.ride_state` row (`select ... for update`) and checks its hold, refuses a malformed hold or an existing settlement (dead-lettered under its own reason; a second hold for a ride cannot exist, a partial unique index refuses it and the second assignment event is dead-lettered as `duplicate_hold`), and otherwise appends a `hold_reversal` and a `settlement` that splits the quoted amount between `driver_payable` (the share stored at quote time, rounded once) and `platform_revenue` (the remainder). A completion that arrives before its assignment stays pending and is retried by the reclaim pass until the hold exists. Settlement is by quote; no actual distance or time is metered.
-12. In the same transaction, `fare-service` inserts a `fare_settled` row into `fare.event_outbox`; its own relay (same statements, backoff and at-least-once semantics as `shared/pkg/outbox`) publishes it to `events.ride.fares`. Nothing consumes that stream yet.
+1. Rider-service commits the requested ride and its outbox event, then returns `202`.
+2. Its relay publishes to Redis; dispatch consumes the request and asks routing for a candidate and passenger-route estimate.
+3. Routing reads shared driver positions and calls the configured provider before dispatch opens the assignment transaction.
+4. Dispatch rechecks the candidate and commits the reservation, ride assignment, and both outgoing events in PostgreSQL.
+5. The dispatch relay publishes to the assignment and notification streams. Notification-service logs delivery; optional fare-service creates the quote hold.
+6. Rider-service handles completion or cancellation by updating the ride, releasing its reservation, and writing an event in one transaction.
+7. Fare-service processes that event in its own transaction. Completion also creates a `fare_settled` outbox row; cancellation reverses an existing hold. The fare relay publishes settlement events asynchronously.
 
-## Why Redis Streams?
-
-Redis Streams are a pragmatic transport for the MVP because they provide:
-
-- Durable append-only stream semantics.
-- Consumer groups for horizontal consumer scaling.
-- Explicit acknowledgements for retry and replay behavior.
-- Simple local operations through Docker Compose.
-- A clean bridge toward Kafka-style event logs.
-
-Kafka is the natural next transport when the system requires stronger partitioning semantics, longer retention, higher fanout, and broader ecosystem integration. MetroRide keeps event definitions transport-neutral to make that migration incremental.
+Each database transaction ends at its owning service. The event transport permits duplicate and out-of-order delivery between those transactions. The [reliability guide](reliability.md#state-guards) explains the state guards; the [fare guide](../services/fare-service/README.md#cancellation) covers ledger ordering. Field-level contracts are in the [event reference](../shared/events/README.md), and provider behavior is in [road routing](routing.md).
 
 ## Fault Tolerance Concepts
 
@@ -131,20 +108,3 @@ The repository includes Docker Compose for local orchestration, raw Kubernetes m
 The Helm chart is not scaffolding: CI installs it on an ephemeral KinD cluster on every run, with commit-SHA-pinned images, tuned health and readiness probes, resource requests and limits, and chart-owned test-only PostgreSQL and Redis, then drives a real ride through the deployed system before deleting the cluster. See [cicd.md](cicd.md).
 
 What that does *not* demonstrate is a hosted environment. No cloud account or persistent infrastructure exists, and environment-specific work such as secrets management, ingress, persistent volumes and autoscaling is deliberately left for future implementation. The raw manifests in `infrastructure/k8s` remain scaffolding.
-
-## Passenger routes and shared driver state
-
-A fare quote uses the estimated road distance and duration from the passenger's pickup point to the drop-off point. The driver's approach to the pickup is recorded separately and is not used as the passenger-trip distance.
-
-Routing requests use Valhalla's `auto` costing model through a configurable endpoint. The route provider, calculation time, distance, and duration are stored with the assignment. A routing failure leaves the ride unassigned for retry; the service does not substitute a straight-line distance and label it as a road route.
-
-Fare-service stores the resulting quote and pricing inputs when it creates the hold. Completion settles that stored quote, so a later route or rate change does not reprice an existing hold. These are upfront route-based estimates using configurable demonstration rates. The application does not measure the passenger's actual driven path, apply live traffic pricing, or collect payments.
-The default driver share is 0.80. The quote, rate version, and driver share are fixed when the hold is created. Money is represented with decimal arithmetic and rounded to cents at the documented calculation boundaries.
-
-Driver locations and active reservations are shared through PostgreSQL. A location update can refresh a driver's position without clearing an active reservation. Stale location reports are excluded from selection, and an older event cannot overwrite a newer position.
-
-Dispatch considers available drivers with recent locations. It ranks a bounded shortlist using estimated road travel time to the pickup; the shortlist is not a global optimization across every driver. The assignment, exclusive driver reservation, ride state change, and outgoing events commit in one database transaction. If another ride reserves the candidate first, dispatch retries selection.
-
-Completing or canceling an assigned ride releases its driver in the same transaction as the ride state change and outgoing event. Conditional state changes prevent completion and cancellation from both succeeding for the same ride. A delayed duplicate request cannot reserve a driver again for an ended ride.
-
-See [routing](routing.md), [reliability](reliability.md), and [fare-service](../services/fare-service/README.md) for versioned events, cancellation, and migrations.

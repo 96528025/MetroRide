@@ -127,9 +127,7 @@ Responses:
 
 A requested or assigned ride can be canceled. A successful transition returns `202` with `ride_id`, `status: "cancelled"`, and the cancellation event's `event_id`. An unknown ride returns `404`; a completed or already canceled ride returns `409`.
 
-Cancellation releases any active driver reservation. If fare-service is enabled, it releases an existing quote hold without creating a settlement or cancellation fee. A cancellation received before the assignment event is recorded so that a late assignment cannot create a new hold for the canceled ride. Ledger changes and event deduplication commit together.
-
-Completion remains `POST /v1/rides/{ride_id}/complete` and requires an assigned ride. Completion and cancellation compete for the same guarded state transition; at most one succeeds.
+Cancellation commits the ride transition, driver release, and outgoing event together. With fare-service enabled, reversal of any existing quote hold happens asynchronously and carries no cancellation fee. See the [fare cancellation contract](../services/fare-service/README.md#cancellation) for event-ordering behavior. Completion and cancellation compete for one guarded ride transition; at most one succeeds.
 
 ## Dispatch Service
 

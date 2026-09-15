@@ -81,6 +81,8 @@ flowchart LR
     DB -->|Rider relay| Completions[events.ride.completions]
     Assignments --> Fare[Optional fare-service / Java]
     Completions --> Fare
+    DB -->|Rider relay| Cancellations[events.ride.cancellations]
+    Cancellations --> Fare
     Fare -->|Event deduplication + ledger + outbox in one transaction| DB
     DB -->|Fare relay| Fares[events.ride.fares]
     Dispatch -.-> DLQ[events.dead_letter]
@@ -91,65 +93,35 @@ The core data path uses HTTP/JSON, PostgreSQL, and Redis Streams. The repository
 
 | Service | Port | Responsibility | Default stack |
 | --- | ---: | --- | --- |
-| `rider-service` | 8080 | Create/read rides, complete assigned rides, publish through its outbox relay | Yes |
+| `rider-service` | 8080 | Create/read rides, complete or cancel rides, publish through its outbox relay | Yes |
 | `driver-service` | 8081 | Publish locations for four simulated drivers every two seconds | Yes |
 | `dispatch-service` | 8082 | Consume requests, call routing, persist assignment and two outbox destinations | Yes |
 | `routing-service` | 8083 | Share driver positions in PostgreSQL; compare road approaches | Yes |
 | `traffic-service` | 8084 | Publish simulated congestion every ten seconds; currently no consumer | Yes |
 | `notification-service` | 8085 | Log and count notification deliveries | Yes |
 | `analytics-service` | 8086 | Expose latest driver locations consumed from Kafka | Optional `kafka` profile |
-| `fare-service` | 8087 | Consume assignments/completions; quote, hold, settle, expose the ledger, and publish `fare_settled` through its own outbox relay | Optional `fare` profile |
+| `fare-service` | 8087 | Process ride events; quote, settle or reverse holds, expose the ledger, and publish `fare_settled` | Optional `fare` profile |
 
 ## A ride from request to settlement
 
-Driver locations and active reservations are shared through PostgreSQL. A location update can refresh a driver's position without clearing an active reservation. Stale location reports are excluded from selection, and an older event cannot overwrite a newer position.
+1. Accept the request and publish it through the rider outbox.
+2. Select a driver using a road-route shortlist, then reserve that driver and commit the assignment together.
+3. With fare-service enabled, create a quote hold from the passenger route and save the pricing inputs.
+4. Complete the ride to settle the saved quote, or cancel it without a fee. Either transition releases the driver; cancellation reverses any existing hold.
 
-Dispatch considers available drivers with recent locations. It ranks a bounded shortlist using estimated road travel time to the pickup; the shortlist is not a global optimization across every driver. The assignment, exclusive driver reservation, ride state change, and outgoing events commit in one database transaction. If another ride reserves the candidate first, dispatch retries selection.
-
-Completing or canceling an assigned ride releases its driver in the same transaction as the ride state change and outgoing event. Conditional state changes prevent completion and cancellation from both succeeding for the same ride. A delayed duplicate request cannot reserve a driver again for an ended ride.
-
-A fare quote uses the estimated road distance and duration from the passenger's pickup point to the drop-off point. The driver's approach to the pickup is recorded separately and is not used as the passenger-trip distance.
-
-Routing requests use Valhalla's `auto` costing model through a configurable endpoint. The route provider, calculation time, distance, and duration are stored with the assignment. A routing failure leaves the ride unassigned for retry; the service does not substitute a straight-line distance and label it as a road route.
-
-Fare-service stores the resulting quote and pricing inputs when it creates the hold. Completion settles that stored quote, so a later route or rate change does not reprice an existing hold. These are upfront route-based estimates using configurable demonstration rates. The application does not measure the passenger's actual driven path, apply live traffic pricing, or collect payments.
-The default driver share is 0.80. The quote, rate version, and driver share are fixed when the hold is created. Money is represented with decimal arithmetic and rounded to cents at the documented calculation boundaries.
+The routing model provides estimates, while driver movement remains simulated. For selection rules and provider settings, see [road routing](docs/routing.md). The [API reference](docs/api.md#rider-service) describes the request and response contracts.
 
 ## Fare ledger and pricing boundary
 
-```text
-quote = 2.50 + 1.20 * trip_distance_km + 0.30 * trip_duration_seconds / 60
-driver share = round_to_cents(quote * stored_driver_share)
-platform share = quote - driver share
-```
+Fare-service keeps an append-only ledger: a quote hold is followed by reversal and settlement, or by a cancellation reversal. The quote-time rate card and driver share remain attached to the ride. The [fare guide](services/fare-service/README.md#fare-and-ledger) defines the calculation, posting rules, cancellation ordering, and legacy-hold policy.
 
-### Cancel a ride
-
-`POST /v1/rides/{ride_id}/cancel`
-
-A requested or assigned ride can be canceled. A successful transition returns `202` with `ride_id`, `status: "cancelled"`, and the cancellation event's `event_id`. An unknown ride returns `404`; a completed or already canceled ride returns `409`.
-
-Cancellation releases any active driver reservation. If fare-service is enabled, it releases an existing quote hold without creating a settlement or cancellation fee. A cancellation received before the assignment event is recorded so that a late assignment cannot create a new hold for the canceled ride. Ledger changes and event deduplication commit together.
-
-Completion remains `POST /v1/rides/{ride_id}/complete` and requires an assigned ride. Completion and cancellation compete for the same guarded state transition; at most one succeeds.
-
-New assignment payloads identify their schema version and separate driver-approach fields from passenger-trip fields. Missing trip fields are not interpreted as zero, and legacy pickup-distance fields are not silently treated as passenger-trip measurements.
-
-Existing ledger entries are preserved. Legacy holds settle using their stored quote under the documented legacy policy; they are not recalculated from a new route. Legacy assignment events that have not yet produced a hold are sent for review instead of creating a quote from unverified passenger-trip inputs. Database migrations preserve existing rows and reject conflicting active assignments rather than choosing which ride owns a driver.
-
-See [fare-service](services/fare-service/README.md) for decimal arithmetic and legacy policy.
+For an existing database, follow the [migration instructions](docs/routing.md#event-version-and-existing-databases) before starting the new services. Conflicting historical driver assignments require explicit resolution.
 
 ## Reliability and operational limits
 
-The Go consumers for dispatch, driver locations, and notifications read new deliveries and periodically reclaim eligible pending entries with `XAUTOCLAIM`. Each instance has its own consumer name, and reclaim scanning retains its cursor. Successful processing is acknowledged only after the relevant state change has completed.
+Transactional outboxes connect database changes to event publication. Consumers can reclaim unfinished deliveries after restart, but redelivery is still possible; state guards protect assignments and ledger writes. Notification logs and counters may repeat. See [failure recovery](docs/reliability.md) for retry limits, acknowledgment ordering, and timeout settings.
 
-Reclaiming does not make delivery exactly-once. Dispatch uses guarded database transitions and unique reservations; location updates reject older timestamps. Notification logs and delivery counters can repeat after redelivery and are not presented as unique notifications.
-
-Retryable failures remain pending. Malformed messages and exhausted delivery attempts are copied to the dead-letter stream before acknowledgment. If dead-letter publication fails, the original remains pending. Reclaim idle time must exceed the bounded processing budget; repeated delivery remains possible and is handled by the state guards.
-
-PostgreSQL domain state and outgoing events commit together in a transactional outbox. Relays publish at least once; Redis Streams persistence, retention, and backups are separate operational responsibilities. There is no client-create request deduplication, authentication, payment collection, or production availability guarantee.
-
-See [routing and migration](docs/routing.md), [reliability](docs/reliability.md), and [API](docs/api.md).
+Redis persistence and retention, external routing availability, and manual dead-letter replay remain operational concerns. The application has no client-create deduplication, authentication, payment collection, actual-trip metering, or production availability guarantee.
 
 ## Verification
 
@@ -189,7 +161,7 @@ Kafka is a telemetry extension; Redis Streams remains the ride workflow transpor
 
 ## Repository guide
 
-[Architecture](docs/architecture.md) · [API](docs/api.md) · [Reliability](docs/reliability.md) · [Fare service](services/fare-service/README.md) · [Observability](docs/observability.md) · [Testing](docs/testing-and-ci.md) · [Deployment](docs/cicd.md) · [Kafka extension](docs/kafka-lightweight-extension.md)
+[Architecture](docs/architecture.md) · [Design decisions](docs/system-design.md) · [Road routing](docs/routing.md) · [API](docs/api.md) · [Reliability](docs/reliability.md) · [Fare service](services/fare-service/README.md) · [Observability](docs/observability.md) · [Testing](docs/testing-and-ci.md) · [Deployment](docs/cicd.md) · [Kafka extension](docs/kafka-lightweight-extension.md)
 
 The root README describes the combined current workflow. Service-specific source, migrations, and tests provide the detailed behavioral contracts.
 

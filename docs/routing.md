@@ -6,7 +6,7 @@ Passenger quotes use a pickup-to-drop-off route. Driver selection uses a shortli
 
 Requests use `costing: "auto"` and kilometer units. Route metadata records the provider and calculation time. Estimates depend on the provider's map and routing model; they are not observed trip times.
 
-The client uses bounded request deadlines and a shared, conservative request-start limit when calling the public endpoint. Duplicate route requests share short-lived cached results. Routes are computed before the assignment transaction so no database reservation is held while waiting for the provider.
+The shared route cache lasts one minute; duplicate requests coordinate through Redis. Request starts are spaced by at least one second per endpoint across replicas. Each provider call has a ten-second limit; the nearest-driver operation has a sixty-second budget. The public provider can return no route, reject requests, or be unavailable; no fixture or straight-line fallback is selected automatically. Routes are computed before the assignment transaction, so no driver reservation is held during the provider call.
 
 `DRIVER_LOCATION_MAX_AGE_SECONDS` defaults to 15. An old location is excluded even if the driver has no active reservation. Simulator updates do not release reservations.
 
@@ -16,11 +16,7 @@ See [Valhalla's route documentation](https://valhalla.github.io/valhalla/api/rou
 
 ## Event version and existing databases
 
-New assignment payloads identify their schema version and separate driver-approach fields from passenger-trip fields. Missing trip fields are not interpreted as zero, and legacy pickup-distance fields are not silently treated as passenger-trip measurements.
-
-Existing ledger entries are preserved. Legacy holds settle using their stored quote under the documented legacy policy; they are not recalculated from a new route. Legacy assignment events that have not yet produced a hold are sent for review instead of creating a quote from unverified passenger-trip inputs. Database migrations preserve existing rows and reject conflicting active assignments rather than choosing which ride owns a driver.
-
-Version 2 `ride_assigned` records retain `distance_km` and `eta_seconds` for the driver's approach. Passenger inputs are required `trip_distance_km` and `trip_duration_seconds`; `route_provider` and `route_calculated_at` identify the estimate. Missing fields never become a zero-distance quote.
+The [assignment event contract](../shared/events/README.md#assignment-version-2-and-cancellation) defines version 2's separate approach and passenger fields. Fare-service owns input validation, quote freezing, and the [legacy-hold policy](../services/fare-service/README.md#quote-context-and-legacy-holds).
 
 Before upgrading a database with existing rows, stop the Go services that write rides and assignments and make a backup. Apply the core migration using a PostgreSQL client:
 
@@ -29,8 +25,6 @@ POSTGRES_DSN='postgres://metroride:metroride@localhost:5432/metroride?sslmode=di
 ```
 
 The migration runs in one transaction. It preserves rides, assignments, and outbox rows, and restores reservations for active historical rides. Conflicting or missing active drivers cause the migration to fail; resolve those records explicitly before retrying. Fresh Compose databases use the same schema from `init.sql`. Fare-service separately applies Flyway migrations V5 (quote context) and V6 (cancellation state) to the `fare` schema.
-
-Historical holds retain their stored amount. If a hold predates quote context, completion uses the current configured driver share as the explicit legacy policy. It does not invent a historical route or historical split. New holds store the original rate card and split, which completion reuses even after configuration changes.
 
 ## Explicit local test fixture
 
@@ -42,5 +36,3 @@ docker compose --profile fare down
 ```
 
 `tests/routingfixture/main.go` returns deterministic contract data. Its standard passenger route is 8.5 km and 920.5 seconds; driver approach fixtures return 1.25 km and 180 seconds. These figures are test inputs, not measured road travel. KinD validation enables the same fixture through `routingFixture.enabled`; the ordinary Helm and Compose defaults use the configured Valhalla endpoint.
-
-The shared route cache lasts one minute; duplicate requests coordinate through Redis. Request starts are spaced by at least one second per endpoint across replicas. Each provider call has a ten-second limit; the nearest-driver operation has a sixty-second budget. The public provider can return no route, reject requests, or be unavailable; no fixture or straight-line fallback is selected automatically.

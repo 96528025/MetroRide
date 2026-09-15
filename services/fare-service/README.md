@@ -1,15 +1,8 @@
 # fare-service
 
-A Java service in the MetroRide monorepo. It consumes `events.ride.assignments` and
-`events.ride.completions` from Redis Streams through the consumer group `fare-service`, records
-every envelope it sees once in its own PostgreSQL schema, for each first-seen `ride_assigned`
-quotes the fare from the assignment's distance and ETA and holds that quote in a double-entry
-ledger, and for each first-seen `ride_completed` reverses that hold and settles the quoted
-amount between the driver and the platform, and announces that settlement on
-`events.ride.fares` through a transactional outbox in its own schema. Settlement is by quote: the
-amount settled is the amount held, nothing is metered. An entry it cannot handle is retried from
-the consumer group's pending list, or written to `events.dead_letter`; see "Failure handling and
-pending-entry recovery". Nothing consumes `events.ride.fares` yet; see "Publication".
+The Java fare service owns MetroRide's quote holds, settlement postings, and cancellation reversals in PostgreSQL. It consumes assignment, completion, and cancellation events from Redis Streams and publishes `fare_settled` through its own transactional outbox. Amounts come from saved passenger-route quotes; this service does not meter trips or move money.
+
+For HTTP ride actions, use the [rider API](../../docs/api.md#rider-service). For route selection and provider configuration, see [road routing](../../docs/routing.md). This guide covers the ledger, consumer failure policy, schema, and service operation.
 
 ## What is here
 
@@ -17,7 +10,7 @@ pending-entry recovery". Nothing consumes `events.ride.fares` yet; see "Publicat
 | --- | --- | --- |
 | Environment mapping | `config/MetroRideEnvironmentPostProcessor` | Reads `FARE_SERVICE_ADDR`, `POSTGRES_DSN`, `REDIS_ADDR` (same names and defaults as `shared/pkg/config/config.go`) and derives the Spring properties |
 | Consumer settings | `config/ConsumerProperties`, `application.yml` | Group and consumer name come from `CONSUMER_GROUP` and `CONSUMER_NAME` through the same post-processor; the `streams` list, batch size and block timeout live in `application.yml` |
-| Envelope contract | `events/Envelope`, `events/RideAssigned`, `events/RideCompleted`, `events/EnvelopeCodec` | Field-for-field match with `shared/pkg/events/events.go`; the stream entry field is `event`, as written by `events.Publish` |
+| Envelope contract | `events/Envelope`, `events/RideAssigned`, `events/RideCompleted`, `events/RideCancelled`, `events/EnvelopeCodec` | Field-for-field match with `shared/pkg/events/events.go`; the stream entry field is `event`, as written by `events.Publish` |
 | Rate card | `pricing/FareProperties`, `application.yml` | `base-fare`, `per-km`, `per-minute`, `driver-share` as exact decimals under `metroride.fare` |
 | Fare calculation | `pricing/FareCalculator` | Pure function of passenger road distance, duration, and the rate card; no Spring dependency |
 | Ledger model | `ledger/Money`, `Account`, `JournalKind`, `Posting`, `JournalEntry` | Records and enums; the balance invariant is checked in the `JournalEntry` constructor; the `quoteHold`, `holdReversal` and `settlement` factories are the completion shapes; cancellation uses a separately named hold reversal |
@@ -251,6 +244,25 @@ positive and credit negative:
 Accounts are text codes (`rider_receivable`, `fare_hold`, `driver_payable`, `platform_revenue`);
 there is no accounts table. Both tables are append-only: a correction is a new reversing entry,
 never an update or delete.
+
+### Quote context and legacy holds
+
+Migration V5 adds insert-only `fare.quote_context`. Each new hold stores `pricing_version: passenger-road-v2`, passenger distance and duration, provider and calculation time, the rate card, and driver share (default 0.80). Completion uses the stored quote amount and share even if configuration has changed. The [event contract](../../shared/events/README.md#assignment-version-2-and-cancellation) defines the incoming route fields.
+
+A historical hold has an amount but no recorded rate or share context. It keeps that amount and uses the configured driver share when settled; the service does not infer a historical split. A legacy assignment that has not produced a hold cannot create one from driver-approach fields and is dead-lettered as invalid quote input. Apply the [core migration](../../docs/routing.md#event-version-and-existing-databases) separately; Flyway applies V5 and V6 for this service.
+
+### Cancellation
+
+Migration V6 adds `fare.ride_state` and a unique cancellation-reversal index. The recorder locks a persistent row for the ride before handling any of its three event types, including when no quote hold exists yet.
+
+| Ledger state when cancellation arrives | Result in the event transaction |
+| --- | --- |
+| No hold | Record canceled state; a late assignment is acknowledged without creating a hold |
+| Existing hold | Append `cancellation_reversal` with opposite postings, then mark canceled; no fee or settlement |
+| Already canceled | Record a new envelope ID if needed, without another reversal |
+| Already settled | Reject cancellation as `already_settled` |
+
+Event-ID deduplication, state changes, and reversal postings commit together. A completion after cancellation is quarantined as `cancelled_ride`. HTTP admission rules and driver release belong to rider-service; see [Cancel a ride](../../docs/api.md#cancel-a-ride).
 
 ### Settlement
 
@@ -681,8 +693,6 @@ curl -s localhost:8087/v1/rides/<ride uuid>/ledger                              
 - Only `fare_settled` is published; no event marks the hold, and nothing in this repository
   consumes `events.ride.fares`. See "Publication" for what the outbox does not do (no attempt
   ceiling, no outbox dead letter, no deduplication, no process-kill test on the Java side).
-- Per-ride state locks serialize assignment, completion, and cancellation across instances; unrelated rides remain independent.
-
 - No database trigger for the ledger balance rule; see "Fare and ledger" for when to add one.
 - No consumer of `events.dead_letter` and no replay tool: a dead-lettered entry is inspected
   and replayed by hand (the original entry is still in its stream, acknowledged but not deleted).
@@ -690,26 +700,3 @@ curl -s localhost:8087/v1/rides/<ride uuid>/ledger                              
 - No pause while PostgreSQL is unreachable: deliveries keep accumulating during an outage, so
   one longer than the retry window ends with entries in the dead-letter stream.
 - No Helm chart entry. Compose is the only runtime for this service so far.
-
-## Passenger route quotes and cancellation
-
-A fare quote uses the estimated road distance and duration from the passenger's pickup point to the drop-off point. The driver's approach to the pickup is recorded separately and is not used as the passenger-trip distance.
-
-Routing requests use Valhalla's `auto` costing model through a configurable endpoint. The route provider, calculation time, distance, and duration are stored with the assignment. A routing failure leaves the ride unassigned for retry; the service does not substitute a straight-line distance and label it as a road route.
-
-Fare-service stores the resulting quote and pricing inputs when it creates the hold. Completion settles that stored quote, so a later route or rate change does not reprice an existing hold. These are upfront route-based estimates using configurable demonstration rates. The application does not measure the passenger's actual driven path, apply live traffic pricing, or collect payments.
-The default driver share is 0.80. The quote, rate version, and driver share are fixed when the hold is created. Money is represented with decimal arithmetic and rounded to cents at the documented calculation boundaries.
-
-### Cancel a ride
-
-`POST /v1/rides/{ride_id}/cancel`
-
-A requested or assigned ride can be canceled. A successful transition returns `202` with `ride_id`, `status: "cancelled"`, and the cancellation event's `event_id`. An unknown ride returns `404`; a completed or already canceled ride returns `409`.
-
-Cancellation releases any active driver reservation. If fare-service is enabled, it releases an existing quote hold without creating a settlement or cancellation fee. A cancellation received before the assignment event is recorded so that a late assignment cannot create a new hold for the canceled ride. Ledger changes and event deduplication commit together.
-
-Completion remains `POST /v1/rides/{ride_id}/complete` and requires an assigned ride. Completion and cancellation compete for the same guarded state transition; at most one succeeds.
-
-V5 stores `fare.quote_context` with `pricing_version: passenger-road-v2`, passenger route inputs, provider/time, rate card, and driver share. V6 adds `fare.ride_state` to serialize all three event types, and `cancellation_reversal` for free cancellation. Quote context is insert-only. A cancellation tombstone can exist before any hold; an assignment delivered later is recorded without creating a hold. Completed rides cannot be canceled in the ledger.
-
-Legacy holds keep their stored amount and use the configured driver share at settlement because no historical split was recorded. Version 2 holds always use the split stored with their quote. Legacy assignment events without a hold cannot create one from approach-only data; they are quarantined/dead-lettered as invalid quote input. See [routing and migration](../../docs/routing.md).
