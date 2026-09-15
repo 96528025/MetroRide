@@ -21,6 +21,9 @@ concurrency:
 jobs:
   backend:
     name: Backend validation
+    env:
+      COMPOSE_FILE: docker-compose.yml:tests/routingfixture/compose.yml
+      COMPOSE_PROJECT_NAME: metroride-ci
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -63,8 +66,17 @@ jobs:
       - name: Run smoke test
         run: bash scripts/smoke-test.sh
 
+      - name: Validate Go pending recovery and route caching
+        run: TEST_REDIS_ADDR=127.0.0.1:6379 TEST_POSTGRES_DSN='postgres://metroride:metroride@localhost:5432/metroride?sslmode=disable' go test -race ./shared/pkg/reliability ./services/routing-service/cmd ./services/dispatch-service/cmd
+
       - name: Run integration tests
         run: go test -race -count=1 -tags=integration ./tests/integration
+
+      - name: Verify dispatch restart and pending replay
+        timeout-minutes: 3
+        env:
+          PENDING_RECOVERY_PROJECT: metroride-ci
+        run: go test -race -count=1 -tags=pendingintegration ./tests/pendingintegration
 
       - name: Run Redis outage transactional outbox recovery test
         id: outbox-recovery

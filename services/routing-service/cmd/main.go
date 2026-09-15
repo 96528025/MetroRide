@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"math"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -42,17 +43,20 @@ type driver struct {
 }
 
 type routingService struct {
-	logDrivers sync.RWMutex
-	drivers    map[string]driver
-	rdb        *redis.Client
+	store   driverStore
+	routes  routeEstimator
+	rdb     *redis.Client
+	cfg     config.Config
+	options reliability.StreamOptions
 }
-
 type nearestDriverRequest struct {
-	PickupLat float64 `json:"pickup_lat"`
-	PickupLng float64 `json:"pickup_lng"`
+	PickupLat  *float64 `json:"pickup_lat"`
+	PickupLng  *float64 `json:"pickup_lng"`
+	DropoffLat *float64 `json:"dropoff_lat"`
+	DropoffLng *float64 `json:"dropoff_lng"`
 }
 
-const nearestDriverAlgorithm = "haversine-nearest"
+const nearestDriverAlgorithm = "road-time-shortlist"
 
 func main() {
 	metrics.RegisterCommon()
@@ -67,15 +71,17 @@ func main() {
 	})
 	defer func() { _ = rdb.Close() }()
 
-	svc := &routingService{
-		drivers: map[string]driver{
-			"driver-seed-1": {ID: "driver-seed-1", Latitude: 37.7749, Longitude: -122.4194, Available: true, UpdatedAt: time.Now().UTC()},
-			"driver-seed-2": {ID: "driver-seed-2", Latitude: 37.7849, Longitude: -122.4094, Available: true, UpdatedAt: time.Now().UTC()},
-			"driver-seed-3": {ID: "driver-seed-3", Latitude: 37.7649, Longitude: -122.4294, Available: true, UpdatedAt: time.Now().UTC()},
-		},
-		rdb: rdb,
+	db, err := pgxpool.New(context.Background(), cfg.PostgresDSN)
+	if err != nil {
+		log.Error("configure database failed", "error", err)
+		os.Exit(1)
 	}
-	activeDrivers.Set(3)
+	defer db.Close()
+	endpoint := os.Getenv("VALHALLA_BASE_URL")
+	if endpoint == "" {
+		endpoint = "https://valhalla1.openstreetmap.de"
+	}
+	svc := &routingService{store: &postgresDrivers{db, config.DriverMaxAge()}, routes: &valhallaClient{endpoint, &http.Client{Timeout: 10 * time.Second}, rdb}, rdb: rdb, cfg: cfg, options: reliability.StreamOptionsFromEnv()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -83,10 +89,12 @@ func main() {
 
 	mux := httpx.CommonMuxWithReadiness(log, map[string]httpx.ReadinessCheck{
 		"redis":                  svc.checkRedis,
+		"postgres":               svc.store.Ready,
 		"driver_location_stream": svc.checkDriverLocationStream,
 	})
 	mux.HandleFunc("POST /v1/routes/nearest-driver", svc.nearestDriver)
 	server := httpx.NewServer(cfg.HTTPAddr, mux)
+	server.WriteTimeout = 65 * time.Second
 	go func() {
 		log.Info("routing-service listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -105,6 +113,9 @@ func main() {
 }
 
 func (s *routingService) nearestDriver(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	start := time.Now()
 	defer func() { routingDuration.Observe(time.Since(start).Seconds()) }()
 
@@ -114,26 +125,50 @@ func (s *routingService) nearestDriver(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logDrivers.RLock()
-	selected, distanceKM, found := selectNearestDriver(s.drivers, req.PickupLat, req.PickupLng)
-	s.logDrivers.RUnlock()
-
-	if !found {
-		httpx.RespondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no available drivers"})
+	if req.PickupLat == nil || req.PickupLng == nil || req.DropoffLat == nil || req.DropoffLng == nil || !validPoint(*req.PickupLat, *req.PickupLng) || !validPoint(*req.DropoffLat, *req.DropoffLng) {
+		httpx.RespondJSON(w, 400, map[string]string{"error": "valid pickup and dropoff coordinates are required"})
 		return
 	}
-
-	etaSeconds := int((distanceKM / 32.0) * 3600)
-	if etaSeconds < 60 {
-		etaSeconds = 60
+	candidates, e := s.store.Available(r.Context())
+	if e != nil {
+		httpx.RespondJSON(w, 503, map[string]string{"error": "driver state unavailable"})
+		return
 	}
-	httpx.RespondJSON(w, http.StatusOK, map[string]any{
-		"driver_id":   selected.ID,
-		"distance_km": math.Round(distanceKM*100) / 100,
-		"eta_seconds": etaSeconds,
-		"algorithm":   nearestDriverAlgorithm,
-		"computed_at": time.Now().UTC(),
-	})
+	activeDrivers.Set(float64(len(candidates)))
+	if len(candidates) == 0 {
+		httpx.RespondJSON(w, 503, map[string]string{"error": "no available drivers"})
+		return
+	}
+	trip, e := s.routes.Estimate(r.Context(), *req.PickupLat, *req.PickupLng, *req.DropoffLat, *req.DropoffLng)
+	if e != nil {
+		httpx.RespondJSON(w, 503, map[string]string{"error": "passenger route unavailable"})
+		return
+	}
+	var selected driver
+	var approach routeEstimate
+	found := false
+	for i := 0; i < 5; i++ {
+		candidate, _, ok := selectNearestDriver(candidates, *req.PickupLat, *req.PickupLng)
+		if !ok {
+			break
+		}
+		delete(candidates, candidate.ID)
+		estimate, e := s.routes.Estimate(r.Context(), candidate.Latitude, candidate.Longitude, *req.PickupLat, *req.PickupLng)
+		if e != nil {
+			continue
+		}
+		if !found || estimate.DurationSeconds < approach.DurationSeconds || (estimate.DurationSeconds == approach.DurationSeconds && candidate.ID < selected.ID) {
+			selected = candidate
+			approach = estimate
+			found = true
+		}
+	}
+	if !found {
+		httpx.RespondJSON(w, 503, map[string]string{"error": "driver route unavailable"})
+		return
+	}
+	httpx.RespondJSON(w, 200, map[string]any{"driver_id": selected.ID, "distance_km": approach.DistanceKM, "eta_seconds": int(math.Ceil(approach.DurationSeconds)), "trip_distance_km": trip.DistanceKM, "trip_duration_seconds": trip.DurationSeconds, "route_provider": trip.Provider, "route_calculated_at": trip.CalculatedAt, "algorithm": nearestDriverAlgorithm})
+
 }
 
 // selectNearestDriver only needs the minimum, so it scans once instead of
@@ -158,75 +193,35 @@ func selectNearestDriver(drivers map[string]driver, pickupLat, pickupLng float64
 }
 
 func (s *routingService) consumeDriverLocations(ctx context.Context, log anyLogger) {
-	group := "routing-service"
-	consumer := "routing-service-1"
-	initCtx, initCancel := reliability.WithRedisTimeout(ctx)
-	_ = ensureGroup(initCtx, s.rdb, events.StreamDriverLocations, group)
-	initCancel()
-	for {
-		// Without this check a cancelled context makes every read fail at once
-		// with context.Canceled, and the loop spins until the process exits.
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		readCtx, readCancel := reliability.WithRedisTimeout(ctx)
-		result, err := s.rdb.XReadGroup(readCtx, &redis.XReadGroupArgs{
-			Group:    group,
-			Consumer: consumer,
-			Streams:  []string{events.StreamDriverLocations, ">"},
-			Count:    25,
-			Block:    time.Second,
-		}).Result()
-		readCancel()
-		if err != nil {
-			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
-				continue
-			}
-			metrics.StreamConsumeErrors.WithLabelValues("routing-service", events.StreamDriverLocations).Inc()
-			metrics.DependencyErrors.WithLabelValues("routing-service", "redis").Inc()
-			log.Error("driver location stream read failed", "error", err)
-			continue
-		}
-		for _, stream := range result {
-			for _, message := range stream.Messages {
-				envelope, err := events.DecodeEnvelope(message)
-				if err != nil {
-					log.Error("driver location decode failed", "error", err)
-					continue
-				}
-				if envelope.Type != events.TypeDriverLocationUpdated {
-					continue
-				}
-				payload, err := events.DecodePayload[events.DriverLocationUpdated](envelope)
-				if err != nil {
-					log.Error("driver location payload decode failed", "error", err)
-					continue
-				}
-				updatedAt, _ := time.Parse(time.RFC3339Nano, payload.UpdatedAt)
-				s.logDrivers.Lock()
-				s.drivers[payload.DriverID] = driver{
-					ID: payload.DriverID, Latitude: payload.Latitude, Longitude: payload.Longitude,
-					Available: payload.Available, UpdatedAt: updatedAt,
-				}
-				available := 0
-				for _, d := range s.drivers {
-					if d.Available {
-						available++
-					}
-				}
-				activeDrivers.Set(float64(available))
-				s.logDrivers.Unlock()
-				ackCtx, ackCancel := reliability.WithRedisTimeout(ctx)
-				if err := s.rdb.XAck(ackCtx, events.StreamDriverLocations, group, message.ID).Err(); err != nil {
-					metrics.DependencyErrors.WithLabelValues("routing-service", "redis").Inc()
-					log.Error("driver location ack failed", "error", err)
-				}
-				ackCancel()
-			}
-		}
+	cfg := s.cfg
+	if cfg.ConsumerGroup == "" {
+		cfg = config.Load("routing-service", ":8083")
 	}
+	o := s.options
+	if o.MaxDeliveries == 0 {
+		o = reliability.DefaultStreamOptions()
+	}
+	reliability.Consume(ctx, s.rdb, events.StreamDriverLocations, cfg.ConsumerGroup, cfg.ConsumerName, o, log, func(ctx context.Context, m redis.XMessage) error {
+		env, e := events.DecodeEnvelope(m)
+		if e != nil {
+			return reliability.DecodeError(e)
+		}
+		if env.Type != events.TypeDriverLocationUpdated {
+			return reliability.Permanent(errors.New("unexpected location event type"))
+		}
+		p, e := events.DecodePayload[events.DriverLocationUpdated](env)
+		if e != nil {
+			return reliability.DecodeError(e)
+		}
+		return s.store.Save(ctx, p)
+	}, func(ctx context.Context, m redis.XMessage, cause error) error {
+		env, e := events.NewEnvelope(uuid.NewString(), "dead_lettered", "routing-service", "", events.NewDeadLetter("routing-service", events.StreamDriverLocations, m, cause))
+		if e != nil {
+			return e
+		}
+		_, e = events.Publish(ctx, s.rdb, events.StreamDeadLetter, env)
+		return e
+	})
 }
 
 type anyLogger interface {

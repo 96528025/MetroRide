@@ -109,6 +109,16 @@ class DeadLetterPublisherTest {
     }
 
     @Test
+    void aCancellationKeepsItsPayloadRideIdWhenCorrelationIsMissing() {
+        Envelope original = new Envelope(UUID.randomUUID().toString(), Envelope.TYPE_RIDE_CANCELLED,
+                "rider-service", "", NOW, mapper.createObjectNode().put("ride_id", "cancelled-ride"));
+        Envelope letter = publisher.envelope(message(), original, new IllegalStateException("already settled"));
+        assertThat(letter.correlationId()).isEqualTo("cancelled-ride");
+        assertThat(letter.payload().get("ride_id").asText()).isEqualTo("cancelled-ride");
+        assertThat(letter.payload().get("original_event_type").asText()).isEqualTo("ride_cancelled");
+    }
+
+    @Test
     void anUndecodableEntryIsDeadLetteredUnderItsMessageIdWithoutARideId() throws Exception {
         EnvelopeDecodeException cause = new EnvelopeDecodeException(
                 "decode event envelope from message " + MESSAGE_ID + ": Unrecognized token 'not-json'");

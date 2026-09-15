@@ -29,7 +29,8 @@ done
 # shellcheck source=scripts/lib/images.sh
 source "${REPO_ROOT}/scripts/lib/images.sh"
 
-mapfile -t SERVICES < <(metroride_resolve_services "${REQUESTED[@]+"${REQUESTED[@]}"}")
+SERVICES=()
+while IFS= read -r value; do SERVICES+=("${value}"); done < <(metroride_resolve_services "${REQUESTED[@]+"${REQUESTED[@]}"}")
 
 echo "building ${#SERVICES[@]} image(s) at tag ${IMAGE_TAG} (push=${PUSH})"
 

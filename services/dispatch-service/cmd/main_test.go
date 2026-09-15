@@ -34,7 +34,7 @@ func TestFindNearestDriverReturnsRoutingResult(t *testing.T) {
 			contentType: r.Header.Get("Content-Type"),
 		}
 		observed.decodeErr = json.NewDecoder(r.Body).Decode(&observed.body)
-		return routingTestHTTPResponse(r, http.StatusOK, `{"driver_id":"driver-7","distance_km":1.25,"eta_seconds":180}`), nil
+		return routingTestHTTPResponse(r, http.StatusOK, `{"driver_id":"driver-7","distance_km":1.25,"eta_seconds":180,"trip_distance_km":8.5,"trip_duration_seconds":920.5,"route_provider":"test-fixture","route_calculated_at":"2026-09-15T00:00:00Z"}`), nil
 	})}
 
 	d := newRoutingTestDispatcher("http://routing.test", client)
@@ -42,14 +42,16 @@ func TestFindNearestDriverReturnsRoutingResult(t *testing.T) {
 	defer cancel()
 
 	got, err := d.findNearestDriver(ctx, events.RideRequested{
-		RideID:    "ride-1",
-		PickupLat: 37.775,
-		PickupLng: -122.419,
+		RideID:     "ride-1",
+		PickupLat:  37.775,
+		PickupLng:  -122.419,
+		DropoffLat: 37.78,
+		DropoffLng: -122.42,
 	})
 	if err != nil {
 		t.Fatalf("find nearest driver: %v", err)
 	}
-	if got != (routingResponse{DriverID: "driver-7", DistanceKM: 1.25, ETASeconds: 180}) {
+	if got.DriverID != "driver-7" || got.DistanceKM != 1.25 || got.ETASeconds != 180 || got.TripDistanceKM == nil || *got.TripDistanceKM != 8.5 || *got.TripDurationSeconds != 920.5 {
 		t.Fatalf("routing response = %+v, want driver-7 at 1.25 km with 180-second ETA", got)
 	}
 
@@ -65,7 +67,7 @@ func TestFindNearestDriverReturnsRoutingResult(t *testing.T) {
 	if observed.contentType != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", observed.contentType)
 	}
-	if observed.body != (routingRequest{PickupLat: 37.775, PickupLng: -122.419}) {
+	if observed.body != (routingRequest{PickupLat: 37.775, PickupLng: -122.419, DropoffLat: 37.78, DropoffLng: -122.42}) {
 		t.Fatalf("routing request = %+v, want pickup coordinates", observed.body)
 	}
 }

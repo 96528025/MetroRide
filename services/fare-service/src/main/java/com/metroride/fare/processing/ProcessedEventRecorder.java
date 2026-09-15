@@ -6,6 +6,9 @@ import com.metroride.fare.events.EnvelopeDecodeException;
 import com.metroride.fare.events.FareSettled;
 import com.metroride.fare.events.RideAssigned;
 import com.metroride.fare.events.RideCompleted;
+import com.metroride.fare.events.RideCancelled;
+import com.metroride.fare.ledger.JournalKind;
+import java.math.BigDecimal;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.metroride.fare.ledger.Account;
 import com.metroride.fare.ledger.CorruptLedgerException;
@@ -33,10 +36,11 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <ul>
  *   <li>{@code ride_assigned}: quote the fare and append the {@code quote_hold} entry;</li>
- *   <li>{@code ride_completed}: lock the ride's {@code quote_hold}, check that it is the one
+ *   <li>{@code ride_completed}: lock the ride state and {@code quote_hold}, check that it is the one
  *       entry the service writes and that the ride is not settled yet, then append the
  *       {@code hold_reversal} and the {@code settlement}, and enqueue the {@code fare_settled}
  *       event for {@code events.ride.fares} in {@code fare.event_outbox};</li>
+ *   <li>{@code ride_cancelled}: record cancellation and reverse an existing hold without a fee;</li>
  *   <li>anything else: recorded, nothing more.</li>
  * </ul>
  *
@@ -58,7 +62,7 @@ public class ProcessedEventRecorder {
      * What one call did. {@code entries} are the journal entries written in the same transaction,
      * in the order written: one {@code quote_hold} for a first-seen {@code ride_assigned}, a
      * {@code hold_reversal} then a {@code settlement} for a first-seen {@code ride_completed},
-     * nothing otherwise.
+     * a {@code cancellation_reversal} when canceling an existing hold, nothing otherwise.
      */
     public record Result(Outcome outcome, List<JournalEntry> entries) {
 
@@ -87,6 +91,7 @@ public class ProcessedEventRecorder {
     private final OutboxRepository outbox;
     private final ObjectMapper mapper;
     private final Clock clock;
+    private final RideContextRepository context;
 
     public ProcessedEventRecorder(
             ProcessedEventRepository repository,
@@ -96,7 +101,8 @@ public class ProcessedEventRecorder {
             FareProperties rates,
             OutboxRepository outbox,
             ObjectMapper mapper,
-            Clock clock) {
+            Clock clock,
+            RideContextRepository context) {
         this.repository = repository;
         this.ledger = ledger;
         this.codec = codec;
@@ -105,6 +111,7 @@ public class ProcessedEventRecorder {
         this.outbox = outbox;
         this.mapper = mapper;
         this.clock = clock;
+        this.context = context;
     }
 
     /**
@@ -124,14 +131,10 @@ public class ProcessedEventRecorder {
      * commit, then hits the conflict clause and returns {@link Outcome#DUPLICATE} without ever
      * reaching the ledger. The unique key on {@code journal_entries (source_event_id, kind)} is a
      * backstop for writers that bypass this method, not the mechanism relied on here. Two
-     * different completion events for one ride are a different case: their event rows do not
-     * collide, so the row lock on the ride's {@code quote_hold} serialises them and the second one
-     * finds the ride settled (see {@link #settle}). A completion and a second, distinct assignment
-     * for one ride are yet another: the lock is on a hold that the assignment does not touch, so
-     * nothing in this class can order them, and the per-ride unique index on {@code quote_hold}
-     * (V3) refuses the second hold instead; the recorder sees that as a
-     * {@link LedgerConflictException} and the consumer quarantines the assignment event as
-     * {@code duplicate_hold} with the ledger untouched.
+     * different events for one ride are serialized by a persistent fare.ride_state row. This
+     * also orders a cancellation that arrives before an assignment: the cancellation tombstone
+     * prevents that late assignment from creating a hold. Existing per-ride unique indexes remain
+     * a backstop against duplicate holds and settlements.
      *
      * @throws FareQuoteException     when a {@code ride_assigned} payload cannot be quoted; the
      *                                transaction rolls back and the event is not recorded
@@ -152,9 +155,12 @@ public class ProcessedEventRecorder {
         return switch (envelope.type()) {
             case Envelope.TYPE_RIDE_ASSIGNED -> {
                 JournalEntry quoteHold = quoteHold(envelope);
+                if (quoteHold == null) yield Result.recorded();
                 ledger.append(quoteHold, clock.instant());
+                context.save(codec.decodePayload(envelope, RideAssigned.class), envelope.id(), rates);
                 yield Result.recorded(List.of(quoteHold));
             }
+            case Envelope.TYPE_RIDE_CANCELLED -> Result.recorded(cancel(envelope));
             case Envelope.TYPE_RIDE_COMPLETED -> Result.recorded(settle(envelope));
             default -> Result.recorded();
         };
@@ -172,7 +178,15 @@ public class ProcessedEventRecorder {
                     "ride_assigned payload of event " + envelope.id() + " has no ride_id", null);
         }
         try {
-            Money quote = calculator.quote(assignment.distanceKm(), assignment.etaSeconds());
+            if ("cancelled".equals(context.lock(assignment.rideId()))) return null;
+            if (!Integer.valueOf(2).equals(assignment.schemaVersion())
+                    || assignment.routeProvider() == null || assignment.routeProvider().isBlank()
+                    || assignment.routeCalculatedAt() == null) {
+                throw new IllegalArgumentException("version 2 passenger route evidence is required; approach fields cannot price a trip");
+            }
+            try { Instant.parse(assignment.routeCalculatedAt()); }
+            catch (java.time.format.DateTimeParseException e) { throw new IllegalArgumentException("invalid route_calculated_at", e); }
+            Money quote = calculator.quote(assignment.tripDistanceKm(), assignment.tripDurationSeconds());
             return JournalEntry.quoteHold(assignment.rideId(), envelope.id(), quote);
         } catch (IllegalArgumentException e) {
             throw new FareQuoteException(FareQuoteException.Reason.CALCULATION,
@@ -187,7 +201,7 @@ public class ProcessedEventRecorder {
      *   <li>Decode the payload; an unusable one is poison ({@link SettlementException.Reason#PAYLOAD}),
      *       never a missing hold, or an entry that can never name its ride would be retried
      *       forever as "assignment not here yet".</li>
-     *   <li>Lock the ride's {@code quote_hold} rows ({@code select ... for update}). Zero rows: the
+     *   <li>Lock the persistent ride state, reject cancellation, then lock {@code quote_hold} rows ({@code select ... for update}). Zero rows: the
      *       assignment has not arrived, retryable. More than one: a state the V3 unique index makes
      *       impossible, so the index is gone or the schema has drifted; fatal, the consumer halts
      *       rather than settle against the first of several holds.</li>
@@ -196,7 +210,7 @@ public class ProcessedEventRecorder {
      *   <li>With the lock held, check the ride is not settled yet; if it is, quarantined as
      *       {@code already_settled}. This is what stops two different completion events for one
      *       ride, from a replayed dead letter for instance, from settling the ride twice: the
-     *       second waits on the hold's row lock and then sees the first's settlement.</li>
+     *       second waits on the ride-state row lock and then sees the first's settlement.</li>
      *   <li>Append the {@code hold_reversal} and the {@code settlement}, both under this event's ID.
      *       Should a second settlement slip past the check above, the per-ride unique index on
      *       settlements refuses it and the whole transaction, reversal included, rolls back; that
@@ -218,6 +232,9 @@ public class ProcessedEventRecorder {
                     "ride_completed payload of event " + envelope.id() + " has no ride_id");
         }
         String rideId = completion.rideId();
+        if ("cancelled".equals(context.lock(rideId))) {
+            throw new SettlementException(SettlementException.Reason.CANCELLED_RIDE, "ride " + rideId + " was cancelled");
+        }
 
         List<StoredJournalEntry> holds = ledger.lockQuoteHolds(rideId);
         if (holds.isEmpty()) {
@@ -236,7 +253,10 @@ public class ProcessedEventRecorder {
         }
 
         JournalEntry reversal = JournalEntry.holdReversal(rideId, envelope.id(), quote);
-        JournalEntry settlement = JournalEntry.settlement(rideId, envelope.id(), quote, rates.driverShare());
+        // A historical hold has no recorded split: its amount is preserved and the current
+        // driver-share policy applies. Version 2 holds always carry their original split.
+        BigDecimal driverShare = context.driverShare(rideId).orElse(rates.driverShare());
+        JournalEntry settlement = JournalEntry.settlement(rideId, envelope.id(), quote, driverShare);
         Instant now = clock.instant();
         try {
             ledger.append(reversal, now);
@@ -249,12 +269,44 @@ public class ProcessedEventRecorder {
                     "ride " + rideId + " was settled by another transaction; event " + envelope.id()
                             + " refused by " + conflict.conflict().indexName(), conflict);
         }
-        outbox.enqueue(Envelope.STREAM_RIDE_FARES, fareSettled(envelope, completion, quote, settlement, now), now);
+        outbox.enqueue(Envelope.STREAM_RIDE_FARES, fareSettled(envelope, completion, quote, settlement, driverShare, now), now);
+        context.mark(rideId, "completed");
         return List.of(reversal, settlement);
     }
 
+    private List<JournalEntry> cancel(Envelope envelope) {
+        RideCancelled cancellation;
+        try { cancellation = codec.decodePayload(envelope, RideCancelled.class); }
+        catch (EnvelopeDecodeException e) {
+            throw new SettlementException(SettlementException.Reason.PAYLOAD, e.getMessage(), e);
+        }
+        String rideId = cancellation.rideId();
+        if (rideId == null || rideId.isBlank()) {
+            throw new SettlementException(SettlementException.Reason.PAYLOAD, "ride_cancelled requires ride_id");
+        }
+        String state = context.lock(rideId);
+        if ("cancelled".equals(state)) return List.of();
+        if ("completed".equals(state) || ledger.hasSettlement(rideId)) {
+            throw new SettlementException(SettlementException.Reason.ALREADY_SETTLED, "cannot cancel settled ride " + rideId);
+        }
+        List<StoredJournalEntry> holds = ledger.lockQuoteHolds(rideId);
+        if (holds.size() > 1) {
+            throw new SettlementException(SettlementException.Reason.AMBIGUOUS_HOLD, "multiple quote holds for " + rideId);
+        }
+        List<JournalEntry> entries = List.of();
+        if (!holds.isEmpty()) {
+            Money amount = QuoteHoldShape.amountOf(rideId, holds.get(0).entry().postings());
+            JournalEntry reversal = new JournalEntry(rideId, JournalKind.CANCELLATION_REVERSAL,
+                    envelope.id(), JournalEntry.holdReversal(rideId, envelope.id(), amount).postings());
+            ledger.append(reversal, clock.instant());
+            entries = List.of(reversal);
+        }
+        context.mark(rideId, "cancelled");
+        return entries;
+    }
+
     /** The {@code fare_settled} envelope: figures copied from the settlement entry, never recomputed. */
-    private Envelope fareSettled(Envelope completion, RideCompleted payload, Money quote, JournalEntry settlement, Instant now) {
+    private Envelope fareSettled(Envelope completion, RideCompleted payload, Money quote, JournalEntry settlement, BigDecimal driverShare, Instant now) {
         FareSettled settled = new FareSettled(
                 payload.rideId(),
                 payload.riderId(),
@@ -264,7 +316,7 @@ public class ProcessedEventRecorder {
                 quote.toString(),
                 credited(settlement, Account.DRIVER_PAYABLE).toString(),
                 credited(settlement, Account.PLATFORM_REVENUE).toString(),
-                rates.driverShare().toPlainString(),
+                driverShare.toPlainString(),
                 DateTimeFormatter.ISO_INSTANT.format(now));
         return new Envelope(
                 UUID.randomUUID().toString(),

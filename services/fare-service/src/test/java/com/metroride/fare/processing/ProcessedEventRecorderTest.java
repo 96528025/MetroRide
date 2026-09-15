@@ -53,13 +53,14 @@ class ProcessedEventRecorderTest {
     private final OutboxRepository outbox = mock(OutboxRepository.class);
     private final FareProperties rates = new FareProperties(
             new BigDecimal("2.50"), new BigDecimal("1.20"), new BigDecimal("0.30"), new BigDecimal("0.80"));
+    private final RideContextRepository context = mock(RideContextRepository.class);
     private ProcessedEventRecorder recorder;
 
     @BeforeEach
     void recorder() {
         when(events.insertIfAbsent(anyString(), anyString(), anyString(), any())).thenReturn(1);
         recorder = new ProcessedEventRecorder(events, ledger, codec, new FareCalculator(rates), rates,
-                outbox, mapper, Clock.fixed(NOW, ZoneOffset.UTC));
+                outbox, mapper, Clock.fixed(NOW, ZoneOffset.UTC), context);
     }
 
     /**
@@ -181,6 +182,6 @@ class ProcessedEventRecorderTest {
                 "{\"id\":\"" + eventId + "\",\"type\":\"ride_assigned\",\"source\":\"dispatch-service\","
                         + "\"correlation_id\":\"" + RIDE + "\",\"occurred_at\":\"2026-09-11T10:00:00Z\","
                         + "\"payload\":{\"ride_id\":\"" + RIDE + "\",\"rider_id\":\"rider-42\",\"driver_id\":\"driver-2\","
-                        + "\"distance_km\":1.8612,\"eta_seconds\":223,\"assignment_id\":\"a-1\"}}"));
+                        + "\"schema_version\":2,\"route_provider\":\"test-fixture\",\"route_calculated_at\":\"2026-09-11T10:00:00Z\",\"trip_distance_km\":1.8612,\"trip_duration_seconds\":223,\"distance_km\":1.8612,\"eta_seconds\":223,\"assignment_id\":\"a-1\"}}"));
     }
 }

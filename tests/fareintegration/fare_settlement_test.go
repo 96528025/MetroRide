@@ -147,6 +147,22 @@ func TestRideToFareSettlement(t *testing.T) {
 	if holdPostings[accountFareHold] != -quote || len(holdPostings) != 2 {
 		run.fatalf("quote_hold postings %v, want rider_receivable +quote and fare_hold -quote only", hold.Postings)
 	}
+	if assignedPayload.SchemaVersion != 2 || assignedPayload.TripDistanceKM == nil || assignedPayload.TripDurationSeconds == nil {
+		run.fatalf("assignment lacks version 2 passenger route evidence: %+v", assignedPayload)
+	}
+	km, ok := new(big.Rat).SetString(fmt.Sprint(*assignedPayload.TripDistanceKM))
+	if !ok {
+		run.fatalf("invalid trip distance")
+	}
+	seconds, ok := new(big.Rat).SetString(fmt.Sprint(*assignedPayload.TripDurationSeconds))
+	if !ok {
+		run.fatalf("invalid trip duration")
+	}
+	expected := new(big.Rat).Add(big.NewRat(250, 1), new(big.Rat).Mul(big.NewRat(120, 1), km))
+	expected.Add(expected, new(big.Rat).Mul(big.NewRat(1, 2), seconds))
+	if quote != roundHalfUp(expected) {
+		run.fatalf("quote %d does not match passenger route %s cents", quote, expected.RatString())
+	}
 	run.quote = quote
 
 	// Stage 4: the ride is completed through rider-service.
@@ -400,6 +416,16 @@ func (r *rideRun) checkFareOutboxRow(db *pgxpool.Pool, published events.Envelope
 	if err != nil {
 		r.fatalf("decode published envelope: %v", err)
 	}
+	// Go re-encodes time.Time without insignificant trailing fractional zeros.
+	// Check the instant, then compare every remaining field without changing payload data.
+	var storedEnvelope events.Envelope
+	if err := json.Unmarshal(row.Envelope, &storedEnvelope); err != nil {
+		r.fatalf("decode stored event timestamp: %v", err)
+	}
+	if !storedEnvelope.OccurredAt.Equal(published.OccurredAt) {
+		r.fatalf("stored and published event timestamps differ")
+	}
+	stored.(map[string]any)["occurred_at"] = onWire.(map[string]any)["occurred_at"]
 	if !reflect.DeepEqual(stored, onWire) {
 		r.fatalf("stored envelope differs from the published one:\n stored:    %s\n published: %s", string(row.Envelope), string(wire))
 	}
@@ -612,6 +638,13 @@ func (r *rideRun) createRide(req createRideRequest) createRideResponse {
 	if out.RideID == "" {
 		r.fatalf("create ride response %s has no ride_id", raw)
 	}
+	r.t.Cleanup(func() {
+		req, _ := http.NewRequest(http.MethodPost, baseURL(riderServicePort)+"/v1/rides/"+out.RideID+"/cancel", nil)
+		resp, e := httpClient.Do(req)
+		if e == nil {
+			resp.Body.Close()
+		}
+	})
 	return out
 }
 

@@ -403,7 +403,7 @@ class OutboxIT extends IntegrationTestSupport {
         return "{\"id\":\"" + eventId + "\",\"type\":\"ride_assigned\",\"source\":\"dispatch-service\","
                 + "\"correlation_id\":\"" + rideId + "\",\"occurred_at\":\"2026-09-12T10:00:00Z\","
                 + "\"payload\":{\"ride_id\":\"" + rideId + "\",\"rider_id\":\"rider-42\",\"driver_id\":\"driver-2\","
-                + "\"distance_km\":" + distanceKm + ",\"eta_seconds\":" + etaSeconds + ",\"assignment_id\":\"" + UUID.randomUUID() + "\"}}";
+                + "\"schema_version\":2,\"route_provider\":\"test-fixture\",\"route_calculated_at\":\"2026-09-11T10:00:00Z\",\"trip_distance_km\":" + distanceKm + ",\"trip_duration_seconds\":" + etaSeconds + ",\"distance_km\":" + distanceKm + ",\"eta_seconds\":" + etaSeconds + ",\"assignment_id\":\"" + UUID.randomUUID() + "\"}}";
     }
 
     private static String completion(String eventId, String rideId) {

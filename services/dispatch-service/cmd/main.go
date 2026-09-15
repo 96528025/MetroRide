@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -43,22 +44,29 @@ var (
 )
 
 type routingRequest struct {
-	PickupLat float64 `json:"pickup_lat"`
-	PickupLng float64 `json:"pickup_lng"`
+	DropoffLat float64 `json:"dropoff_lat"`
+	DropoffLng float64 `json:"dropoff_lng"`
+	PickupLat  float64 `json:"pickup_lat"`
+	PickupLng  float64 `json:"pickup_lng"`
 }
 
 type routingResponse struct {
-	DriverID   string  `json:"driver_id"`
-	DistanceKM float64 `json:"distance_km"`
-	ETASeconds int     `json:"eta_seconds"`
+	TripDistanceKM      *float64 `json:"trip_distance_km"`
+	TripDurationSeconds *float64 `json:"trip_duration_seconds"`
+	RouteProvider       string   `json:"route_provider"`
+	RouteCalculatedAt   string   `json:"route_calculated_at"`
+	DriverID            string   `json:"driver_id"`
+	DistanceKM          float64  `json:"distance_km"`
+	ETASeconds          int      `json:"eta_seconds"`
 }
 
 type dispatcher struct {
-	cfg    config.Config
-	log    *slog.Logger
-	db     *pgxpool.Pool
-	rdb    *redis.Client
-	client *http.Client
+	cfg     config.Config
+	log     *slog.Logger
+	db      *pgxpool.Pool
+	rdb     *redis.Client
+	client  *http.Client
+	options reliability.StreamOptions
 }
 
 func main() {
@@ -67,6 +75,7 @@ func main() {
 	prometheus.MustRegister(dispatchLatency, assignmentFailures, ridesAssigned)
 	cfg := config.Load("dispatch-service", ":8082")
 	log := logging.New(cfg.ServiceName)
+	options := reliability.StreamOptionsFromEnv()
 	ctx := context.Background()
 
 	db, err := pgxpool.New(ctx, cfg.PostgresDSN)
@@ -92,11 +101,12 @@ func main() {
 	}
 
 	d := &dispatcher{
-		cfg:    cfg,
-		log:    log,
-		db:     db,
-		rdb:    rdb,
-		client: &http.Client{Timeout: 3 * time.Second},
+		cfg:     cfg,
+		options: options,
+		log:     log,
+		db:      db,
+		rdb:     rdb,
+		client:  &http.Client{Timeout: reliability.RoutingTimeout},
 	}
 
 	if err := d.ensureConsumerGroup(ctx); err != nil {
@@ -140,73 +150,27 @@ func (d *dispatcher) ensureConsumerGroup(ctx context.Context) error {
 }
 
 func (d *dispatcher) consume(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		readCtx, readCancel := reliability.WithRedisTimeout(ctx)
-		result, err := d.rdb.XReadGroup(readCtx, &redis.XReadGroupArgs{
-			Group:    d.cfg.ConsumerGroup,
-			Consumer: d.cfg.ConsumerName,
-			Streams:  []string{events.StreamRideRequests, ">"},
-			Count:    10,
-			Block:    time.Second,
-		}).Result()
-		readCancel()
-		if err != nil {
-			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
-				continue
-			}
-			metrics.StreamConsumeErrors.WithLabelValues("dispatch-service", events.StreamRideRequests).Inc()
-			metrics.DependencyErrors.WithLabelValues("dispatch-service", "redis").Inc()
-			d.log.Error("read ride request stream failed", "error", err)
-			continue
-		}
-		for _, stream := range result {
-			for _, message := range stream.Messages {
-				if err := reliability.Retry(ctx, reliability.MaxRetryAttempts, reliability.InitialRetryDelay, func(attemptCtx context.Context) error {
-					return d.handleMessage(attemptCtx, message)
-				}); err != nil {
-					assignmentFailures.Inc()
-					d.log.Error("dispatch message failed after retries", "error", err, "message_id", message.ID)
-					if dlqErr := d.publishDeadLetter(ctx, message, err); dlqErr != nil {
-						d.log.Error("publish dead-letter event failed", "error", dlqErr, "message_id", message.ID)
-						continue
-					}
-					ackCtx, ackCancel := reliability.WithRedisTimeout(ctx)
-					if ackErr := d.rdb.XAck(ackCtx, events.StreamRideRequests, d.cfg.ConsumerGroup, message.ID).Err(); ackErr != nil {
-						metrics.DependencyErrors.WithLabelValues("dispatch-service", "redis").Inc()
-						d.log.Error("ack dead-lettered ride request failed", "error", ackErr, "message_id", message.ID)
-					}
-					ackCancel()
-					continue
-				}
-				ackCtx, ackCancel := reliability.WithRedisTimeout(ctx)
-				if err := d.rdb.XAck(ackCtx, events.StreamRideRequests, d.cfg.ConsumerGroup, message.ID).Err(); err != nil {
-					metrics.DependencyErrors.WithLabelValues("dispatch-service", "redis").Inc()
-					d.log.Error("ack ride request failed", "error", err, "message_id", message.ID)
-				}
-				ackCancel()
-			}
-		}
-	}
+	reliability.Consume(ctx, d.rdb, events.StreamRideRequests, d.cfg.ConsumerGroup, d.cfg.ConsumerName, d.options, d.log, d.handleMessage, d.publishDeadLetter)
 }
 
 func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) error {
 	start := time.Now()
 	envelope, err := events.DecodeEnvelope(message)
 	if err != nil {
-		return err
+		return reliability.DecodeError(err)
 	}
 	if envelope.Type != events.TypeRideRequested {
-		return nil
+		return reliability.Permanent(errors.New("unexpected ride request event"))
 	}
 	payload, err := events.DecodePayload[events.RideRequested](envelope)
 	if err != nil {
-		return err
+		return reliability.DecodeError(err)
+	}
+	if _, err = uuid.Parse(payload.RideID); err != nil {
+		return reliability.DecodeError(err)
+	}
+	if payload.RiderID == "" {
+		return reliability.Permanent(errors.New("missing rider id"))
 	}
 
 	alreadyAssigned, err := d.rideAlreadyAssigned(ctx, payload.RideID)
@@ -225,6 +189,7 @@ func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) 
 	assignmentID := uuid.NewString()
 	now := time.Now().UTC()
 	assignment := events.RideAssigned{
+		SchemaVersion: 2, TripDistanceKM: route.TripDistanceKM, TripDurationSeconds: route.TripDurationSeconds, RouteProvider: route.RouteProvider, RouteCalculatedAt: route.RouteCalculatedAt,
 		RideID:       payload.RideID,
 		RiderID:      payload.RiderID,
 		DriverID:     route.DriverID,
@@ -243,7 +208,11 @@ func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) 
 		metrics.DependencyErrors.WithLabelValues("dispatch-service", "postgres").Inc()
 		return err
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() {
+		c, cancel := reliability.WithPostgresTimeout(context.Background())
+		defer cancel()
+		_ = tx.Rollback(c)
+	}()
 
 	commandTag, err := tx.Exec(dbCtx, `
 		update rides
@@ -258,10 +227,27 @@ func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) 
 		d.log.Info("ride already assigned before update", "event_type", envelope.Type, "ride_id", payload.RideID)
 		return nil
 	}
+	// Serialize location freshness with reservation acquisition. Position reports
+	// cannot clear a reservation, and the unique driver key chooses one winner.
+	var available bool
+	err = tx.QueryRow(dbCtx, `select available and updated_at>=clock_timestamp()-($2*interval '1 second') from driver_positions where driver_id=$1 for update`, route.DriverID, config.DriverMaxAge().Seconds()).Scan(&available)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return errors.New("driver location is stale or unavailable")
+	}
+	tag, err := tx.Exec(dbCtx, `insert into driver_reservations(driver_id,ride_id) values($1,$2) on conflict do nothing`, route.DriverID, payload.RideID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("driver already reserved; retry selection")
+	}
 	_, err = tx.Exec(dbCtx, `
-		insert into ride_assignments (id, ride_id, driver_id, distance_km, eta_seconds, created_at)
-		values ($1, $2, $3, $4, $5, $6)
-	`, assignmentID, payload.RideID, route.DriverID, route.DistanceKM, route.ETASeconds, now)
+		insert into ride_assignments (id, ride_id, driver_id, distance_km, eta_seconds, created_at,schema_version,trip_distance_km,trip_duration_seconds,route_provider,route_calculated_at)
+		values ($1, $2, $3, $4, $5, $6,2,$7,$8,$9,$10)
+	`, assignmentID, payload.RideID, route.DriverID, route.DistanceKM, route.ETASeconds, now, route.TripDistanceKM, route.TripDurationSeconds, route.RouteProvider, route.RouteCalculatedAt)
 	if err != nil {
 		metrics.DependencyErrors.WithLabelValues("dispatch-service", "postgres").Inc()
 		return err
@@ -286,7 +272,7 @@ func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) 
 }
 
 func (d *dispatcher) findNearestDriver(ctx context.Context, ride events.RideRequested) (routingResponse, error) {
-	body, err := json.Marshal(routingRequest{PickupLat: ride.PickupLat, PickupLng: ride.PickupLng})
+	body, err := json.Marshal(routingRequest{PickupLat: ride.PickupLat, PickupLng: ride.PickupLng, DropoffLat: ride.DropoffLat, DropoffLng: ride.DropoffLng})
 	if err != nil {
 		return routingResponse{}, err
 	}
@@ -317,6 +303,12 @@ func (d *dispatcher) findNearestDriver(ctx context.Context, ride events.RideRequ
 	}
 	if out.DriverID == "" {
 		return routingResponse{}, errors.New("routing-service returned empty driver_id")
+	}
+	if out.TripDistanceKM == nil || out.TripDurationSeconds == nil || *out.TripDistanceKM < 0 || *out.TripDurationSeconds < 0 || math.IsInf(*out.TripDistanceKM, 0) || math.IsInf(*out.TripDurationSeconds, 0) || math.IsNaN(*out.TripDistanceKM) || math.IsNaN(*out.TripDurationSeconds) || out.RouteProvider == "" || out.DistanceKM < 0 || out.ETASeconds < 0 {
+		return routingResponse{}, errors.New("routing-service returned invalid passenger route")
+	}
+	if _, err = time.Parse(time.RFC3339Nano, out.RouteCalculatedAt); err != nil {
+		return routingResponse{}, errors.New("routing-service returned invalid calculation time")
 	}
 	return out, nil
 }
@@ -362,14 +354,8 @@ func (d *dispatcher) publishDeadLetter(ctx context.Context, message redis.XMessa
 	if payload, decodeErr := events.DecodePayload[events.RideRequested](envelope); decodeErr == nil && payload.RideID != "" {
 		rideID = payload.RideID
 	}
-	payload := events.DeadLetter{
-		OriginalEventID:   envelope.ID,
-		OriginalEventType: envelope.Type,
-		RideID:            rideID,
-		Error:             cause.Error(),
-		Service:           "dispatch-service",
-		FailedAt:          time.Now().UTC().Format(time.RFC3339Nano),
-	}
+	payload := events.NewDeadLetter("dispatch-service", events.StreamRideRequests, message, cause)
+	payload.RideID = rideID
 	out, err := events.NewEnvelope(uuid.NewString(), "dead_lettered", "dispatch-service", rideID, payload)
 	if err != nil {
 		return err

@@ -44,7 +44,7 @@ READY_PORTS=(8080 8081 8083 8082 8087)
 ALL_PORTS=(5432 6379 8080 8081 8082 8083 8087)
 
 COMPOSE=(docker compose -p "${PROJECT}"
-  -f docker-compose.yml -f tests/fareintegration/compose.fare-e2e.yml
+  -f docker-compose.yml -f tests/routingfixture/compose.yml -f tests/fareintegration/compose.fare-e2e.yml
   --profile fare)
 
 log() { printf '[fare-e2e] %s\n' "$*"; }
@@ -75,7 +75,7 @@ teardown() {
   fi
   if [[ "${KEEP}" == "true" ]]; then
     log "FARE_E2E_KEEP=true: stack left running; remove it with:"
-    log "  FARE_DRIVER_SHARE=${FARE_DRIVER_SHARE} docker compose -p ${PROJECT} -f docker-compose.yml -f tests/fareintegration/compose.fare-e2e.yml --profile fare down -v --remove-orphans --rmi local"
+    log "  FARE_DRIVER_SHARE=${FARE_DRIVER_SHARE} docker compose -p ${PROJECT} -f docker-compose.yml -f tests/routingfixture/compose.yml -f tests/fareintegration/compose.fare-e2e.yml --profile fare down -v --remove-orphans --rmi local"
   else
     log "removing project ${PROJECT} (containers, volumes, built images)..."
     "${COMPOSE[@]}" down -v --remove-orphans --rmi local >/dev/null 2>&1 || true
@@ -105,7 +105,7 @@ log "project ${PROJECT}, driver share ${FARE_DRIVER_SHARE}"
 # --- build and start -----------------------------------------------------------------
 phase_start=${SECONDS}
 "${COMPOSE[@]}" config --quiet
-"${COMPOSE[@]}" build "${SERVICES[@]}"
+"${COMPOSE[@]}" build route-fixture "${SERVICES[@]}"
 log "build took $((SECONDS - phase_start))s"
 
 phase_start=${SECONDS}

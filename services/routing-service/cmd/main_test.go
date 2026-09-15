@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metroride/metroride/shared/pkg/events"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -22,7 +23,7 @@ func TestConsumeDriverLocationsReturnsWhenContextIsCancelled(t *testing.T) {
 	// fails every call with context.Canceled before it dials.
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	defer func() { _ = rdb.Close() }()
-	svc := &routingService{drivers: map[string]driver{}, rdb: rdb}
+	svc := &routingService{rdb: rdb}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -38,21 +39,22 @@ func TestConsumeDriverLocationsReturnsWhenContextIsCancelled(t *testing.T) {
 	}
 }
 
-func TestNearestDriverReportsHaversineAlgorithm(t *testing.T) {
+func TestNearestDriverReportsRoadAlgorithmAndPassengerRoute(t *testing.T) {
 	svc := &routingService{
-		drivers: map[string]driver{
+		store: fakeDrivers{map[string]driver{
 			"driver-1": {
 				ID:        "driver-1",
 				Latitude:  37.7749,
 				Longitude: -122.4194,
 				Available: true,
 			},
-		},
+		}},
+		routes: fakeRoutes{},
 	}
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/routes/nearest-driver",
-		strings.NewReader(`{"pickup_lat":37.775,"pickup_lng":-122.419}`),
+		strings.NewReader(`{"pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.78,"dropoff_lng":-122.42}`),
 	)
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
@@ -68,8 +70,8 @@ func TestNearestDriverReportsHaversineAlgorithm(t *testing.T) {
 	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if response.Algorithm != "haversine-nearest" {
-		t.Fatalf("algorithm = %q, want %q", response.Algorithm, "haversine-nearest")
+	if response.Algorithm != "road-time-shortlist" {
+		t.Fatalf("algorithm = %q, want %q", response.Algorithm, "road-time-shortlist")
 	}
 }
 
@@ -129,5 +131,49 @@ func BenchmarkSelectNearestDriver10000(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _, _ = selectNearestDriver(drivers, 37.7751, -122.4193)
+	}
+}
+
+// Fixtures are confined to tests; production always uses the configured road provider.
+type fakeDrivers struct{ drivers map[string]driver }
+
+func (s fakeDrivers) Available(context.Context) (map[string]driver, error) {
+	out := map[string]driver{}
+	for k, v := range s.drivers {
+		out[k] = v
+	}
+	return out, nil
+}
+func (fakeDrivers) Save(context.Context, events.DriverLocationUpdated) error { return nil }
+func (fakeDrivers) Ready(context.Context) error                              { return nil }
+
+type fakeRoutes struct{}
+
+func (fakeRoutes) Estimate(context.Context, float64, float64, float64, float64) (routeEstimate, error) {
+	return routeEstimate{DistanceKM: 8.5, DurationSeconds: 920.5, Provider: "test-fixture", CalculatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, nil
+}
+
+type routeFunction func(context.Context, float64, float64, float64, float64) (routeEstimate, error)
+
+func (f routeFunction) Estimate(c context.Context, a, b, d, e float64) (routeEstimate, error) {
+	return f(c, a, b, d, e)
+}
+func TestRoadTimeCanSelectADriverFartherAwayByStraightLine(t *testing.T) {
+	svc := routingService{store: fakeDrivers{map[string]driver{"near": {ID: "near", Latitude: 37.7751, Longitude: -122.419, Available: true}, "faster": {ID: "faster", Latitude: 37.78, Longitude: -122.419, Available: true}}}, routes: routeFunction(func(_ context.Context, lat, lon, dlat, dlon float64) (routeEstimate, error) {
+		duration := 300.0
+		if lat == 37.78 {
+			duration = 100
+		}
+		return routeEstimate{DistanceKM: 2, DurationSeconds: duration, Provider: "fixture", CalculatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, nil
+	})}
+	req := httptest.NewRequest(http.MethodPost, "/v1/routes/nearest-driver", strings.NewReader(`{"pickup_lat":37.775,"pickup_lng":-122.419,"dropoff_lat":37.789,"dropoff_lng":-122.401}`))
+	rec := httptest.NewRecorder()
+	svc.nearestDriver(rec, req)
+	var response struct {
+		DriverID string `json:"driver_id"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &response)
+	if rec.Code != 200 || response.DriverID != "faster" {
+		t.Fatalf("response=%d %s", rec.Code, rec.Body.String())
 	}
 }

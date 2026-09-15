@@ -142,6 +142,12 @@ if [[ -n "${SMOKE_RIDE_ID_FILE}" ]]; then
   printf '%s' "${ride_id}" > "${SMOKE_RIDE_ID_FILE}"
 fi
 
+cleanup_ride() {
+  if [[ "${SMOKE_KEEP_RIDE:-false}" != "true" ]]; then
+    curl -sS --max-time 5 -X POST "$(service_url 8080)/v1/rides/${ride_id}/cancel" >/dev/null || true
+  fi
+}
+trap cleanup_ride EXIT
 echo "created ride: ${ride_id}"
 
 status=""

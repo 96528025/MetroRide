@@ -8,3 +8,4 @@ data:
   REDIS_ADDR: {{ .Values.config.redisAddr | quote }}
   POSTGRES_DSN: {{ .Values.config.postgresDsn | quote }}
   ROUTING_SERVICE_URL: {{ .Values.config.routingServiceUrl | quote }}
+  VALHALLA_BASE_URL: {{ ternary "http://route-fixture:8090" .Values.config.valhallaBaseUrl .Values.routingFixture.enabled | quote }}

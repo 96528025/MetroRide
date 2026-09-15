@@ -18,6 +18,7 @@ public class SettlementException extends RuntimeException implements ClassifiedF
          * the bytes will not change. Never filed as {@link #MISSING_HOLD}, or an entry that can
          * never name its ride would be retried as if its assignment were merely late.
          */
+        CANCELLED_RIDE("cancelled_ride", FailureClass.QUARANTINE, DeadLetterReason.CANCELLED_RIDE),
         PAYLOAD("payload", FailureClass.POISON, DeadLetterReason.POISON),
         /**
          * The ride has no {@code quote_hold} yet. Retryable: the assignment travels on another

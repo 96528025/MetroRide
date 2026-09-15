@@ -50,6 +50,9 @@ WORK_DIR="$(mktemp -d)"
 
 cleanup() {
   local status=$?
+  if [[ -n "${RIDE_ID:-}" ]]; then
+    curl -sS --max-time 5 -X POST "http://127.0.0.1:8080/v1/rides/${RIDE_ID}/cancel" >/dev/null || true
+  fi
   for pid in "${PORT_FORWARD_PIDS[@]+"${PORT_FORWARD_PIDS[@]}"}"; do
     kill "${pid}" 2>/dev/null || true
   done
@@ -102,6 +105,7 @@ echo "== running the shared smoke test against the Kubernetes release"
 RIDE_ID_FILE="${WORK_DIR}/ride-id"
 BASE_HOST=127.0.0.1 \
   ENABLE_KAFKA_SMOKE=false \
+  SMOKE_KEEP_RIDE=true \
   SMOKE_RIDE_ID_FILE="${RIDE_ID_FILE}" \
   bash scripts/smoke-test.sh
 

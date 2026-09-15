@@ -12,7 +12,8 @@ public enum JournalKind {
     /** On {@code ride_completed}: the quote hold is reversed posting by posting. */
     HOLD_REVERSAL("hold_reversal"),
     /** On {@code ride_completed}: the quoted fare is moved into driver payable and platform revenue. */
-    SETTLEMENT("settlement");
+    SETTLEMENT("settlement"),
+    CANCELLATION_REVERSAL("cancellation_reversal");
 
     private final String code;
 

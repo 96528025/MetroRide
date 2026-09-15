@@ -146,6 +146,14 @@ func createRide(t *testing.T, ctx context.Context, req createRideRequest) create
 	if out.RideID == "" {
 		t.Fatal("create ride response missing ride_id")
 	}
+	t.Cleanup(func() {
+		req, _ := http.NewRequest(http.MethodPost, baseURL("8080")+"/v1/rides/"+out.RideID+"/cancel", nil)
+		client := http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	})
 	return out
 }
 

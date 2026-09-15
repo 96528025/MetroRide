@@ -184,6 +184,9 @@ func waitForDeadLetter(t *testing.T, ctx context.Context, rdb *redis.Client, bas
 func assertDeadLetter(t *testing.T, deadLetter events.DeadLetter, created createRideResponse) {
 	t.Helper()
 
+	if deadLetter.OriginalStream != events.StreamRideRequests || deadLetter.OriginalValues["event"] == nil {
+		t.Fatal("dead letter did not preserve its source entry")
+	}
 	if deadLetter.OriginalEventID != created.EventID {
 		t.Fatalf("expected original event %q, got %+v", created.EventID, deadLetter)
 	}

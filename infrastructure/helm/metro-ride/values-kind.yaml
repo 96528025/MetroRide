@@ -44,3 +44,6 @@ services:
     replicas: 1
   notification-service:
     replicas: 1
+
+routingFixture:
+  enabled: true

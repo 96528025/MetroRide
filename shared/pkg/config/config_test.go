@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -10,6 +11,10 @@ func TestLoadUsesDefaults(t *testing.T) {
 	clearConfigEnv(t, "routing-service")
 
 	got := Load("routing-service", ":8083")
+	if !strings.HasPrefix(got.ConsumerName, "routing-service-") {
+		t.Fatal("missing service prefix")
+	}
+	got.ConsumerName = "routing-service-1"
 	want := Config{
 		ServiceName:       "routing-service",
 		HTTPAddr:          ":8083",
