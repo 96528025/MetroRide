@@ -36,7 +36,7 @@ layers.
 17. Shut down the stack with `docker compose down -v`, even when an earlier
     step fails.
 
-Nothing is published and nothing is deployed unless this job passes.
+Core image publication and KinD deployment validation depend on this job.
 
 ### fare-service job (every event)
 
@@ -102,10 +102,10 @@ This command compiles the Go packages and runs untagged tests under the race det
 ```bash
 TEST_REDIS_ADDR=localhost:6379 \
 TEST_POSTGRES_DSN='postgres://metroride:metroride@localhost:5432/metroride?sslmode=disable' \
-go test -race ./shared/pkg/reliability ./services/routing-service/cmd
+go test -race ./shared/pkg/reliability ./services/routing-service/cmd ./services/dispatch-service/cmd
 ```
 
-Those checks cover pending recovery, delivery caps, failed dead-letter publication, shared route caching, and persistent driver state. The race detector instruments test processes; separately built service containers are not instrumented. Packages without test files are shown by Go's output; no comprehensive coverage percentage is claimed.
+Those checks cover pending recovery, delivery caps, failed dead-letter publication, failure counters, bounded readiness, shared route caching, and persistent driver state. The race detector instruments test processes; separately built service containers are not instrumented. Packages without test files are shown by Go's output; no comprehensive coverage percentage is claimed.
 
 ### Smoke Test
 
@@ -170,16 +170,16 @@ The relay-progress test runs its own relay under a unique `source_service` and p
 bash scripts/failure-integration-test.sh
 ```
 
-The script requires the default Compose stack to be running. It stops `routing-service`, waits with a bounded deadline until the service is unreachable, runs the `failureintegration` Go test, and restores routing on exit.
+The script requires a running stack using the same fixture and short recovery settings as CI; see [local validation](cicd.md#running-it-locally). It stops `routing-service`, waits with a bounded deadline until the service is unreachable, runs the `failureintegration` Go test, and restores routing on exit.
 
 The Go test:
 
 1. Confirms routing is unavailable.
 2. Records the current end of `events.dead_letter` so old failures cannot satisfy the test.
 3. Creates a ride through the public rider API, which persists the ride and its outbox entry before a relay publishes the real `ride_requested` event to Redis Streams.
-4. Lets the running dispatch consumer exhaust its production bounded-retry path.
+4. Lets the running dispatch consumer exhaust its bounded-retry path using the explicit test delivery limit and timing settings.
 5. Polls only new dead-letter records and matches the exact ride and original event ID.
-6. Validates the dead-letter event type, dispatch source, routing error context, and failure timestamp.
+6. Validates the dead-letter event type, dispatch source, routing error context, failure timestamp, and an increase in the assignment-failure counter.
 7. Confirms the ride remains `requested`, has no driver, and has zero rows in `ride_assignments`.
 
 The test uses a 30-second context deadline and Redis blocking reads with short polling intervals. It does not rely on a fixed delay or a mock transport.
@@ -352,25 +352,10 @@ a broker failure.
 
 ## Running Everything Locally
 
-```bash
-gofmt -l .                     # must print nothing
-go vet ./...
-go test -race ./...
-docker compose config
-docker compose build
-docker compose up -d
-bash scripts/smoke-test.sh
-go test -race -count=1 -tags=integration ./tests/integration
-bash scripts/outbox-recovery-test.sh
-bash scripts/process-kill-recovery-test.sh
-bash scripts/failure-integration-test.sh
-docker compose down -v
-bash scripts/fare-e2e-test.sh   # after the stack is down: it needs the same host ports
-bash scripts/kafka-e2e-test.sh  # publishes no host ports
-```
-
-To also reproduce the Kubernetes deployment validation locally, see the
-step-by-step commands in [cicd.md](cicd.md#running-it-locally).
+Follow the [local validation sequence](cicd.md#running-it-locally), which selects
+the same explicit route fixture and retry settings as CI, runs the package and
+outage checks, and tears down its disposable stack. It also includes Java,
+settlement/cancellation, Kafka telemetry, and Helm/KinD validation.
 
 If local ports are unavailable, stop the conflicting process or adjust the Compose port mappings before running the stack.
 

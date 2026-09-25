@@ -26,7 +26,7 @@ var (
 	routingDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "metroride_routing_computation_seconds",
 		Help:    "Latency for nearest-driver route calculations.",
-		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5},
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 40, 60},
 	})
 	activeDrivers = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "metroride_active_drivers",
@@ -201,7 +201,7 @@ func (s *routingService) consumeDriverLocations(ctx context.Context, log anyLogg
 	if o.MaxDeliveries == 0 {
 		o = reliability.DefaultStreamOptions()
 	}
-	reliability.Consume(ctx, s.rdb, events.StreamDriverLocations, cfg.ConsumerGroup, cfg.ConsumerName, o, log, func(ctx context.Context, m redis.XMessage) error {
+	reliability.Consume(ctx, s.rdb, events.StreamDriverLocations, cfg.ConsumerGroup, cfg.ConsumerName, "routing-service", o, log, func(ctx context.Context, m redis.XMessage) error {
 		env, e := events.DecodeEnvelope(m)
 		if e != nil {
 			return reliability.DecodeError(e)

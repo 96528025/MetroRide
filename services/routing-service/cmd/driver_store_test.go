@@ -79,4 +79,27 @@ func TestDriverStateIsSharedPersistentAndReservationsSurviveLocationUpdates(t *t
 	if e != nil || len(got) != 0 {
 		t.Fatal("stale driver was eligible")
 	}
+	// Readiness must also be bounded when the migration table is locked.
+	if _, e = pool.Exec(ctx, "create table core_schema_migrations(version int); insert into core_schema_migrations values(1)"); e != nil {
+		t.Fatal(e)
+	}
+	if e = a.Ready(ctx); e != nil {
+		t.Fatal(e)
+	}
+	blocker, e := pool.Begin(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer blocker.Rollback(ctx)
+	if _, e = blocker.Exec(ctx, "lock table core_schema_migrations in access exclusive mode"); e != nil {
+		t.Fatal(e)
+	}
+	outer, stop := context.WithTimeout(ctx, 4*time.Second)
+	defer stop()
+	began := time.Now()
+	e = a.Ready(outer)
+	if e == nil || time.Since(began) > 3*time.Second {
+		t.Fatalf("blocked readiness took %s, error=%v", time.Since(began), e)
+	}
+
 }

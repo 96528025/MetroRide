@@ -30,12 +30,12 @@ import (
 var (
 	dispatchLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "metroride_dispatch_latency_seconds",
-		Help:    "Ride assignment latency from event receipt to assignment emission.",
-		Buckets: prometheus.DefBuckets,
+		Help:    "Successful assignment processing time through database commit.",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 60},
 	})
 	assignmentFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "metroride_assignment_failures_total",
-		Help: "Total failed ride assignments.",
+		Help: "Terminal dispatch handling attempts before dead-letter publication.",
 	})
 	ridesAssigned = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "metroride_rides_assigned_total",
@@ -123,7 +123,7 @@ func main() {
 		"postgres":            d.checkPostgres,
 		"redis":               d.checkRedis,
 		"ride_request_stream": d.checkRideRequestStream,
-		"routing_service":     httpx.CheckHTTP(cfg.RoutingServiceURL+"/readyz", d.client),
+		"routing_service":     d.checkRoutingService,
 	})
 	server := httpx.NewServer(cfg.HTTPAddr, mux)
 	go func() {
@@ -150,7 +150,7 @@ func (d *dispatcher) ensureConsumerGroup(ctx context.Context) error {
 }
 
 func (d *dispatcher) consume(ctx context.Context) {
-	reliability.Consume(ctx, d.rdb, events.StreamRideRequests, d.cfg.ConsumerGroup, d.cfg.ConsumerName, d.options, d.log, d.handleMessage, d.publishDeadLetter)
+	reliability.Consume(ctx, d.rdb, events.StreamRideRequests, d.cfg.ConsumerGroup, d.cfg.ConsumerName, "dispatch-service", d.options, d.log, d.handleMessage, d.publishDeadLetter)
 }
 
 func (d *dispatcher) handleMessage(ctx context.Context, message redis.XMessage) error {
@@ -346,6 +346,8 @@ func (d *dispatcher) publishWithRetry(ctx context.Context, stream string, envelo
 }
 
 func (d *dispatcher) publishDeadLetter(ctx context.Context, message redis.XMessage, cause error) error {
+	// Count terminal handling attempts, including retries after a failed DLQ publish.
+	assignmentFailures.Inc()
 	envelope, err := events.DecodeEnvelope(message)
 	if err != nil {
 		envelope = events.Envelope{ID: message.ID, Type: "decode_failed", Source: "unknown"}
@@ -362,6 +364,12 @@ func (d *dispatcher) publishDeadLetter(ctx context.Context, message redis.XMessa
 	}
 	_, err = d.publishWithRetry(ctx, events.StreamDeadLetter, out)
 	return err
+}
+
+func (d *dispatcher) checkRoutingService(ctx context.Context) error {
+	checkCtx, cancel := reliability.WithReadinessTimeout(ctx)
+	defer cancel()
+	return httpx.CheckHTTP(d.cfg.RoutingServiceURL+"/readyz", d.client)(checkCtx)
 }
 
 func (d *dispatcher) checkPostgres(ctx context.Context) error {

@@ -253,7 +253,7 @@ if it fails.
 | `publish-images` | `contents: read`, `packages: write` | The only job that writes packages. |
 | `deploy-validation-release` | `contents: read`, `packages: read` | Pulls published images back onto the runner. |
 | `fare-service` | `contents: read` (workflow default) | Runs `./mvnw -B verify` for the Java service with Testcontainers on the runner's Docker daemon; no registry access. |
-| `fare-end-to-end` | `contents: read` (workflow default) | Runs `scripts/fare-e2e-test.sh`: builds the core Go images and the fare-service image in the runner, drives one ride through the Compose stack, uploads service logs on failure; no registry access, and not a dependency of publication or deployment validation. |
+| `fare-end-to-end` | `contents: read` (workflow default) | Runs `scripts/fare-e2e-test.sh`: builds the core Go images and the fare-service image in the runner, checks settlement and cancellation through the Compose stack, uploads service logs on failure; no registry access, and not a dependency of publication or deployment validation. |
 | `kafka-end-to-end` | `contents: read` (workflow default) | Runs `scripts/kafka-e2e-test.sh`: builds the driver and analytics images plus a Go + Docker CLI test runner, runs the test on the Compose network with the runner's Docker socket mounted so it can stop and start its own project's containers, uploads service logs on failure; no registry access, and not a dependency of publication or deployment validation. |
 
 `deploy-validation.yml` declares no permissions of its own, so it inherits
@@ -266,8 +266,9 @@ delivery run is never interrupted part-way through publishing.
 ## Running it locally
 
 Everything CI does can be reproduced locally with Docker with Compose, Go 1.22,
-curl, KinD, kubectl, Helm and Bash 4+ installed (the scripts use `mapfile`; macOS ships
-Bash 3.2):
+curl, KinD, kubectl, Helm, and Bash (including macOS Bash 3.2). Java validation
+also needs JDK 21. Use a disposable Compose project: the teardown below removes
+its data volumes.
 
 ```bash
 # 1. Static and package validation
@@ -275,16 +276,27 @@ gofmt -l .                     # must print nothing
 go vet ./...
 go test -race ./...
 
-# 2. Docker Compose stack (the same suite CI's backend job runs)
+# 2. Docker Compose stack with the same local routes and retry settings as CI
+export COMPOSE_PROJECT_NAME=metroride-local-check
+export COMPOSE_FILE=docker-compose.yml:tests/routingfixture/compose.yml
 docker compose config
 docker compose build
 docker compose up -d
 bash scripts/smoke-test.sh
+TEST_REDIS_ADDR=127.0.0.1:6379 TEST_POSTGRES_DSN='postgres://metroride:metroride@localhost:5432/metroride?sslmode=disable' go test -race ./shared/pkg/reliability ./services/routing-service/cmd ./services/dispatch-service/cmd
 go test -race -count=1 -tags=integration ./tests/integration
+PENDING_RECOVERY_PROJECT="$COMPOSE_PROJECT_NAME" go test -race -count=1 -tags=pendingintegration ./tests/pendingintegration
 bash scripts/outbox-recovery-test.sh
 bash scripts/process-kill-recovery-test.sh
 bash scripts/failure-integration-test.sh
 docker compose down -v
+
+# Java service and cross-language settlement/cancellation
+(cd services/fare-service && ./mvnw verify)
+bash scripts/fare-e2e-test.sh
+
+# Kafka telemetry path (isolated project, publishes no host ports)
+bash scripts/kafka-e2e-test.sh
 
 # 3. Helm chart validation
 bash scripts/ci/validate-helm-chart.sh

@@ -158,7 +158,7 @@ Real Redis and PostgreSQL checks in the routing and shared consumer packages run
 - **Main, release tags, manual runs:** publish core images tagged with the full commit SHA to GHCR, pull those artifacts into the deployment-validation job, and run the same KinD checks. No `latest` tag is used.
 - **Scope:** the publish job depends on Go backend validation; fare validation and the fare and Kafka flow jobs are separate jobs and not dependencies of image publication. Fare and analytics are outside the six-image release/Helm smoke path: the flow job proves the Go-to-Java chain works in Compose, it does not put fare-service into GHCR, the Helm chart or KinD. KinD clusters are removed after validation.
 
-The [Helm chart](infrastructure/helm/metro-ride) includes probes, resource settings, bounded dependency waits, and optional `ServiceMonitor` rendering. Default dependencies are external PostgreSQL/Redis; KinD profiles use disposable `emptyDir`-backed instances. Local deployment validation needs Docker, kind, kubectl, Helm, and Bash 4+; see [CI/CD documentation](docs/cicd.md).
+The [Helm chart](infrastructure/helm/metro-ride) includes probes, resource settings, bounded dependency waits, and optional `ServiceMonitor` rendering. Default dependencies are external PostgreSQL/Redis; KinD profiles use disposable `emptyDir`-backed instances. Local deployment validation needs Docker, kind, kubectl, Helm, and Bash; see [CI/CD documentation](docs/cicd.md).
 
 The optional Kafka profile runs a non-persistent single KRaft broker, a three-partition driver-location topic keyed by `driver_id`, a separate telemetry producer, and the analytics consumer:
 
