@@ -1,6 +1,6 @@
 # MetroRide Testing and CI
 
-MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, process-kill recovery of a committed outbox row, outbox relay progress, a real routing-outage dead-letter path, and the ride-to-fare-settlement flow across the Go services and the Java fare-service.
+MetroRide uses automated validation to keep the local distributed system reliable as the codebase evolves. The test strategy is intentionally backend-focused: it validates Go packages, Docker Compose configuration, service readiness, the ride assignment workflow, duplicate-event idempotency, Redis-outage recovery, process-kill recovery of a committed outbox row, outbox relay progress, a real routing-outage dead-letter path, the ride-to-fare-settlement flow across the Go services and the Java fare-service, and the optional Kafka telemetry path.
 
 ## CI Pipeline
 
@@ -61,6 +61,18 @@ its stack is never shared with the backend job's outage tests, which stop Redis
 and kill rider-service. Like the `fare-service` job it is not a dependency of
 image publication or deployment validation: it proves the Go-to-Java chain in
 Compose and does not add fare-service to GHCR, the Helm chart or KinD.
+
+### Kafka telemetry flow job (every event)
+
+`kafka-end-to-end` runs `bash scripts/kafka-e2e-test.sh`, the same entry point
+used locally. It starts its own Compose project with only the `kafka` profile's
+path (Kafka, the topic job, the telemetry producer, analytics-service, Redis),
+runs the `kafkaintegration` Go test, uploads service logs and the consumer
+group's `--describe` output when it fails, and removes the project whether the
+test passed or not. It is a separate job because the test stops and starts the
+producer and analytics-service. It is not a dependency of image publication or
+deployment validation: analytics-service stays outside GHCR, the Helm chart and
+KinD. Details in [Kafka Telemetry Flow](#kafka-telemetry-flow).
 
 ### Deployment-validation job (every event)
 
@@ -265,12 +277,85 @@ passenger route, not a metered trip. The fixed route fixture does not establish
 real-world travel times or public-provider availability. These two tests do not
 exercise fault injection, load, or actual payment processing.
 
+### Kafka Telemetry Flow
+
+```bash
+bash scripts/kafka-e2e-test.sh
+```
+
+Prerequisites: Docker with Compose v2.24 or newer and the Docker socket at
+`/var/run/docker.sock` (override with `DOCKER_SOCKET`). No host ports need to be
+free: the test overlay `tests/kafkaintegration/compose.kafka-e2e.yml` drops the
+host port mappings, so the run can share a machine with a stack you already have
+running. Go is not needed on the host: the test always runs in a small runner
+image (Go toolchain plus the Docker CLI, `tests/kafkaintegration/Dockerfile.runner`)
+attached to the run's Compose network, because the broker advertises only
+`kafka:9092`. The mounted socket lets the test stop and start containers. It
+selects them by this run's Compose project label, which keeps it from touching
+other projects by mistake; that is not a security boundary, because the socket
+gives the runner container full control of the Docker daemon.
+
+The test reads Kafka through its own protocol (metadata, list offsets, offset
+fetch, describe groups, and the log itself) and never writes to the topic.
+analytics-service exposes only a running total, its latest location per driver,
+and Prometheus counters, so the consumer-side checks compare those aggregates
+with the log:
+
+1. After both services report ready, the topic has the three partitions
+   `kafka-init` creates. The simulated driver IDs come from the producer's
+   `/v1/drivers`.
+2. Once every driver has at least two events, the whole log is read partition
+   by partition. Every record's key equals its `driver_id`, every event ID is
+   unique, the event type is `driver_location_updated`, each driver appears on
+   exactly one partition, and that partition equals an independent computation
+   of kafka-go's Hash balancer (FNV-1a, Sarama-compatible). Within a partition a
+   driver's timestamps strictly increase.
+3. The producer is stopped so the log is fixed. analytics-service's
+   `total_consumed` must reach the number of records in the log (a higher count
+   fails at once), the group's committed offset must reach the high watermark on
+   every partition that has records, each driver's latest location must equal the
+   last event for that driver in the log, and the group must be `Stable` with one
+   member that owns all three partitions.
+4. analytics-service is stopped, the producer publishes one more round and is
+   stopped again, which leaves a fixed backlog behind the group's committed
+   offsets (checked). analytics-service is started. Its total must reach the size
+   of the backlog, its commits the new high watermarks, its latest locations the
+   backlog's events, and its Prometheus counters must agree
+   (`metroride_kafka_driver_location_events_total` equal to the backlog,
+   `metroride_kafka_consume_errors_total` zero). A consumer that restarted from
+   the first offset would count the whole log and fail at once; one that skipped
+   to the end would count nothing and time out.
+
+What these checks cannot see: equal totals do not show which events were
+processed. A skipped event and a duplicated one would cancel out and still pass
+steps 3 and 4, and only the last location per driver is compared. Per-event
+claims would need analytics-service to expose the offsets or event IDs it
+handled. The consumer also commits offsets automatically (kafka-go
+`ReadMessage` with a one-second commit interval), so an offset can be committed
+before its event has been applied. This test covers normal operation and a
+restart after a clean shutdown; it does not establish crash-safe processing
+guarantees.
+
+Each wait polls until its condition holds and checks a 60 s deadline between
+attempts. Individual calls have their own limits (HTTP requests 5 s, Kafka
+admin requests 10 s, each partition read 15 s), and the whole test is bounded
+at 5 minutes. The test was checked against deliberate faults: a round-robin
+producer balancer fails step 2, a consumer that fetches without committing
+fails step 3, and a consumer that ignores events older than its own start
+fails step 4.
+
+With four drivers and three partitions, one partition normally receives no
+records and never gets a committed offset; the test accepts that only for an
+empty partition. What the flow does not claim: throughput, multi-broker
+replication, consumer rebalancing across several members, or delivery through
+a broker failure.
+
 ## Running Everything Locally
 
 Follow the [local validation sequence](cicd.md#running-it-locally), which selects
 the same explicit route fixture and retry settings as CI, runs the package and
 outage checks, and tears down its disposable stack. It also includes Java,
-settlement/cancellation, and Helm/KinD validation.
+settlement/cancellation, Kafka telemetry, and Helm/KinD validation.
 
 If local ports are unavailable, stop the conflicting process or adjust the Compose port mappings before running the stack.
 

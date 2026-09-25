@@ -117,6 +117,10 @@ This extension is intentionally small:
 
 The goal is to demonstrate architecture concepts without turning MetroRide into a heavy infrastructure lab.
 
+## Testing
+
+`bash scripts/kafka-e2e-test.sh` runs in CI on every event (job `kafka-end-to-end`). It checks `driver_id` keying and partition choice, per-driver order, that analytics-service's running total, committed offsets and latest per-driver locations match the log, and that after a restart it picks up the backlog published while it was down. These are aggregate checks, not per-event delivery guarantees; see [Kafka Telemetry Flow](testing-and-ci.md#kafka-telemetry-flow).
+
 ## How This Could Evolve
 
 At larger scale, MetroRide could evolve Kafka usage by:

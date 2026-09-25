@@ -1,0 +1,10 @@
+# Test runner for scripts/kafka-e2e-test.sh: the Go toolchain plus the Docker CLI.
+#
+# The test has to run on the Compose network, because the broker advertises only
+# kafka:9092, and it has to stop and restart containers of its own Compose project,
+# which it does through the Docker socket the script mounts. Only the static docker
+# binary is copied in; the daemon is the host's.
+FROM docker:28-cli AS docker-cli
+
+FROM golang:1.22
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
