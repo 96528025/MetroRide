@@ -1,0 +1,17 @@
+# Test-only Compose overlay for scripts/kafka-e2e-test.sh. It is loaded explicitly after
+# docker-compose.yml (`-f docker-compose.yml -f tests/kafkaintegration/compose.kafka-e2e.yml`)
+# and changes nothing about the everyday stack or the `kafka` profile.
+#
+# Its one job is to drop the host port mappings of the services the Kafka flow starts. The
+# test reaches them on the Compose network, so the run does not need 6379, 8086 or 9092 to be
+# free and can share a machine with a MetroRide stack that is already running.
+# driver-kafka-producer publishes no host port in docker-compose.yml.
+#
+# `!reset` needs Docker Compose v2.24 or newer.
+services:
+  redis:
+    ports: !reset []
+  kafka:
+    ports: !reset []
+  analytics-service:
+    ports: !reset []

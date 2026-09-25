@@ -152,11 +152,11 @@ Real Redis and PostgreSQL checks in the routing and shared consumer packages run
 
 ## Delivery pipeline and optional Kafka
 
-[CI](.github/workflows/ci.yml) validates Go formatting, vet/tests, Compose, smoke/integration, and outage recovery. A separate Java job runs Maven `verify`, and a third job runs the ride-to-fare-settlement flow against a Compose stack with the `fare` profile. Six core images are built as distroless, non-root containers.
+[CI](.github/workflows/ci.yml) validates Go formatting, vet/tests, Compose, smoke/integration, and outage recovery. A separate Java job runs Maven `verify`, a third job runs the ride-to-fare-settlement flow against a Compose stack with the `fare` profile, and a fourth runs the Kafka telemetry flow against the `kafka` profile. Six core images are built as distroless, non-root containers.
 
 - **Pull requests:** build images in the runner, load them into KinD, install the Helm release, and run deployment smoke checks without publishing service images.
 - **Main, release tags, manual runs:** publish core images tagged with the full commit SHA to GHCR, pull those artifacts into the deployment-validation job, and run the same KinD checks. No `latest` tag is used.
-- **Scope:** the publish job depends on Go backend validation; fare validation and the fare flow job are separate jobs and not dependencies of image publication. Fare and analytics are outside the six-image release/Helm smoke path: the flow job proves the Go-to-Java chain works in Compose, it does not put fare-service into GHCR, the Helm chart or KinD. KinD clusters are removed after validation.
+- **Scope:** the publish job depends on Go backend validation; fare validation and the fare and Kafka flow jobs are separate jobs and not dependencies of image publication. Fare and analytics are outside the six-image release/Helm smoke path: the flow job proves the Go-to-Java chain works in Compose, it does not put fare-service into GHCR, the Helm chart or KinD. KinD clusters are removed after validation.
 
 The [Helm chart](infrastructure/helm/metro-ride) includes probes, resource settings, bounded dependency waits, and optional `ServiceMonitor` rendering. Default dependencies are external PostgreSQL/Redis; KinD profiles use disposable `emptyDir`-backed instances. Local deployment validation needs Docker, kind, kubectl, Helm, and Bash 4+; see [CI/CD documentation](docs/cicd.md).
 
@@ -167,7 +167,7 @@ docker compose --profile kafka up --build -d
 ENABLE_KAFKA_SMOKE=true bash scripts/smoke-test.sh
 ```
 
-Kafka is a telemetry extension; Redis Streams remains the ride workflow transport.
+`bash scripts/kafka-e2e-test.sh` runs the same profile in an isolated project and checks `driver_id` keying and partition choice, per-driver order, that the consumer's running total, committed offsets and latest per-driver locations match the log, and that a restarted consumer picks up the backlog published while it was down ([details](docs/testing-and-ci.md#kafka-telemetry-flow)). Kafka is a telemetry extension; Redis Streams remains the ride workflow transport.
 
 ## Repository guide
 

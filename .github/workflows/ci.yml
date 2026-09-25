@@ -173,6 +173,34 @@ jobs:
           path: ${{ runner.temp }}/fare-e2e-logs
           if-no-files-found: ignore
 
+  kafka-end-to-end:
+    name: Kafka telemetry flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Its own job for the same reason as the fare flow: the script starts, tests and
+    # removes its own Compose project (the `kafka` profile only), and it stops and
+    # restarts containers mid-test. The Go test runs in a runner container on that
+    # project's network, so this job needs no setup-go. Nothing downstream depends on
+    # it: analytics-service is outside the published image set, the Helm chart and KinD.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run the Kafka telemetry flow
+        env:
+          KAFKA_E2E_PROJECT: kafka-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          KAFKA_E2E_LOG_DIR: ${{ runner.temp }}/kafka-e2e-logs
+        run: bash scripts/kafka-e2e-test.sh
+
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-e2e-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kafka-e2e-logs
+          if-no-files-found: ignore
+
   publish-images:
     name: Publish ${{ matrix.service }} to GHCR
     needs: backend
